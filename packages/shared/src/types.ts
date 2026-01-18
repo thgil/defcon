@@ -57,6 +57,7 @@ export interface Player {
   populationRemaining: number;
   populationLost: number;
   enemyKills: number;
+  isAI?: boolean;
 }
 
 // Geographic coordinate (imported from geography for convenience)
@@ -158,7 +159,13 @@ export interface Satellite {
   geoPosition?: GeoPosition;
 }
 
-// Missile in flight
+// Missile flight phases for interceptors (legacy)
+export type InterceptorFlightPhase = 'boost' | 'track';
+
+// Physics-based interceptor phases (new system)
+export type InterceptorPhase = 'boost' | 'pitch' | 'cruise' | 'terminal' | 'coast';
+
+// Missile in flight (legacy/ICBM system)
 export interface Missile {
   id: string;
   type: MissileType;
@@ -178,7 +185,81 @@ export interface Missile {
   geoLaunchPosition?: GeoPosition;
   geoTargetPosition?: GeoPosition;
   geoCurrentPosition?: GeoPosition;
+  // Enhanced interceptor fields
+  detectedByRadarId?: string;        // Which radar detected the target
+  launchingSiloId?: string;          // Which silo launched this interceptor
+  lastKnownTargetPosition?: GeoPosition;  // For when radar loses track
+  flightPhase?: InterceptorFlightPhase;   // Current flight phase
+  boostEndProgress?: number;         // When boost ends (default 0.25)
+  // Missed interceptor fields
+  missedTarget?: boolean;            // True if hit check failed (interceptor continues flying)
+  maxFlightDuration?: number;        // Extended flight time for missed interceptors
+  missDirection?: GeoPosition;       // Direction to continue flying after missing
 }
+
+// Physics-based missile (new system for interceptors)
+// Uses real physics simulation instead of progress-based curves
+export interface PhysicsMissile {
+  id: string;
+  type: 'interceptor';
+  ownerId: string;
+  sourceId: string;
+
+  // Physics state (server-authoritative)
+  position: { x: number; y: number; z: number };   // Current 3D position
+  velocity: { x: number; y: number; z: number };   // Velocity vector (units/sec)
+  heading: { x: number; y: number; z: number };    // Direction missile is pointing
+
+  // Engine/fuel
+  fuel: number;                // Remaining burn time (seconds)
+  maxFuel: number;             // Starting fuel (e.g., 8 seconds)
+  thrust: number;              // Current thrust level
+
+  // Guidance
+  phase: InterceptorPhase;
+  targetId?: string;
+  predictedInterceptPoint?: { x: number; y: number; z: number };
+  timeToIntercept?: number;
+
+  // Status
+  launchTime: number;
+  intercepted: boolean;
+  detonated: boolean;
+  engineFlameout: boolean;
+  flameoutTime?: number;  // Timestamp when engine flamed out
+
+  // For rendering compatibility (derived from position)
+  geoCurrentPosition?: GeoPosition;
+
+  // Legacy compatibility fields (for gradual migration)
+  launchPosition?: Vector2;
+  targetPosition?: Vector2;
+  currentPosition?: Vector2;
+  progress?: number;
+  flightDuration?: number;
+  geoLaunchPosition?: GeoPosition;
+  geoTargetPosition?: GeoPosition;
+  apexHeight?: number;
+
+  // Legacy interceptor fields (maintained for compatibility)
+  detectedByRadarId?: string;
+  launchingSiloId?: string;
+  lastKnownTargetPosition?: GeoPosition;
+  flightPhase?: InterceptorFlightPhase;
+  boostEndProgress?: number;
+  missedTarget?: boolean;
+  maxFlightDuration?: number;
+  missDirection?: GeoPosition;
+}
+
+// Type guard to check if a missile is using the new physics system
+export function isPhysicsMissile(m: Missile | PhysicsMissile | null | undefined): m is PhysicsMissile {
+  if (!m) return false;
+  return 'velocity' in m && 'thrust' in m && 'phase' in m && typeof (m as PhysicsMissile).fuel === 'number';
+}
+
+// Combined missile type for game state
+export type AnyMissile = Missile | PhysicsMissile;
 
 // Full game state
 export interface GameState {
@@ -193,7 +274,7 @@ export interface GameState {
   territories: Record<string, Territory>;
   cities: Record<string, City>;
   buildings: Record<string, Building>;
-  missiles: Record<string, Missile>;
+  missiles: Record<string, Missile | PhysicsMissile>;
   satellites: Record<string, Satellite>;
 }
 
@@ -219,7 +300,8 @@ export type GameEvent =
   | ModeChangeEvent
   | GameEndEvent
   | SatelliteLaunchEvent
-  | SatelliteDestroyedEvent;
+  | SatelliteDestroyedEvent
+  | LaunchDetectedEvent;
 
 export interface DefconChangeEvent {
   type: 'defcon_change';
@@ -305,13 +387,23 @@ export interface SatelliteDestroyedEvent {
   destroyedBy?: string;  // Interceptor missile ID or undefined if other cause
 }
 
+export interface LaunchDetectedEvent {
+  type: 'launch_detected';
+  tick: number;
+  detectedByPlayerId: string;   // Player who detected the launch (has the satellite)
+  launchingPlayerId: string;    // Player who launched the missile
+  approximatePosition: GeoPosition;  // Approximate launch location
+  regionName?: string;          // Name of the region/territory if known
+  satelliteId: string;          // Satellite that detected it
+}
+
 // Helper types for better Object.values() inference
 export type GameStateRecords = {
   players: Player;
   territories: Territory;
   cities: City;
   buildings: Building;
-  missiles: Missile;
+  missiles: Missile | PhysicsMissile;
   satellites: Satellite;
 };
 
@@ -332,13 +424,17 @@ export function getBuildings(state: GameState): Building[] {
   return Object.values(state.buildings);
 }
 
-export function getMissiles(state: GameState): Missile[] {
+export function getMissiles(state: GameState): (Missile | PhysicsMissile)[] {
   return Object.values(state.missiles);
 }
 
 export function getSatellites(state: GameState): Satellite[] {
   return Object.values(state.satellites);
 }
+
+// Global missile speed multiplier - affects all missiles (ICBMs and interceptors)
+// 1.0 = normal speed, 0.5 = half speed, 2.0 = double speed
+export const GLOBAL_MISSILE_SPEED_MULTIPLIER = 0.5;
 
 // Default game config
 export const DEFAULT_GAME_CONFIG: GameConfig = {
@@ -350,7 +446,7 @@ export const DEFAULT_GAME_CONFIG: GameConfig = {
     defcon2Duration: 180000,
     defcon1Duration: 600000, // 10 minutes
   },
-  missileSpeed: 2, // units per second - slow enough to enjoy the drama
+  missileSpeed: 2 * GLOBAL_MISSILE_SPEED_MULTIPLIER, // units per second - adjusted by global multiplier
   radarRange: 300,
   siloRange: 400,
   startingUnits: {

@@ -1,4 +1,5 @@
-import type { GameState, Building, Silo, SatelliteLaunchFacility, DefconLevel } from '@defcon/shared';
+import type { GameState, Building, Silo, SatelliteLaunchFacility, DefconLevel, Player } from '@defcon/shared';
+import type { GameAlert } from '../stores/gameStore';
 
 const DEFCON_COLORS: Record<DefconLevel, string> = {
   5: '#00ff00',
@@ -9,8 +10,25 @@ const DEFCON_COLORS: Record<DefconLevel, string> = {
 };
 
 const FONT = '12px "Courier New", monospace';
+const FONT_SMALL = '10px "Courier New", monospace';
 const FONT_LARGE = '16px "Courier New", monospace';
 const FONT_TITLE = '24px "Courier New", monospace';
+
+// Debug panel regions for AI selection
+const AI_REGIONS = [
+  { id: 'north_america', name: 'North America' },
+  { id: 'south_america', name: 'South America' },
+  { id: 'europe', name: 'Europe' },
+  { id: 'russia', name: 'Russia' },
+  { id: 'africa', name: 'Africa' },
+  { id: 'asia', name: 'Asia' },
+];
+
+// Target regions for test missiles
+const TARGET_REGIONS = [
+  { id: 'any', name: 'Any Region' },
+  ...AI_REGIONS,
+];
 
 interface Button {
   x: number;
@@ -39,6 +57,10 @@ export class HUDRenderer {
   private onPlacementMode: ((type: string | null) => void) | null = null;
   private onViewToggle: ((toggle: 'radar' | 'grid' | 'labels' | 'trails', value: boolean) => void) | null = null;
   private onLaunchSatellite: ((facilityId: string, inclination: number) => void) | null = null;
+  private onDebugCommand: ((command: string, value?: number, targetRegion?: string) => void) | null = null;
+  private onEnableAI: ((region: string) => void) | null = null;
+  private onDisableAI: (() => void) | null = null;
+  private onLayerToggle: ((layer: 'coastlines' | 'borders' | 'airspaces') => boolean) | null = null;
 
   // Placement state
   private placementMode: string | null = null;
@@ -55,6 +77,30 @@ export class HUDRenderer {
     labels: true,
     trails: true,
   };
+
+  // Debug panel state
+  private debugPanelVisible = true;
+  private selectedAIRegion = 'russia';
+  private selectedTargetRegion = 'any';
+
+  // Layer visibility state (for canvas-based toggles)
+  private layerVisibility = {
+    coastlines: true,
+    borders: true,
+    airspaces: true,
+  };
+
+  // Fog of war visibility
+  private fogOfWarEnabled = true;
+  private onFogOfWarToggle: ((enabled: boolean) => void) | null = null;
+
+  // Timer interpolation state
+  private lastStateUpdateTime = performance.now();
+  private lastDefconTimer = 0;
+  private lastDefconLevel = 5;
+
+  // Alert display
+  private alerts: GameAlert[] = [];
 
   constructor(container: HTMLElement) {
     this.canvas = document.createElement('canvas');
@@ -101,12 +147,49 @@ export class HUDRenderer {
     this.viewToggles = { ...toggles };
   }
 
+  setDebugCallbacks(
+    onDebugCommand: (command: string, value?: number, targetRegion?: string) => void,
+    onEnableAI: (region: string) => void,
+    onDisableAI: () => void,
+    onLayerToggle: (layer: 'coastlines' | 'borders' | 'airspaces') => boolean,
+    onFogOfWarToggle?: (enabled: boolean) => void
+  ): void {
+    this.onDebugCommand = onDebugCommand;
+    this.onEnableAI = onEnableAI;
+    this.onDisableAI = onDisableAI;
+    this.onLayerToggle = onLayerToggle;
+    this.onFogOfWarToggle = onFogOfWarToggle || null;
+  }
+
+  setDebugPanelVisible(visible: boolean): void {
+    this.debugPanelVisible = visible;
+  }
+
+  toggleDebugPanel(): void {
+    this.debugPanelVisible = !this.debugPanelVisible;
+  }
+
+  setLayerVisibility(visibility: { coastlines: boolean; borders: boolean; airspaces: boolean }): void {
+    this.layerVisibility = { ...visibility };
+  }
+
   updateState(
     gameState: GameState | null,
     playerId: string | null,
     selectedBuilding: Building | null,
     placementMode: string | null
   ): void {
+    // Track timer changes for interpolation
+    if (gameState) {
+      // Only update baseline if timer changed or DEFCON level changed
+      if (gameState.defconTimer !== this.lastDefconTimer ||
+          gameState.defconLevel !== this.lastDefconLevel) {
+        this.lastStateUpdateTime = performance.now();
+        this.lastDefconTimer = gameState.defconTimer;
+        this.lastDefconLevel = gameState.defconLevel;
+      }
+    }
+
     this.gameState = gameState;
     this.playerId = playerId;
     this.selectedBuilding = selectedBuilding;
@@ -161,11 +244,68 @@ export class HUDRenderer {
     // Draw scoreboard (top right)
     this.drawScoreboard(width);
 
-    // Draw view toggles (bottom right, above status bar)
+    // Draw debug panel (below scoreboard, top right)
+    if (this.debugPanelVisible) {
+      this.drawDebugPanel(width);
+    }
+
+    // Draw layer toggles (bottom right, above status bar)
+    this.drawLayerToggles(width, height);
+
+    // Draw view toggles (above layer toggles)
     this.drawViewToggles(width, height);
 
     // Draw bottom status bar
     this.drawStatusBar(width, height);
+
+    // Draw alerts (center-left)
+    this.drawAlerts(height);
+  }
+
+  setAlerts(alerts: GameAlert[]): void {
+    this.alerts = alerts;
+  }
+
+  private drawAlerts(height: number): void {
+    if (this.alerts.length === 0) return;
+
+    const now = Date.now();
+    const alertX = 20;
+    let alertY = height / 2 - (this.alerts.length * 30);
+
+    for (const alert of this.alerts) {
+      // Calculate fade based on time remaining
+      const timeLeft = alert.expiresAt - now;
+      const fadeStart = 2000; // Start fading 2 seconds before expiry
+      const opacity = timeLeft < fadeStart ? timeLeft / fadeStart : 1;
+
+      if (opacity <= 0) continue;
+
+      // Flashing effect for launch detected
+      const flash = alert.type === 'launch_detected' && Math.sin(now / 150) > 0;
+
+      // Background
+      this.ctx.fillStyle = `rgba(80, 0, 0, ${0.9 * opacity})`;
+      this.ctx.fillRect(alertX, alertY, 280, 28);
+
+      // Border (flashing)
+      this.ctx.strokeStyle = flash ? `rgba(255, 100, 100, ${opacity})` : `rgba(255, 0, 0, ${opacity})`;
+      this.ctx.lineWidth = 2;
+      this.ctx.strokeRect(alertX, alertY, 280, 28);
+
+      // Warning icon
+      this.ctx.fillStyle = `rgba(255, 200, 0, ${opacity})`;
+      this.ctx.font = FONT_LARGE;
+      this.ctx.textAlign = 'left';
+      this.ctx.fillText('⚠', alertX + 8, alertY + 20);
+
+      // Alert text
+      this.ctx.fillStyle = `rgba(255, 255, 255, ${opacity})`;
+      this.ctx.font = FONT;
+      this.ctx.fillText(alert.message, alertX + 30, alertY + 18);
+
+      alertY += 35;
+    }
   }
 
   private drawDefconIndicator(width: number): void {
@@ -186,8 +326,10 @@ export class HUDRenderer {
     this.ctx.textAlign = 'center';
     this.ctx.fillText(`DEFCON ${state.defconLevel}`, centerX, 38);
 
-    // Timer
-    const timeLeft = Math.ceil(state.defconTimer / 1000);
+    // Timer - interpolate client-side for smooth updates
+    const elapsedSinceUpdate = performance.now() - this.lastStateUpdateTime;
+    const interpolatedTimer = Math.max(0, this.lastDefconTimer - elapsedSinceUpdate);
+    const timeLeft = Math.ceil(interpolatedTimer / 1000);
     const minutes = Math.floor(timeLeft / 60);
     const seconds = timeLeft % 60;
     this.ctx.font = FONT;
@@ -467,6 +609,285 @@ export class HUDRenderer {
     });
   }
 
+  private drawDebugPanel(width: number): void {
+    const state = this.gameState!;
+    const players = Object.values(state.players);
+    const scoreboardHeight = 20 + players.length * 18;
+
+    const panelX = width - 188;
+    const panelY = 8 + scoreboardHeight + 8;
+    const panelWidth = 180;
+    const panelHeight = 320;
+
+    // Background
+    this.ctx.fillStyle = 'rgba(0, 0, 0, 0.9)';
+    this.ctx.fillRect(panelX, panelY, panelWidth, panelHeight);
+    this.ctx.strokeStyle = '#ff00ff';
+    this.ctx.lineWidth = 1;
+    this.ctx.strokeRect(panelX, panelY, panelWidth, panelHeight);
+
+    // Title
+    this.ctx.fillStyle = '#ff00ff';
+    this.ctx.font = FONT_LARGE;
+    this.ctx.textAlign = 'left';
+    this.ctx.fillText('DEBUG', panelX + 8, panelY + 18);
+
+    // Current DEFCON
+    this.ctx.font = FONT;
+    this.ctx.fillStyle = '#888';
+    this.ctx.fillText(`DEFCON: ${state.defconLevel}`, panelX + 8, panelY + 36);
+
+    // Advance DEFCON button
+    let buttonY = panelY + 44;
+    this.drawButton({
+      x: panelX + 8,
+      y: buttonY,
+      width: panelWidth - 16,
+      height: 22,
+      label: 'Advance DEFCON',
+      action: () => {
+        if (this.onDebugCommand) {
+          this.onDebugCommand('advance_defcon');
+        }
+      },
+    });
+
+    // DEFCON level buttons
+    buttonY += 28;
+    const defconButtonWidth = (panelWidth - 16 - 16) / 5;
+    [5, 4, 3, 2, 1].forEach((level, i) => {
+      this.drawButton({
+        x: panelX + 8 + i * (defconButtonWidth + 4),
+        y: buttonY,
+        width: defconButtonWidth,
+        height: 22,
+        label: `${level}`,
+        active: state.defconLevel === level,
+        disabled: state.defconLevel === level,
+        action: () => {
+          if (this.onDebugCommand) {
+            this.onDebugCommand('set_defcon', level);
+          }
+        },
+      });
+    });
+
+    // Skip timer and refill ammo buttons
+    buttonY += 28;
+    const halfWidth = (panelWidth - 20) / 2;
+    this.drawButton({
+      x: panelX + 8,
+      y: buttonY,
+      width: halfWidth,
+      height: 22,
+      label: 'Skip Timer',
+      action: () => {
+        if (this.onDebugCommand) {
+          this.onDebugCommand('skip_timer');
+        }
+      },
+    });
+
+    this.drawButton({
+      x: panelX + 12 + halfWidth,
+      y: buttonY,
+      width: halfWidth,
+      height: 22,
+      label: 'Refill Ammo',
+      action: () => {
+        if (this.onDebugCommand) {
+          this.onDebugCommand('add_missiles');
+        }
+      },
+    });
+
+    // Test missiles section
+    buttonY += 32;
+    this.ctx.fillStyle = '#888';
+    this.ctx.font = FONT_SMALL;
+    this.ctx.fillText('Test Missiles', panelX + 8, buttonY);
+
+    // Target region selector (simulated with buttons for each region)
+    buttonY += 10;
+    const thirdWidth = (panelWidth - 20) / 3;
+    [3, 5, 10].forEach((count, i) => {
+      this.drawButton({
+        x: panelX + 8 + i * (thirdWidth + 4),
+        y: buttonY,
+        width: thirdWidth,
+        height: 22,
+        label: `${count}`,
+        disabled: state.defconLevel !== 1,
+        action: () => {
+          if (this.onDebugCommand) {
+            const target = this.selectedTargetRegion === 'any' ? undefined : this.selectedTargetRegion;
+            this.onDebugCommand('launch_test_missiles', count, target);
+          }
+        },
+      });
+    });
+
+    // AI section
+    buttonY += 36;
+    this.ctx.fillStyle = '#888';
+    this.ctx.font = FONT_SMALL;
+    this.ctx.fillText('Enemy AI', panelX + 8, buttonY);
+
+    const aiPlayer = players.find(p => p.isAI);
+    buttonY += 10;
+
+    if (aiPlayer) {
+      // AI is active - show disable button
+      this.ctx.fillStyle = '#ff4444';
+      this.ctx.font = FONT_SMALL;
+      this.ctx.fillText(`${aiPlayer.name} (Active)`, panelX + 8, buttonY + 10);
+
+      buttonY += 18;
+      this.drawButton({
+        x: panelX + 8,
+        y: buttonY,
+        width: panelWidth - 16,
+        height: 22,
+        label: 'Disable AI',
+        action: () => {
+          if (this.onDisableAI) {
+            this.onDisableAI();
+          }
+        },
+      });
+    } else {
+      // AI not active - show region selector and enable button
+      const availableRegions = AI_REGIONS.filter(region => {
+        const territory = state.territories[region.id];
+        return !territory?.ownerId;
+      });
+
+      if (availableRegions.length > 0) {
+        // Region selector as a row of small buttons
+        const regionButtonWidth = (panelWidth - 20) / 3;
+        availableRegions.slice(0, 3).forEach((region, i) => {
+          this.drawButton({
+            x: panelX + 8 + i * (regionButtonWidth + 4),
+            y: buttonY,
+            width: regionButtonWidth,
+            height: 20,
+            label: region.name.substring(0, 8),
+            active: this.selectedAIRegion === region.id,
+            action: () => {
+              this.selectedAIRegion = region.id;
+            },
+          });
+        });
+
+        if (availableRegions.length > 3) {
+          buttonY += 24;
+          availableRegions.slice(3).forEach((region, i) => {
+            this.drawButton({
+              x: panelX + 8 + i * (regionButtonWidth + 4),
+              y: buttonY,
+              width: regionButtonWidth,
+              height: 20,
+              label: region.name.substring(0, 8),
+              active: this.selectedAIRegion === region.id,
+              action: () => {
+                this.selectedAIRegion = region.id;
+              },
+            });
+          });
+        }
+
+        buttonY += 26;
+        this.drawButton({
+          x: panelX + 8,
+          y: buttonY,
+          width: panelWidth - 16,
+          height: 22,
+          label: 'Enable AI',
+          action: () => {
+            if (this.onEnableAI) {
+              this.onEnableAI(this.selectedAIRegion);
+            }
+          },
+        });
+      } else {
+        this.ctx.fillStyle = '#666';
+        this.ctx.font = FONT_SMALL;
+        this.ctx.fillText('No available regions', panelX + 8, buttonY + 12);
+      }
+    }
+
+    // Fog of War toggle
+    buttonY = panelY + panelHeight - 56;
+    this.drawButton({
+      x: panelX + 8,
+      y: buttonY,
+      width: panelWidth - 16,
+      height: 22,
+      label: this.fogOfWarEnabled ? 'Disable Fog of War' : 'Enable Fog of War',
+      active: !this.fogOfWarEnabled,
+      action: () => {
+        this.fogOfWarEnabled = !this.fogOfWarEnabled;
+        if (this.onFogOfWarToggle) {
+          this.onFogOfWarToggle(this.fogOfWarEnabled);
+        }
+      },
+    });
+
+    // Press D to toggle hint
+    this.ctx.fillStyle = '#444';
+    this.ctx.font = FONT_SMALL;
+    this.ctx.fillText('Press D to toggle', panelX + 8, panelY + panelHeight - 6);
+  }
+
+  private drawLayerToggles(width: number, height: number): void {
+    const statusBarHeight = 30;
+    const viewTogglePanelHeight = 24 + 16; // height of view toggles panel
+    const toggleHeight = 24;
+    const toggleWidth = 70;
+    const toggleSpacing = 4;
+    const panelPadding = 8;
+
+    const toggles: Array<{ key: 'coastlines' | 'borders' | 'airspaces'; label: string }> = [
+      { key: 'coastlines', label: 'COAST' },
+      { key: 'borders', label: 'BORDERS' },
+      { key: 'airspaces', label: 'AIR' },
+    ];
+
+    const panelWidth = toggles.length * (toggleWidth + toggleSpacing) - toggleSpacing + panelPadding * 2;
+    const panelHeight = toggleHeight + panelPadding * 2;
+    const panelX = width - panelWidth - 8;
+    const panelY = height - statusBarHeight - viewTogglePanelHeight - panelHeight - 16;
+
+    // Panel background
+    this.ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    this.ctx.fillRect(panelX, panelY, panelWidth, panelHeight);
+    this.ctx.strokeStyle = '#333';
+    this.ctx.lineWidth = 1;
+    this.ctx.strokeRect(panelX, panelY, panelWidth, panelHeight);
+
+    // Draw toggle buttons
+    toggles.forEach((toggle, i) => {
+      const x = panelX + panelPadding + i * (toggleWidth + toggleSpacing);
+      const y = panelY + panelPadding;
+      const isActive = this.layerVisibility[toggle.key];
+
+      this.drawButton({
+        x,
+        y,
+        width: toggleWidth,
+        height: toggleHeight,
+        label: toggle.label,
+        action: () => {
+          if (this.onLayerToggle) {
+            const newValue = this.onLayerToggle(toggle.key);
+            this.layerVisibility[toggle.key] = newValue;
+          }
+        },
+        active: isActive,
+      });
+    });
+  }
+
   private drawStatusBar(width: number, height: number): void {
     const barHeight = 30;
     const y = height - barHeight;
@@ -640,10 +1061,20 @@ export class HUDRenderer {
     if (x >= centerX - 100 && x <= centerX + 100 && y >= 8 && y <= 58) return true;
 
     // Top right scoreboard
-    if (x >= width - 188 && y >= 8 && y <= 100) return true;
+    const players = this.gameState ? Object.values(this.gameState.players) : [];
+    const scoreboardHeight = 20 + players.length * 18;
+    if (x >= width - 188 && y >= 8 && y <= 8 + scoreboardHeight) return true;
+
+    // Debug panel (below scoreboard)
+    if (this.debugPanelVisible) {
+      const debugPanelY = 8 + scoreboardHeight + 8;
+      const debugPanelHeight = 290;
+      if (x >= width - 188 && x <= width - 8 &&
+          y >= debugPanelY && y <= debugPanelY + debugPanelHeight) return true;
+    }
 
     // Left placement panel (during DEFCON 5)
-    if (this.gameState?.defconLevel === 5 && x >= 8 && x <= 188 && y >= 80 && y <= 220) return true;
+    if (this.gameState?.defconLevel === 5 && x >= 8 && x <= 188 && y >= 80 && y <= 260) return true;
 
     // Bottom left selected building panel (above status bar)
     const statusBarHeight = 30;
@@ -661,6 +1092,16 @@ export class HUDRenderer {
     const togglePanelY = height - statusBarHeight - togglePanelHeight - 8;
     if (x >= togglePanelX && x <= togglePanelX + togglePanelWidth &&
         y >= togglePanelY && y <= togglePanelY + togglePanelHeight) return true;
+
+    // Bottom right layer toggles panel (above view toggles)
+    const viewTogglePanelHeight = 24 + 16;
+    const layerToggleWidth = 70;
+    const layerPanelWidth = 3 * (layerToggleWidth + toggleSpacing) - toggleSpacing + togglePanelPadding * 2;
+    const layerPanelHeight = 24 + togglePanelPadding * 2;
+    const layerPanelX = width - layerPanelWidth - 8;
+    const layerPanelY = height - statusBarHeight - viewTogglePanelHeight - layerPanelHeight - 16;
+    if (x >= layerPanelX && x <= layerPanelX + layerPanelWidth &&
+        y >= layerPanelY && y <= layerPanelY + layerPanelHeight) return true;
 
     // Bottom status bar
     if (y >= height - statusBarHeight) return true;

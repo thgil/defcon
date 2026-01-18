@@ -5,6 +5,7 @@ import {
   type GameState,
   type Building,
   type Missile,
+  type PhysicsMissile,
   type City,
   type Territory,
   type GeoPosition,
@@ -14,6 +15,7 @@ import {
   type Satellite,
   type SatelliteLaunchFacility,
   geoToSphere,
+  sphereToGeo,
   getMissilePosition3D,
   getMissileDirection3D,
   geoInterpolate,
@@ -26,6 +28,9 @@ import {
   getSatelliteGroundPosition,
   SatelliteOrbitalParams,
   TERRITORY_GEO_DATA,
+  CITY_GEO_DATA,
+  isPhysicsMissile,
+  GLOBAL_MISSILE_SPEED_MULTIPLIER,
 } from '@defcon/shared';
 import { HUDRenderer } from './HUDRenderer';
 
@@ -52,11 +57,11 @@ const COLORS = {
 };
 
 const GLOBE_RADIUS = 100;
-const MISSILE_MIN_ALTITUDE = 5;  // Minimum altitude for very short flights
-const MISSILE_MAX_ALTITUDE = 35; // Maximum altitude for intercontinental flights
+const MISSILE_MIN_ALTITUDE = 8;  // Minimum altitude for very short flights
+const MISSILE_MAX_ALTITUDE = 50; // Maximum altitude for intercontinental flights (higher for more dramatic arcs)
 
 // Satellite configuration (should match server SATELLITE_CONFIG)
-const SATELLITE_ORBITAL_ALTITUDE = 50;  // Globe units above surface
+const SATELLITE_ORBITAL_ALTITUDE = 120;  // Globe units above surface (above interceptor range)
 const SATELLITE_VISION_RANGE_DEGREES = 12;
 const SATELLITE_RADAR_COMM_RANGE = 90;  // Range to communicate with radar (degrees) - line of sight from orbit
 const SATELLITE_SAT_COMM_RANGE = 90;    // Range for satellite-to-satellite relay (degrees)
@@ -119,6 +124,9 @@ export class GlobeRenderer {
   private radarCoverageGroup: THREE.Group;
   private gridGroup: THREE.Group;
   private satelliteGroup: THREE.Group;
+  private coastlineGroup: THREE.Group;
+  private borderGroup: THREE.Group;
+  private airspaceGroup: THREE.Group;
 
   // View toggles state
   private viewToggles = {
@@ -126,6 +134,9 @@ export class GlobeRenderer {
     grid: true,
     labels: true,
     trails: true,
+    coastlines: true,
+    borders: true,
+    airspaces: true,
   };
 
   // Object maps for efficient updates
@@ -136,7 +147,13 @@ export class GlobeRenderer {
     head: THREE.Group;       // ICBM cone with glow
     maxAltitude: number;     // Calculated based on flight distance
     flightDuration: number;  // Flight duration in ms for phase timing
+    seed: number;            // Unique seed for path variation
     plannedRoute?: THREE.Line; // Full planned path (only for player's missiles)
+    isInterceptor?: boolean; // Whether this is an interceptor missile
+    targetMissileId?: string; // For interceptors: the ID of the ICBM being tracked
+    interceptorTrailHistory?: THREE.Vector3[]; // For interceptors: actual path taken
+    lastTrailProgress?: number; // Last progress when we added a trail point
+    targetQuaternion?: THREE.Quaternion; // Target orientation for smooth interpolation
   }>();
   private satelliteObjects = new Map<string, {
     body: THREE.Group;        // Satellite body mesh
@@ -149,6 +166,7 @@ export class GlobeRenderer {
   private radarSweepLines = new Map<string, { line: THREE.Line; center: THREE.Vector3; outward: THREE.Vector3 }>();
   private fogOfWarMesh: THREE.Mesh | null = null;
   private fogOfWarMaterial: THREE.ShaderMaterial | null = null;
+  private selectedCityInfo: { name: string; population: number; territoryId: string } | null = null;
 
   // Client-side interpolation for smooth missile movement
   private missileInterpolation = new Map<string, {
@@ -158,8 +176,40 @@ export class GlobeRenderer {
     estimatedSpeed: number;  // Progress per second
   }>();
 
-  // Track missile target positions for explosions when they're removed
+  // Track missile positions for explosions when they're removed
   private missileTargets = new Map<string, GeoPosition>();
+  private missileLastPositions = new Map<string, GeoPosition>();
+  private missileWasIntercepted = new Map<string, boolean>();
+
+  // Track missiles that have had ground impact explosions shown (prevent duplicate explosions)
+  private groundImpactMissiles = new Set<string>();
+
+  // Track missiles that have had detonation/interception explosions shown
+  private shownExplosions = new Set<string>();
+
+  // Fading missiles after detonation/interception
+  private fadingMissiles = new Map<string, {
+    objects: {
+      trail: THREE.Line;
+      head: THREE.Group;
+      explosionSphere?: THREE.Mesh;  // Small explosion sphere at destruction point
+    };
+    impactPosition: THREE.Vector3;   // Where the missile exploded
+    trailPoints: THREE.Vector3[];    // Original trail points
+    fadeStartTime: number;           // When fade started
+    fadeDuration: number;            // How long to fade (ms)
+  }>();
+
+  // Uncertain radar contacts - tracks detection confidence and glitch state
+  private uncertainContacts = new Map<string, {
+    confidence: number;              // 0-1, how certain we are this is a real contact
+    classification: 'unknown' | 'anomaly' | 'probable' | 'confirmed';
+    jitteredPosition: GeoPosition;   // Noisy position for display
+    lastFlickerTime: number;         // For flickering effect
+    flickerState: boolean;           // Current visibility in flicker
+    firstDetectedTime: number;       // When we first saw this contact
+    positionNoise: { lat: number; lng: number };  // Persistent noise offset
+  }>();
 
   // Radar coverage calculation
   // Maximum electronic range of radar (about 3000km / 27 degrees)
@@ -174,6 +224,10 @@ export class GlobeRenderer {
   // Raycaster for click detection
   private raycaster = new THREE.Raycaster();
   private mouse = new THREE.Vector2();
+
+  // Drag detection - prevent firing missiles when rotating the globe
+  private mouseDownPosition: { x: number; y: number } | null = null;
+  private readonly DRAG_THRESHOLD = 5; // pixels - if mouse moves more than this, it's a drag
 
   // Click callback
   private onClickCallback: ((geoPosition: GeoPosition) => void) | null = null;
@@ -196,6 +250,22 @@ export class GlobeRenderer {
   private trackedMissileId: string | null = null;
   private cameraTargetGeo: GeoPosition | null = null;
   private cameraAnimating: boolean = false;
+
+  // Communication chain visualization (shown when interceptor is selected)
+  private commChainGroup: THREE.Group;
+  private commChainLines: THREE.Line[] = [];
+  private commChainPackets: THREE.Mesh[] = [];
+  private packetAnimationTime: number = 0;
+
+  // Intercept prediction visualization (shown when interceptor is tracked)
+  private interceptPredictionGroup: THREE.Group;
+  private interceptMarker: THREE.Group | null = null;
+  private interceptChanceLabel: THREE.Sprite | null = null;
+  private flameoutMarker: THREE.Group | null = null;
+  private missileStatsLabel: THREE.Sprite | null = null;
+
+  // Fog of war toggle (for debug mode)
+  private fogOfWarDisabled: boolean = false;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -238,10 +308,18 @@ export class GlobeRenderer {
     this.radarCoverageGroup = new THREE.Group();
     this.gridGroup = new THREE.Group();
     this.satelliteGroup = new THREE.Group();
+    this.coastlineGroup = new THREE.Group();
+    this.borderGroup = new THREE.Group();
+    this.airspaceGroup = new THREE.Group();
 
     this.placementPreviewGroup = new THREE.Group();
+    this.commChainGroup = new THREE.Group();
+    this.interceptPredictionGroup = new THREE.Group();
 
     this.scene.add(this.territoryGroup);
+    this.scene.add(this.coastlineGroup);
+    this.scene.add(this.borderGroup);
+    this.scene.add(this.airspaceGroup);
     this.scene.add(this.radarCoverageGroup);
     this.scene.add(this.gridGroup);
     this.scene.add(this.cityGroup);
@@ -250,6 +328,8 @@ export class GlobeRenderer {
     this.scene.add(this.satelliteGroup);
     this.scene.add(this.effectGroup);
     this.scene.add(this.placementPreviewGroup);
+    this.scene.add(this.commChainGroup);
+    this.scene.add(this.interceptPredictionGroup);
 
     // Create starfield background
     this.createStarfield();
@@ -297,6 +377,7 @@ export class GlobeRenderer {
 
     // Event listeners
     window.addEventListener('resize', this.handleResize);
+    this.renderer.domElement.addEventListener('mousedown', this.handleMouseDown);
     this.renderer.domElement.addEventListener('click', this.handleClick);
     this.renderer.domElement.addEventListener('mousemove', this.handleMouseMove);
 
@@ -306,6 +387,7 @@ export class GlobeRenderer {
 
   destroy(): void {
     window.removeEventListener('resize', this.handleResize);
+    this.renderer.domElement.removeEventListener('mousedown', this.handleMouseDown);
     this.renderer.domElement.removeEventListener('click', this.handleClick);
     this.renderer.domElement.removeEventListener('mousemove', this.handleMouseMove);
 
@@ -324,6 +406,10 @@ export class GlobeRenderer {
     this.playerId = playerId;
     this.updateGameObjects();
     this.hudRenderer.updateState(state, playerId, this.selectedBuilding, this.placementMode);
+  }
+
+  setAlerts(alerts: import('../stores/gameStore').GameAlert[]): void {
+    this.hudRenderer.setAlerts(alerts);
   }
 
   setSelectedBuilding(building: Building | null): void {
@@ -378,6 +464,78 @@ export class GlobeRenderer {
     if (this.gameState) {
       this.hudRenderer.updateState(this.gameState, this.playerId, this.selectedBuilding, mode);
     }
+  }
+
+  // Layer visibility toggles
+  toggleCoastlines(visible?: boolean): boolean {
+    const newState = visible !== undefined ? visible : !this.viewToggles.coastlines;
+    this.viewToggles.coastlines = newState;
+    this.coastlineGroup.visible = newState;
+    return newState;
+  }
+
+  toggleBorders(visible?: boolean): boolean {
+    const newState = visible !== undefined ? visible : !this.viewToggles.borders;
+    this.viewToggles.borders = newState;
+    this.borderGroup.visible = newState;
+    return newState;
+  }
+
+  toggleAirspaces(visible?: boolean): boolean {
+    const newState = visible !== undefined ? visible : !this.viewToggles.airspaces;
+    this.viewToggles.airspaces = newState;
+    this.airspaceGroup.visible = newState;
+    return newState;
+  }
+
+  getLayerVisibility(): { coastlines: boolean; borders: boolean; airspaces: boolean } {
+    return {
+      coastlines: this.viewToggles.coastlines,
+      borders: this.viewToggles.borders,
+      airspaces: this.viewToggles.airspaces,
+    };
+  }
+
+  // Debug panel methods
+  setDebugCallbacks(
+    onDebugCommand: (command: string, value?: number, targetRegion?: string) => void,
+    onEnableAI: (region: string) => void,
+    onDisableAI: () => void
+  ): void {
+    this.hudRenderer.setDebugCallbacks(
+      onDebugCommand,
+      onEnableAI,
+      onDisableAI,
+      (layer) => {
+        switch (layer) {
+          case 'coastlines':
+            return this.toggleCoastlines();
+          case 'borders':
+            return this.toggleBorders();
+          case 'airspaces':
+            return this.toggleAirspaces();
+        }
+      },
+      (enabled) => {
+        this.setFogOfWarEnabled(enabled);
+      }
+    );
+    // Initialize layer visibility in HUD
+    this.hudRenderer.setLayerVisibility(this.getLayerVisibility());
+  }
+
+  setFogOfWarEnabled(enabled: boolean): void {
+    // Track fog of war state (disabled = show everything)
+    this.fogOfWarDisabled = !enabled;
+
+    // Hide/show the visual fog overlay
+    if (this.fogOfWarMesh) {
+      this.fogOfWarMesh.visible = enabled;
+    }
+  }
+
+  toggleDebugPanel(): void {
+    this.hudRenderer.toggleDebugPanel();
   }
 
   private clearPlacementPreview(): void {
@@ -735,8 +893,8 @@ export class GlobeRenderer {
 
   private async loadWorldMap(): Promise<void> {
     try {
-      // Load land polygons first (for filled continents) - 50m resolution
-      const landResponse = await fetch('/assets/world-land-50m.geojson');
+      // Load land polygons first (for filled continents) - 110m resolution for faster loading
+      const landResponse = await fetch('/assets/world-land.geojson');
       const landGeojson = await landResponse.json();
 
       const landMaterial = new THREE.MeshBasicMaterial({
@@ -771,8 +929,8 @@ export class GlobeRenderer {
         }
       }
 
-      // Load coastlines for outlines - this gives us clean continent boundaries (50m resolution)
-      const coastResponse = await fetch('/assets/world-coastline-50m.geojson');
+      // Load coastlines for outlines - this gives us clean continent boundaries (110m resolution for faster loading)
+      const coastResponse = await fetch('/assets/world-coastline.geojson');
       const coastGeojson = await coastResponse.json();
 
       const lineMaterial = new THREE.LineBasicMaterial({
@@ -788,7 +946,7 @@ export class GlobeRenderer {
           if (points.length > 1) {
             const geometry = new THREE.BufferGeometry().setFromPoints(points);
             const line = new THREE.Line(geometry, lineMaterial);
-            this.scene.add(line);
+            this.coastlineGroup.add(line);
           }
         } else if (feature.geometry.type === 'MultiLineString') {
           for (const coords of feature.geometry.coordinates) {
@@ -796,7 +954,7 @@ export class GlobeRenderer {
             if (points.length > 1) {
               const geometry = new THREE.BufferGeometry().setFromPoints(points);
               const line = new THREE.Line(geometry, lineMaterial);
-              this.scene.add(line);
+              this.coastlineGroup.add(line);
             }
           }
         }
@@ -818,7 +976,7 @@ export class GlobeRenderer {
           if (points.length > 1) {
             const geometry = new THREE.BufferGeometry().setFromPoints(points);
             const line = new THREE.Line(geometry, borderMaterial);
-            this.scene.add(line);
+            this.borderGroup.add(line);
           }
         } else if (feature.geometry.type === 'MultiLineString') {
           for (const coords of feature.geometry.coordinates) {
@@ -826,7 +984,7 @@ export class GlobeRenderer {
             if (points.length > 1) {
               const geometry = new THREE.BufferGeometry().setFromPoints(points);
               const line = new THREE.Line(geometry, borderMaterial);
-              this.scene.add(line);
+              this.borderGroup.add(line);
             }
           }
         }
@@ -845,18 +1003,18 @@ export class GlobeRenderer {
 
   private drawTerritoryBoundaries(): void {
     const boundaryMaterial = new THREE.LineDashedMaterial({
-      color: 0x334455,
-      dashSize: 3,
+      color: 0x4a6080,
+      dashSize: 4,
       gapSize: 2,
       transparent: true,
-      opacity: 0.6,
+      opacity: 0.8,
     });
 
     for (const territory of Object.values(TERRITORY_GEO_DATA)) {
       const points: THREE.Vector3[] = [];
 
       for (const coord of territory.boundaryCoords) {
-        const pos = geoToSphere(coord, GLOBE_RADIUS + 0.7);
+        const pos = geoToSphere(coord, GLOBE_RADIUS + 4);
         points.push(new THREE.Vector3(pos.x, pos.y, pos.z));
       }
 
@@ -868,7 +1026,7 @@ export class GlobeRenderer {
       const geometry = new THREE.BufferGeometry().setFromPoints(points);
       const line = new THREE.Line(geometry, boundaryMaterial);
       line.computeLineDistances(); // Required for dashed lines
-      this.scene.add(line);
+      this.airspaceGroup.add(line);
     }
   }
 
@@ -1002,10 +1160,24 @@ export class GlobeRenderer {
   // Check if a geographic position is within radar coverage
   // Uses realistic horizon-limited detection: higher altitude = farther detection range
   private isWithinRadarCoverage(geoPos: GeoPosition, altitudeKm: number = 0): boolean {
+    const info = this.getRadarDetectionInfo(geoPos, altitudeKm);
+    return info.detected;
+  }
+
+  // Get detailed radar detection info including confidence level
+  // Confidence decreases near the edge of radar range (uncertainty zone)
+  private getRadarDetectionInfo(geoPos: GeoPosition, altitudeKm: number = 0): {
+    detected: boolean;
+    confidence: number;  // 0-1: 0 = edge of range, 1 = very close to radar
+    closestRadarDistance: number;  // Angular distance to nearest radar
+    effectiveRange: number;  // Effective radar range in degrees
+  } {
     const radarPositions = this.getPlayerRadarPositions();
 
     // Always visible if player has no radars (early game) - TODO: revisit this
-    if (radarPositions.length === 0) return true;
+    if (radarPositions.length === 0) {
+      return { detected: true, confidence: 1, closestRadarDistance: 0, effectiveRange: this.RADAR_MAX_RANGE_DEGREES };
+    }
 
     // Calculate horizon-limited range based on target altitude
     // Formula: horizon distance = √(2*R*h_radar) + √(2*R*h_target)
@@ -1020,14 +1192,51 @@ export class GlobeRenderer {
     // Effective range is minimum of horizon limit and electronic max range
     const effectiveRangeDegrees = Math.min(horizonRangeDegrees, this.RADAR_MAX_RANGE_DEGREES);
 
+    let closestDistance = Infinity;
+    let detected = false;
+
     for (const radarPos of radarPositions) {
       // Calculate angular distance using great circle formula
       const angularDistance = this.calculateAngularDistance(geoPos, radarPos);
+      closestDistance = Math.min(closestDistance, angularDistance);
       if (angularDistance <= effectiveRangeDegrees) {
-        return true;
+        detected = true;
       }
     }
-    return false;
+
+    // Calculate confidence based on distance ratio
+    // 0-60% of range: confidence = 1 (clear detection)
+    // 60-85% of range: confidence decreases (getting fuzzy)
+    // 85-100% of range: confidence low (very uncertain, flickery)
+    // 100-115% of range: detection possible but very unreliable (edge anomalies)
+    let confidence = 0;
+    if (detected) {
+      const rangeRatio = closestDistance / effectiveRangeDegrees;
+      if (rangeRatio <= 0.6) {
+        confidence = 1.0;
+      } else if (rangeRatio <= 0.85) {
+        // Linear decrease from 1.0 to 0.7
+        confidence = 1.0 - (rangeRatio - 0.6) / 0.25 * 0.3;
+      } else {
+        // Steep decrease from 0.7 to 0.2
+        confidence = 0.7 - (rangeRatio - 0.85) / 0.15 * 0.5;
+      }
+    } else {
+      // Not officially detected, but check for edge anomalies
+      // Contacts at 100-115% of range may flicker in and out
+      const rangeRatio = closestDistance / effectiveRangeDegrees;
+      if (rangeRatio <= 1.15) {
+        confidence = Math.max(0, 0.2 - (rangeRatio - 1.0) * 1.33);
+        detected = confidence > 0.05; // Can still "detect" if close enough to edge
+      }
+    }
+
+    return {
+      detected,
+      confidence: Math.max(0, Math.min(1, confidence)),
+      closestRadarDistance: closestDistance,
+      effectiveRange: effectiveRangeDegrees,
+    };
   }
 
   // Calculate the current altitude of a missile based on its flight progress
@@ -1313,65 +1522,98 @@ export class GlobeRenderer {
     // Mark existing cities for removal
     const existingIds = new Set(this.cityMarkers.keys());
 
+    // Build a map of game state cities by name+territory for matching
+    const gameStateCities = new Map<string, City>();
     for (const city of getCities(this.gameState)) {
-      const territory = this.gameState.territories[city.territoryId];
-      const isMine = territory?.ownerId === this.playerId;
+      gameStateCities.set(`${city.territoryId}:${city.name}`, city);
+    }
 
-      // Get position from geoPosition or fall back to calculated position
-      const geoPos = city.geoPosition || this.pixelToGeoFallback(city.position);
+    // Render all cities from CITY_GEO_DATA
+    for (const [territoryId, cities] of Object.entries(CITY_GEO_DATA)) {
+      for (const cityData of cities) {
+        const cityKey = `${territoryId}:${cityData.name}`;
+        const gameCity = gameStateCities.get(cityKey);
 
-      // Check fog of war - hide enemy cities outside radar coverage
-      if (!isMine && !this.isWithinRadarCoverage(geoPos)) {
-        // Remove marker if it exists but is now hidden
-        const existingGroup = this.cityMarkers.get(city.id);
-        if (existingGroup) {
-          this.cityGroup.remove(existingGroup);
-          this.disposeCityGroup(existingGroup);
-          this.cityMarkers.delete(city.id);
+        // Determine ownership and color
+        const territory = this.gameState.territories[territoryId];
+        const hasOwner = territory?.ownerId != null;
+        const isMine = territory?.ownerId === this.playerId;
+        const isEnemy = hasOwner && !isMine;
+
+        const geoPos = cityData.position;
+        const population = gameCity?.population ?? cityData.population;
+        const destroyed = gameCity?.destroyed ?? false;
+
+        // Check fog of war - hide enemy cities outside coverage
+        if (isEnemy && !this.isWithinCoverage(geoPos)) {
+          const existingGroup = this.cityMarkers.get(cityKey);
+          if (existingGroup) {
+            this.cityGroup.remove(existingGroup);
+            this.disposeCityGroup(existingGroup);
+            this.cityMarkers.delete(cityKey);
+          }
+          continue;
         }
-        continue;
-      }
 
-      existingIds.delete(city.id);
+        existingIds.delete(cityKey);
 
-      const pos3d = geoToSphere(geoPos, GLOBE_RADIUS + 0.5);
-      const color = city.destroyed ? COLORS.cityDestroyed : (isMine ? COLORS.friendly : COLORS.enemy);
+        const pos3d = geoToSphere(geoPos, GLOBE_RADIUS + 0.5);
+        let color: number;
+        if (destroyed) {
+          color = COLORS.cityDestroyed;
+        } else if (isMine) {
+          color = COLORS.friendly;
+        } else if (isEnemy) {
+          color = COLORS.enemy;
+        } else {
+          color = COLORS.neutral; // Gray for unowned cities
+        }
 
-      let group = this.cityMarkers.get(city.id);
+        let group = this.cityMarkers.get(cityKey);
 
-      if (!group) {
-        group = new THREE.Group();
-        group.userData = { type: 'city', id: city.id };
+        if (!group) {
+          group = new THREE.Group();
+          group.userData = {
+            type: 'city',
+            id: cityKey,
+            name: cityData.name,
+            population: population,
+            territoryId: territoryId,
+          };
 
-        // Create smaller city marker (dot)
-        const size = Math.max(0.4, Math.sqrt(city.population / 1000000) * 0.25);
-        const geometry = new THREE.SphereGeometry(size, 8, 8);
-        const material = new THREE.MeshBasicMaterial({ color });
-        const marker = new THREE.Mesh(geometry, material);
-        marker.name = 'marker';
-        group.add(marker);
+          // Create smaller city marker (dot)
+          const size = Math.max(0.4, Math.sqrt(population / 1000000) * 0.25);
+          const geometry = new THREE.SphereGeometry(size, 8, 8);
+          const material = new THREE.MeshBasicMaterial({ color });
+          const marker = new THREE.Mesh(geometry, material);
+          marker.name = 'marker';
+          group.add(marker);
 
-        // Create text label
-        const label = this.createTextSprite(city.name, color);
-        label.name = 'label';
-        label.position.set(0, size + 1.5, 0); // Position above the marker
-        group.add(label);
+          // Create text label
+          const label = this.createTextSprite(cityData.name, color);
+          label.name = 'label';
+          label.position.set(0, size + 1.5, 0); // Position above the marker
+          group.add(label);
 
-        this.cityGroup.add(group);
-        this.cityMarkers.set(city.id, group);
-      }
+          this.cityGroup.add(group);
+          this.cityMarkers.set(cityKey, group);
+        }
 
-      // Update position
-      group.position.set(pos3d.x, pos3d.y, pos3d.z);
+        // Update population in userData
+        group.userData.population = population;
 
-      // Orient the group to face outward from globe center
-      group.lookAt(0, 0, 0);
-      group.rotateX(Math.PI); // Flip so label is right-side up
+        // Update position
+        group.position.set(pos3d.x, pos3d.y, pos3d.z);
 
-      // Update colors
-      const marker = group.getObjectByName('marker') as THREE.Mesh;
-      if (marker) {
-        (marker.material as THREE.MeshBasicMaterial).color.setHex(color);
+        // Orient the group to face outward from globe center
+        group.lookAt(0, 0, 0);
+        group.rotateX(Math.PI); // Flip so label is right-side up
+
+        // Update colors
+        const marker = group.getObjectByName('marker') as THREE.Mesh;
+        if (marker) {
+          (marker.material as THREE.MeshBasicMaterial).color.setHex(color);
+        }
       }
     }
 
@@ -1440,8 +1682,8 @@ export class GlobeRenderer {
       const isMine = building.ownerId === this.playerId;
       const geoPos = building.geoPosition || this.pixelToGeoFallback(building.position);
 
-      // Check fog of war - hide enemy buildings outside radar coverage
-      if (!isMine && !this.isWithinRadarCoverage(geoPos)) {
+      // Check fog of war - hide enemy buildings outside radar coverage (unless fog of war is disabled)
+      if (!isMine && !this.fogOfWarDisabled && !this.isWithinRadarCoverage(geoPos)) {
         // Remove marker if it exists but is now hidden
         const existingMarker = this.buildingMarkers.get(building.id);
         if (existingMarker) {
@@ -1603,86 +1845,257 @@ export class GlobeRenderer {
     for (const missile of getMissiles(this.gameState)) {
       currentMissileIds.add(missile.id);
 
-      // Track target position for explosion when missile is removed
-      const targetGeo = missile.geoTargetPosition || this.pixelToGeoFallback(missile.targetPosition);
+      // Track positions for explosion when missile is removed
+      // Physics missiles may have undefined legacy position fields - use geo fields or defaults
+      const targetGeo = missile.geoTargetPosition
+        || (missile.targetPosition ? this.pixelToGeoFallback(missile.targetPosition) : { lat: 0, lng: 0 });
       this.missileTargets.set(missile.id, targetGeo);
 
       const isMine = missile.ownerId === this.playerId;
-      const currentGeo = missile.geoCurrentPosition || this.pixelToGeoFallback(missile.currentPosition);
-      const startGeo = missile.geoLaunchPosition || this.pixelToGeoFallback(missile.launchPosition);
+      const currentGeo = missile.geoCurrentPosition
+        || (missile.currentPosition ? this.pixelToGeoFallback(missile.currentPosition) : { lat: 0, lng: 0 });
+      const startGeo = missile.geoLaunchPosition
+        || (missile.launchPosition ? this.pixelToGeoFallback(missile.launchPosition) : { lat: 0, lng: 0 });
+
+      // Always track last known position and intercepted status
+      this.missileLastPositions.set(missile.id, currentGeo);
+      if (missile.intercepted) {
+        this.missileWasIntercepted.set(missile.id, true);
+      }
 
       if (missile.detonated || missile.intercepted) {
-        // Show explosion effect at appropriate location
         // Detonated = at target, Intercepted = at current position (interception point)
         const explosionGeo = missile.intercepted ? currentGeo : targetGeo;
-        this.showExplosionAt(explosionGeo);
-        // Clean up
+
+        // Show explosion effect (only once per missile)
+        if (!this.shownExplosions.has(missile.id)) {
+          this.showExplosionAt(explosionGeo);
+          this.shownExplosions.add(missile.id);
+        }
+
+        // Move missile to fading state instead of immediate removal
+        const objects = this.missileObjects.get(missile.id);
+        if (objects) {
+          // Get impact position in 3D
+          const impactPos3d = geoToSphere(explosionGeo, GLOBE_RADIUS + 2);
+          const impactVec = new THREE.Vector3(impactPos3d.x, impactPos3d.y, impactPos3d.z);
+
+          // Extract current trail points
+          const trailGeom = objects.trail.geometry;
+          const posAttr = trailGeom.getAttribute('position');
+          const trailPoints: THREE.Vector3[] = [];
+          if (posAttr) {
+            for (let i = 0; i < posAttr.count; i++) {
+              trailPoints.push(new THREE.Vector3(
+                posAttr.getX(i),
+                posAttr.getY(i),
+                posAttr.getZ(i)
+              ));
+            }
+          }
+
+          // Add to fading missiles (no separate explosion sphere - showExplosionAt handles the effect)
+          this.fadingMissiles.set(missile.id, {
+            objects: {
+              trail: objects.trail,
+              head: objects.head,
+            },
+            impactPosition: impactVec,
+            trailPoints: trailPoints,
+            fadeStartTime: Date.now(),
+            fadeDuration: 2000, // 2 seconds fade
+          });
+
+          // Remove planned route if exists
+          if (objects.plannedRoute) {
+            this.missileGroup.remove(objects.plannedRoute);
+            objects.plannedRoute.geometry.dispose();
+            (objects.plannedRoute.material as THREE.Material).dispose();
+          }
+
+          // Remove from active missiles (but keep objects in scene for fading)
+          this.missileObjects.delete(missile.id);
+        }
+
+        // Clean up tracking
         this.missileInterpolation.delete(missile.id);
         this.missileTargets.delete(missile.id);
+        this.missileLastPositions.delete(missile.id);
+        this.missileWasIntercepted.delete(missile.id);
         continue;
       }
 
-      // Check fog of war - hide enemy missiles outside radar coverage
+      // Check fog of war - hide enemy missiles outside radar coverage (unless fog of war is disabled)
       // Calculate missile altitude for horizon-limited radar detection
-      const missileAltitudeKm = this.calculateMissileAltitudeKm(startGeo, targetGeo, missile.progress, missile.flightDuration);
-      if (!isMine && !this.isWithinRadarCoverage(currentGeo, missileAltitudeKm)) {
-        // Remove marker if it exists but is now hidden
+      // Use defaults for physics missiles where progress/flightDuration might be undefined
+      const missileProgress = missile.progress ?? 0;
+      const missileFlightDuration = missile.flightDuration ?? 30000;
+      const missileAltitudeKm = this.calculateMissileAltitudeKm(startGeo, targetGeo, missileProgress, missileFlightDuration);
+
+      // Get detailed detection info for uncertainty effects
+      const detectionInfo = this.getRadarDetectionInfo(currentGeo, missileAltitudeKm);
+
+      // Track uncertain contacts and apply glitch effects for enemy missiles
+      let uncertainContact = this.uncertainContacts.get(missile.id);
+      let displayConfidence = 1.0;
+      let shouldFlicker = false;
+      let classification: 'unknown' | 'anomaly' | 'probable' | 'confirmed' = 'confirmed';
+
+      if (!isMine && !this.fogOfWarDisabled) {
+        if (!detectionInfo.detected) {
+          // Remove marker if it exists but is now hidden
+          const existingObjects = this.missileObjects.get(missile.id);
+          if (existingObjects) {
+            this.missileGroup.remove(existingObjects.trail);
+            this.missileGroup.remove(existingObjects.head);
+            if (existingObjects.plannedRoute) {
+              this.missileGroup.remove(existingObjects.plannedRoute);
+            }
+            this.disposeMissileObjects(existingObjects);
+            this.missileObjects.delete(missile.id);
+          }
+          this.missileInterpolation.delete(missile.id);
+          this.uncertainContacts.delete(missile.id);
+          continue;
+        }
+
+        // Apply detection uncertainty for enemy missiles
+        displayConfidence = detectionInfo.confidence;
+
+        // Initialize or update uncertain contact tracking
+        if (!uncertainContact) {
+          // Generate persistent noise for this contact
+          const noiseScale = 3.0; // degrees of position uncertainty at low confidence
+          uncertainContact = {
+            confidence: displayConfidence,
+            classification: 'unknown',
+            jitteredPosition: currentGeo,
+            lastFlickerTime: now,
+            flickerState: true,
+            firstDetectedTime: now,
+            positionNoise: {
+              lat: (Math.random() - 0.5) * 2 * noiseScale,
+              lng: (Math.random() - 0.5) * 2 * noiseScale,
+            },
+          };
+          this.uncertainContacts.set(missile.id, uncertainContact);
+        }
+
+        // Update confidence with some smoothing
+        uncertainContact.confidence = uncertainContact.confidence * 0.9 + displayConfidence * 0.1;
+        displayConfidence = uncertainContact.confidence;
+
+        // Determine classification based on confidence and time tracked
+        const timeTracked = now - uncertainContact.firstDetectedTime;
+        if (displayConfidence >= 0.9 || timeTracked > 8000) {
+          classification = 'confirmed';
+        } else if (displayConfidence >= 0.7 || timeTracked > 4000) {
+          classification = 'probable';
+        } else if (displayConfidence >= 0.4 || timeTracked > 1500) {
+          classification = 'anomaly';
+        } else {
+          classification = 'unknown';
+        }
+        uncertainContact.classification = classification;
+
+        // Flickering effect at low confidence
+        // The lower the confidence, the more frequent and longer the flicker
+        if (displayConfidence < 0.85) {
+          const flickerInterval = 100 + (1 - displayConfidence) * 400; // 100-500ms between flickers
+          const flickerDuration = 50 + (1 - displayConfidence) * 150;  // 50-200ms flicker off time
+
+          if (now - uncertainContact.lastFlickerTime > flickerInterval) {
+            uncertainContact.flickerState = false;
+            uncertainContact.lastFlickerTime = now;
+          }
+          if (!uncertainContact.flickerState && now - uncertainContact.lastFlickerTime > flickerDuration) {
+            uncertainContact.flickerState = true;
+          }
+          shouldFlicker = !uncertainContact.flickerState;
+        } else {
+          uncertainContact.flickerState = true;
+        }
+      }
+
+      // Skip rendering this frame if flickering off
+      if (shouldFlicker && displayConfidence < 0.5) {
+        // At very low confidence, actually hide the missile during flicker
         const existingObjects = this.missileObjects.get(missile.id);
         if (existingObjects) {
-          this.missileGroup.remove(existingObjects.trail);
-          this.missileGroup.remove(existingObjects.head);
-          if (existingObjects.plannedRoute) {
-            this.missileGroup.remove(existingObjects.plannedRoute);
-          }
-          this.disposeMissileObjects(existingObjects);
-          this.missileObjects.delete(missile.id);
+          existingObjects.head.visible = false;
+          existingObjects.trail.visible = false;
         }
-        this.missileInterpolation.delete(missile.id);
         continue;
       }
 
       existingIds.delete(missile.id);
 
-      // Color based on missile type: interceptors are cyan, ICBMs are red
+      // Color based on ownership: player = blue, enemy = red, interceptors = cyan
+      // Apply uncertainty tint for unclear contacts
       const isInterceptor = missile.type === 'interceptor';
-      const color = isInterceptor ? COLORS.interceptor : COLORS.missile;
+      let color: number;
+      if (isInterceptor) {
+        color = COLORS.interceptor; // Cyan
+      } else if (isMine) {
+        color = 0x2266ff; // Blue for player
+      } else {
+        // Enemy missile color varies by classification
+        if (classification === 'confirmed') {
+          color = COLORS.missile; // Red for confirmed enemy
+        } else if (classification === 'probable') {
+          color = 0xff6600; // Orange for probable
+        } else if (classification === 'anomaly') {
+          color = 0xffaa00; // Yellow-orange for anomaly
+        } else {
+          color = 0xffff00; // Yellow for unknown
+        }
+      }
 
       // Client-side interpolation for smooth movement
-      let interpolatedProgress = missile.progress;
+      // Use defaults for physics missiles that may have undefined progress/flightDuration
+      let interpolatedProgress = missileProgress;
       let interpState = this.missileInterpolation.get(missile.id);
 
-      if (!interpState) {
-        // New missile - initialize interpolation state
-        interpState = {
-          lastProgress: missile.progress,
-          lastUpdateTime: now,
-          targetProgress: missile.progress,
-          estimatedSpeed: 1 / (missile.flightDuration / 1000), // Progress per second
-        };
-        this.missileInterpolation.set(missile.id, interpState);
-      } else {
-        // Check if server sent a new progress value
-        if (Math.abs(missile.progress - interpState.targetProgress) > 0.0001) {
-          // New server update received - update interpolation target
-          const timeSinceLastUpdate = (now - interpState.lastUpdateTime) / 1000;
-          if (timeSinceLastUpdate > 0.01) {
-            // Estimate speed from the delta
-            const progressDelta = missile.progress - interpState.targetProgress;
-            interpState.estimatedSpeed = Math.max(progressDelta / timeSinceLastUpdate, 0.001);
+      // Skip interpolation for physics missiles - they use server position directly
+      if (!isPhysicsMissile(missile)) {
+        if (!interpState) {
+          // New missile - initialize interpolation state
+          // Guard against division by zero if flight duration is 0
+          const flightDurationSec = Math.max(1, missileFlightDuration / 1000);
+          interpState = {
+            lastProgress: missileProgress,
+            lastUpdateTime: now,
+            targetProgress: missileProgress,
+            estimatedSpeed: 1 / flightDurationSec, // Progress per second
+          };
+          this.missileInterpolation.set(missile.id, interpState);
+        } else {
+          // Check if server sent a new progress value
+          if (Math.abs(missileProgress - interpState.targetProgress) > 0.0001) {
+            // New server update received - update interpolation target
+            const timeSinceLastUpdate = (now - interpState.lastUpdateTime) / 1000;
+            if (timeSinceLastUpdate > 0.01) {
+              // Estimate speed from the delta
+              const progressDelta = missileProgress - interpState.targetProgress;
+              interpState.estimatedSpeed = Math.max(progressDelta / timeSinceLastUpdate, 0.001);
+            }
+            interpState.lastProgress = interpState.targetProgress;
+            interpState.targetProgress = missileProgress;
+            interpState.lastUpdateTime = now;
           }
-          interpState.lastProgress = interpState.targetProgress;
-          interpState.targetProgress = missile.progress;
-          interpState.lastUpdateTime = now;
+
+          // Smoothly interpolate towards target progress
+          const timeSinceUpdate = (now - interpState.lastUpdateTime) / 1000;
+          const predictedProgress = interpState.targetProgress + interpState.estimatedSpeed * timeSinceUpdate;
+
+          // Blend between last known and predicted, capped at target + small buffer
+          interpolatedProgress = Math.min(predictedProgress, interpState.targetProgress + 0.02);
+          interpolatedProgress = Math.max(interpolatedProgress, interpState.targetProgress);
+
+          // Cap at 1.0 for normal missiles, but allow up to 1.5 for missed interceptors
+          const maxProgress = (isInterceptor && missile.missedTarget) ? 1.5 : 1.0;
+          interpolatedProgress = Math.min(interpolatedProgress, maxProgress);
         }
-
-        // Smoothly interpolate towards target progress
-        const timeSinceUpdate = (now - interpState.lastUpdateTime) / 1000;
-        const predictedProgress = interpState.targetProgress + interpState.estimatedSpeed * timeSinceUpdate;
-
-        // Blend between last known and predicted, capped at target + small buffer
-        interpolatedProgress = Math.min(predictedProgress, interpState.targetProgress + 0.02);
-        interpolatedProgress = Math.max(interpolatedProgress, interpState.targetProgress);
-        interpolatedProgress = Math.min(interpolatedProgress, 1.0);
       }
 
       // startGeo and targetGeo already defined above
@@ -1690,128 +2103,525 @@ export class GlobeRenderer {
       let objects = this.missileObjects.get(missile.id);
 
       // Calculate max altitude based on distance (only once per missile)
+      // Interceptors fly at lower altitude than ICBMs
       let maxAltitude: number;
+      let seed: number;
       if (!objects) {
-        maxAltitude = calculateMissileAltitude(startGeo, targetGeo);
+        const baseAltitude = calculateMissileAltitude(startGeo, targetGeo);
+        maxAltitude = isInterceptor ? baseAltitude * 0.4 : baseAltitude; // Interceptors fly lower
+        // Generate deterministic seed from missile ID
+        seed = this.hashStringToNumber(missile.id);
 
         // Create traveled trail - shows where missile has been
-        const trailPoints = this.calculateTraveledTrailSmooth(startGeo, targetGeo, interpolatedProgress, maxAltitude, missile.flightDuration);
+        // Interceptor trails are thinner and use historical tracking
+        let trailPoints: THREE.Vector3[];
+        if (isInterceptor) {
+          // Start with just the launch position - will be filled in each frame
+          const launchPos = geoToSphere(startGeo, GLOBE_RADIUS);
+          trailPoints = [new THREE.Vector3(launchPos.x, launchPos.y, launchPos.z)];
+        } else {
+          trailPoints = this.calculateTraveledTrailSmooth(startGeo, targetGeo, interpolatedProgress, maxAltitude, missileFlightDuration, seed);
+        }
         const trailGeom = new THREE.BufferGeometry().setFromPoints(trailPoints);
         const trailMat = new THREE.LineBasicMaterial({
           color: color,
           transparent: true,
-          opacity: 0.7,
+          opacity: isInterceptor ? 0.25 : 0.35,
         });
         const trail = new THREE.Line(trailGeom, trailMat);
 
-        // Create ICBM-shaped head (cone with glowing tip)
-        const head = this.createICBMHead(isInterceptor);
+        // Create missile head (smaller for interceptors, colored by ownership)
+        const head = this.createICBMHead(isInterceptor, isMine);
 
         this.missileGroup.add(trail);
         this.missileGroup.add(head);
 
         // Create planned route line for player's missiles (light gray full path)
+        // For interceptors, skip planned route since target changes dynamically
         let plannedRoute: THREE.Line | undefined;
-        if (isMine) {
-          const routePoints = this.calculateFullRoutePath(startGeo, targetGeo, maxAltitude, missile.flightDuration);
+        if (isMine && !isInterceptor) {
+          const routePoints = this.calculateFullRoutePath(startGeo, targetGeo, maxAltitude, missileFlightDuration, seed);
           const routeGeom = new THREE.BufferGeometry().setFromPoints(routePoints);
           const routeMat = new THREE.LineBasicMaterial({
             color: 0x888888,  // Light gray
             transparent: true,
-            opacity: 0.4,
+            opacity: 0.2,
             linewidth: 1,
           });
           plannedRoute = new THREE.Line(routeGeom, routeMat);
           this.missileGroup.add(plannedRoute);
         }
 
-        objects = { trail, head, maxAltitude, flightDuration: missile.flightDuration, plannedRoute };
+        // For interceptors, initialize trail history with launch position
+        const interceptorTrailHistory = isInterceptor ? [new THREE.Vector3(
+          geoToSphere(startGeo, GLOBE_RADIUS).x,
+          geoToSphere(startGeo, GLOBE_RADIUS).y,
+          geoToSphere(startGeo, GLOBE_RADIUS).z
+        )] : undefined;
+
+        objects = { trail, head, maxAltitude, flightDuration: missileFlightDuration, seed, plannedRoute, isInterceptor, targetMissileId: missile.targetId, interceptorTrailHistory, lastTrailProgress: 0 };
         this.missileObjects.set(missile.id, objects);
       } else {
         maxAltitude = objects.maxAltitude;
+        seed = objects.seed;
+
+        // Update trail color for existing missiles (for classification changes)
+        if (!isMine && !isInterceptor) {
+          const trailMat = objects.trail.material as THREE.LineBasicMaterial;
+          trailMat.color.setHex(color);
+        }
       }
 
-      // Get 3D position using linear progress (altitude easing is handled inside getMissilePosition3D)
-      const pos3d = getMissilePosition3D(startGeo, targetGeo, interpolatedProgress, maxAltitude, GLOBE_RADIUS, objects.flightDuration);
+      // Get 3D position
+      // Physics missiles (new interceptors) use position from server directly
+      // Legacy missiles use curve-based calculation
+      let pos3d: { x: number; y: number; z: number };
 
-      // Update ICBM position and orientation
+      // Calculate flameout progress for legacy interceptors (when fuel runs out)
+      // For physics missiles, engine flameout is tracked server-side via engineFlameout field
+      const flameoutProgress = isInterceptor && !isPhysicsMissile(missile)
+        ? this.calculateFlameoutProgress(missile)
+        : 1.0;
+
+      if (isPhysicsMissile(missile)) {
+        // Physics-based interceptor: use server-provided position directly
+        pos3d = { ...missile.position };
+      } else if (isInterceptor && missile.targetId) {
+        // Legacy interceptor: use trajectory calculation
+        const boostEnd = missile.boostEndProgress ?? 0.25;
+        pos3d = this.getInterceptorPositionTowardTarget(
+          startGeo,
+          interpolatedProgress,
+          missile.targetId,
+          boostEnd,
+          missile.flightPhase,
+          missile.missedTarget,
+          missile.missDirection,
+          flameoutProgress
+        );
+      } else {
+        // ICBM: use standard ballistic trajectory
+        pos3d = getMissilePosition3D(startGeo, targetGeo, interpolatedProgress, maxAltitude, GLOBE_RADIUS, objects.flightDuration, seed);
+      }
+
+      // Check for ground impact on missed interceptors
+      if (isInterceptor && missile.missedTarget && missileProgress > 1) {
+        const altitude = Math.sqrt(pos3d.x * pos3d.x + pos3d.y * pos3d.y + pos3d.z * pos3d.z) - GLOBE_RADIUS;
+        if (altitude <= 0.5 && !this.groundImpactMissiles.has(missile.id)) {
+          // Ground impact! Create small explosion (only once per missile)
+          this.createGroundImpactExplosion(pos3d);
+          this.groundImpactMissiles.add(missile.id);
+        }
+      }
+
+      // Update ICBM position and orientation (no jitter - show actual position)
       objects.head.position.set(pos3d.x, pos3d.y, pos3d.z);
 
-      // Orient ICBM along flight path
-      const direction = getMissileDirection3D(startGeo, targetGeo, interpolatedProgress, maxAltitude, GLOBE_RADIUS, objects.flightDuration);
-      const dirVec = new THREE.Vector3(direction.x, direction.y, direction.z);
-      const targetPos = new THREE.Vector3(pos3d.x + dirVec.x, pos3d.y + dirVec.y, pos3d.z + dirVec.z);
-      objects.head.lookAt(targetPos);
+      // For uncertain contacts, apply subtle opacity-based uncertainty (no wobble)
+      if (uncertainContact && displayConfidence < 0.9 && !isMine) {
+        // Simple opacity based on confidence - no scale or position wobble
+        const finalOpacity = 0.5 + displayConfidence * 0.5; // 0.5-1.0 based on confidence
+
+        objects.head.traverse((child) => {
+          if (child instanceof THREE.Mesh && child.material) {
+            const mat = child.material as THREE.MeshBasicMaterial | THREE.MeshStandardMaterial;
+            if (mat.transparent !== undefined) {
+              mat.transparent = true;
+              mat.opacity = finalOpacity;
+            }
+          }
+        });
+
+        const trailMat = objects.trail.material as THREE.LineBasicMaterial;
+        trailMat.opacity = finalOpacity * 0.35;
+
+        objects.head.visible = true;
+        objects.trail.visible = true;
+      } else if (!isMine && objects.head) {
+        // Full opacity for confirmed contacts
+        objects.head.traverse((child) => {
+          if (child instanceof THREE.Mesh && child.material) {
+            const mat = child.material as THREE.MeshBasicMaterial | THREE.MeshStandardMaterial;
+            if (mat.transparent !== undefined) {
+              mat.opacity = 1.0;
+            }
+          }
+        });
+        const trailMat = objects.trail.material as THREE.LineBasicMaterial;
+        trailMat.opacity = 0.35;
+        objects.head.visible = true;
+        objects.trail.visible = true;
+      }
+
+      // Apply fade effect for coasting physics missiles approaching timeout
+      if (isPhysicsMissile(missile) && missile.engineFlameout && missile.flameoutTime) {
+        const coastTimeout = 15 / GLOBAL_MISSILE_SPEED_MULTIPLIER; // Matches server's scaled coastTimeout
+        const coastTime = (now - missile.flameoutTime) / 1000;
+        // Start fading 5 seconds before despawn
+        const fadeStartTime = coastTimeout - 5;
+        if (coastTime > fadeStartTime) {
+          const fadeProgress = (coastTime - fadeStartTime) / 5; // 0 to 1 over 5 seconds
+          const fadeOpacity = Math.max(0.1, 1 - fadeProgress * 0.9); // Fade from 1.0 to 0.1
+
+          objects.head.traverse((child) => {
+            if (child instanceof THREE.Mesh && child.material) {
+              const mat = child.material as THREE.MeshBasicMaterial | THREE.MeshStandardMaterial;
+              if (mat.transparent !== undefined) {
+                mat.transparent = true;
+                mat.opacity = fadeOpacity;
+              }
+            }
+          });
+
+          const trailMat = objects.trail.material as THREE.LineBasicMaterial;
+          trailMat.opacity = fadeOpacity * 0.35;
+        }
+      }
+
+      // Orient missile along flight path (direction of movement)
+      let lookTarget: THREE.Vector3 | null = null;
+
+      if (isPhysicsMissile(missile)) {
+        // Physics missile: orient along velocity vector (or heading if velocity is zero)
+        const vel = missile.velocity;
+        const velMag = Math.sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
+        if (velMag > 0.01) {
+          // Point along velocity direction
+          lookTarget = new THREE.Vector3(
+            pos3d.x + vel.x,
+            pos3d.y + vel.y,
+            pos3d.z + vel.z
+          );
+        } else {
+          // No velocity yet - use heading
+          const hdg = missile.heading;
+          lookTarget = new THREE.Vector3(
+            pos3d.x + hdg.x,
+            pos3d.y + hdg.y,
+            pos3d.z + hdg.z
+          );
+        }
+      } else if (isInterceptor && missile.targetId && this.gameState) {
+        // Legacy interceptor: calculate orientation from trajectory
+        const pastFlameout = interpolatedProgress > flameoutProgress;
+
+        if (pastFlameout || missile.missedTarget) {
+          // After flameout or miss: point along direction of travel (coasting)
+          const aheadProgress = Math.min(interpolatedProgress + 0.02, 1.5);
+          const boostEnd = missile.boostEndProgress ?? 0.25;
+          const aheadPos = this.getInterceptorPositionTowardTarget(
+            startGeo, aheadProgress, missile.targetId, boostEnd,
+            missile.flightPhase, missile.missedTarget, missile.missDirection, flameoutProgress
+          );
+          lookTarget = new THREE.Vector3(aheadPos.x, aheadPos.y, aheadPos.z);
+        } else {
+          // Still tracking: point toward predicted intercept point
+          const targetIcbm = this.gameState.missiles[missile.targetId];
+          if (targetIcbm && targetIcbm.geoLaunchPosition && targetIcbm.geoTargetPosition && !isPhysicsMissile(targetIcbm)) {
+            const interceptorRemaining = 1 - interpolatedProgress;
+            const leadFactor = 0.5;
+            const predictedIcbmProgress = Math.min(1, targetIcbm.progress + interceptorRemaining * leadFactor);
+
+            const icbmStartGeo = targetIcbm.geoLaunchPosition;
+            const icbmEndGeo = targetIcbm.geoTargetPosition;
+            const icbmAltitude = calculateMissileAltitude(icbmStartGeo, icbmEndGeo);
+            const icbmObjects = this.missileObjects.get(missile.targetId);
+            const icbmSeed = icbmObjects?.seed || 0;
+            const icbmFlightDuration = icbmObjects?.flightDuration || 30000;
+
+            const predictedPos = getMissilePosition3D(
+              icbmStartGeo, icbmEndGeo, predictedIcbmProgress,
+              icbmAltitude, GLOBE_RADIUS, icbmFlightDuration, icbmSeed
+            );
+
+            lookTarget = new THREE.Vector3(predictedPos.x, predictedPos.y, predictedPos.z);
+          }
+        }
+      } else {
+        // ICBM: use the standard direction calculation
+        const direction = getMissileDirection3D(startGeo, targetGeo, interpolatedProgress, maxAltitude, GLOBE_RADIUS, objects.flightDuration, seed);
+        const dirVec = new THREE.Vector3(direction.x, direction.y, direction.z);
+        lookTarget = new THREE.Vector3(pos3d.x + dirVec.x, pos3d.y + dirVec.y, pos3d.z + dirVec.z);
+      }
+
+      // Apply orientation with smooth interpolation
+      if (lookTarget) {
+        // Calculate target quaternion by using lookAt on a temp object
+        const tempObj = new THREE.Object3D();
+        tempObj.position.copy(objects.head.position);
+        tempObj.lookAt(lookTarget);
+        const targetQuat = tempObj.quaternion.clone();
+
+        // Initialize target quaternion if not set
+        if (!objects.targetQuaternion) {
+          objects.targetQuaternion = targetQuat.clone();
+          objects.head.quaternion.copy(targetQuat);
+        } else {
+          // Update target quaternion
+          objects.targetQuaternion.copy(targetQuat);
+          // Smoothly interpolate current orientation toward target (slerp)
+          // Use higher factor (0.3) for faster response while still being smooth
+          objects.head.quaternion.slerp(objects.targetQuaternion, 0.3);
+        }
+      }
+
+      // Update exhaust visibility based on flight phase (engine cuts out in space)
+      this.updateMissileExhaust(objects.head, interpolatedProgress, isInterceptor, missile);
+
+      // For interceptors, record actual path taken (add points periodically)
+      if (isInterceptor && objects.interceptorTrailHistory) {
+        const progressStep = 0.02; // Add a point every 2% progress
+        if (interpolatedProgress - (objects.lastTrailProgress || 0) >= progressStep) {
+          objects.interceptorTrailHistory.push(new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z));
+          objects.lastTrailProgress = interpolatedProgress;
+        }
+      }
 
       // Update traveled trail with linear progress
-      const trailPoints = this.calculateTraveledTrailSmooth(startGeo, targetGeo, interpolatedProgress, maxAltitude, objects.flightDuration);
-      const positions = new Float32Array(trailPoints.length * 3);
-      for (let i = 0; i < trailPoints.length; i++) {
-        positions[i * 3] = trailPoints[i].x;
-        positions[i * 3 + 1] = trailPoints[i].y;
-        positions[i * 3 + 2] = trailPoints[i].z;
+      let trailPoints: THREE.Vector3[];
+      if (isInterceptor && objects.interceptorTrailHistory) {
+        // Use the stored trail history for interceptors
+        trailPoints = [...objects.interceptorTrailHistory];
+        // Add current position as the last point
+        trailPoints.push(new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z));
+      } else {
+        trailPoints = this.calculateTraveledTrailSmooth(startGeo, targetGeo, interpolatedProgress, maxAltitude, objects.flightDuration, seed);
       }
-      objects.trail.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-      objects.trail.geometry.attributes.position.needsUpdate = true;
+      const trailGeom = objects.trail.geometry;
+      const existingAttr = trailGeom.getAttribute('position') as THREE.BufferAttribute | undefined;
+
+      // Reuse existing buffer if it's large enough, otherwise create a new one
+      if (existingAttr && existingAttr.array.length >= trailPoints.length * 3) {
+        const positions = existingAttr.array as Float32Array;
+        for (let i = 0; i < trailPoints.length; i++) {
+          positions[i * 3] = trailPoints[i].x;
+          positions[i * 3 + 1] = trailPoints[i].y;
+          positions[i * 3 + 2] = trailPoints[i].z;
+        }
+        existingAttr.needsUpdate = true;
+        trailGeom.setDrawRange(0, trailPoints.length);
+      } else {
+        // Need a larger buffer - create new one
+        const positions = new Float32Array(trailPoints.length * 3);
+        for (let i = 0; i < trailPoints.length; i++) {
+          positions[i * 3] = trailPoints[i].x;
+          positions[i * 3 + 1] = trailPoints[i].y;
+          positions[i * 3 + 2] = trailPoints[i].z;
+        }
+        trailGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      }
     }
 
-    // Remove completed missiles and show explosions
+    // Remove missiles that are no longer in game state
+    // Instead of instant removal, move them to fading state
     for (const id of existingIds) {
-      // Show explosion at target position if we have it stored
-      const targetPos = this.missileTargets.get(id);
-      if (targetPos) {
-        this.showExplosionAt(targetPos);
-        this.missileTargets.delete(id);
-      }
-
       const objects = this.missileObjects.get(id);
       if (objects) {
-        this.missileGroup.remove(objects.trail);
-        this.missileGroup.remove(objects.head);
-        if (objects.plannedRoute) {
-          this.missileGroup.remove(objects.plannedRoute);
+        // Get last known position for impact point
+        const lastPos = this.missileLastPositions.get(id);
+        const targetPos = this.missileTargets.get(id);
+        const impactGeo = lastPos || targetPos;
+
+        if (impactGeo) {
+          // Extract current trail points
+          const trailGeom = objects.trail.geometry;
+          const posAttr = trailGeom.getAttribute('position');
+          const trailPoints: THREE.Vector3[] = [];
+          if (posAttr) {
+            for (let i = 0; i < posAttr.count; i++) {
+              trailPoints.push(new THREE.Vector3(
+                posAttr.getX(i),
+                posAttr.getY(i),
+                posAttr.getZ(i)
+              ));
+            }
+          }
+
+          // Get impact position in 3D
+          const impactPos3d = geoToSphere(impactGeo, GLOBE_RADIUS + 2);
+          const impactVec = new THREE.Vector3(impactPos3d.x, impactPos3d.y, impactPos3d.z);
+
+          // Add to fading missiles
+          this.fadingMissiles.set(id, {
+            objects: {
+              trail: objects.trail,
+              head: objects.head,
+            },
+            impactPosition: impactVec,
+            trailPoints: trailPoints,
+            fadeStartTime: Date.now(),
+            fadeDuration: 2000,
+          });
+
+          // Remove planned route if exists
+          if (objects.plannedRoute) {
+            this.missileGroup.remove(objects.plannedRoute);
+            objects.plannedRoute.geometry.dispose();
+            (objects.plannedRoute.material as THREE.Material).dispose();
+          }
+
+          // Remove from active missiles (but keep in scene for fading)
+          this.missileObjects.delete(id);
+        } else {
+          // No position info, just remove immediately
+          this.missileGroup.remove(objects.trail);
+          this.missileGroup.remove(objects.head);
+          if (objects.plannedRoute) {
+            this.missileGroup.remove(objects.plannedRoute);
+          }
+          this.disposeMissileObjects(objects);
+          this.missileObjects.delete(id);
         }
-        this.disposeMissileObjects(objects);
-        this.missileObjects.delete(id);
       }
+
+      // Clean up tracking maps
+      this.missileTargets.delete(id);
+      this.missileLastPositions.delete(id);
+      this.missileWasIntercepted.delete(id);
       this.missileInterpolation.delete(id);
+      this.uncertainContacts.delete(id);
+      this.shownExplosions.delete(id);
+      this.groundImpactMissiles.delete(id);
     }
   }
 
-  private createICBMHead(isInterceptor: boolean): THREE.Group {
+  private createICBMHead(isInterceptor: boolean, isMine: boolean): THREE.Group {
     const group = new THREE.Group();
 
-    // Main ICBM body (elongated cone)
-    // Interceptors are cyan/blue, ICBMs are red/orange
-    const bodyGeom = new THREE.ConeGeometry(1.2, 5, 8);
-    const bodyMat = new THREE.MeshBasicMaterial({
-      color: isInterceptor ? 0x00aaff : 0xff3300,
-    });
+    // Base scale reduced by 50%, interceptors are even smaller
+    const scale = isInterceptor ? 0.25 : 0.5;
+
+    // Colors based on ownership: player = blue, enemy = red
+    // Interceptors are always cyan (defensive)
+    let primaryColor: number;
+    let secondaryColor: number;
+    let exhaustColor: number;
+    let glowColor: number;
+
+    if (isInterceptor) {
+      // Interceptors are cyan
+      primaryColor = 0x00ddff;
+      secondaryColor = 0x006688;
+      exhaustColor = 0x00ffff;
+      glowColor = 0x0088aa;
+    } else if (isMine) {
+      // Player ICBMs are blue
+      primaryColor = 0x2266ff;
+      secondaryColor = 0x113388;
+      exhaustColor = 0x4488ff;
+      glowColor = 0x2244aa;
+    } else {
+      // Enemy ICBMs are red
+      primaryColor = 0xcc2200;
+      secondaryColor = 0x881100;
+      exhaustColor = 0xff6600;
+      glowColor = 0xff4400;
+    }
+
+    // Nose cone (pointed tip)
+    const noseGeom = new THREE.ConeGeometry(0.8 * scale, 3 * scale, 8);
+    const noseMat = new THREE.MeshBasicMaterial({ color: primaryColor });
+    const nose = new THREE.Mesh(noseGeom, noseMat);
+    nose.rotation.x = Math.PI / 2;
+    nose.position.z = 4 * scale;
+    group.add(nose);
+
+    // Main body (cylinder)
+    const bodyGeom = new THREE.CylinderGeometry(0.8 * scale, 1.0 * scale, 5 * scale, 8);
+    const bodyMat = new THREE.MeshBasicMaterial({ color: secondaryColor });
     const body = new THREE.Mesh(bodyGeom, bodyMat);
-    body.rotation.x = Math.PI / 2; // Point forward
+    body.rotation.x = Math.PI / 2;
+    body.position.z = 0;
     group.add(body);
 
-    // Glowing warhead tip
-    const tipGeom = new THREE.SphereGeometry(0.8, 8, 8);
-    const tipMat = new THREE.MeshBasicMaterial({
-      color: 0xffffff,
-    });
-    const tip = new THREE.Mesh(tipGeom, tipMat);
-    tip.position.z = 2.5; // At front of cone
-    group.add(tip);
+    // Tail section (tapered)
+    const tailGeom = new THREE.CylinderGeometry(1.0 * scale, 0.6 * scale, 2 * scale, 8);
+    const tailMat = new THREE.MeshBasicMaterial({ color: secondaryColor });
+    const tail = new THREE.Mesh(tailGeom, tailMat);
+    tail.rotation.x = Math.PI / 2;
+    tail.position.z = -3.5 * scale;
+    group.add(tail);
 
-    // Engine glow at back
-    const glowGeom = new THREE.SphereGeometry(1.5, 8, 8);
-    const glowMat = new THREE.MeshBasicMaterial({
-      color: isInterceptor ? 0x0088ff : 0xff4400,
+    // Fins (4 stabilizers)
+    const finGeom = new THREE.BoxGeometry(0.15 * scale, 2.5 * scale, 1.5 * scale);
+    const finMat = new THREE.MeshBasicMaterial({ color: primaryColor });
+    for (let i = 0; i < 4; i++) {
+      const fin = new THREE.Mesh(finGeom, finMat);
+      const angle = (i * Math.PI) / 2;
+      fin.position.set(
+        Math.cos(angle) * 1.2 * scale,
+        Math.sin(angle) * 1.2 * scale,
+        -3 * scale
+      );
+      fin.rotation.z = angle;
+      group.add(fin);
+    }
+
+    // Engine exhaust (bright glow) - named for later update
+    const exhaustGeom = new THREE.ConeGeometry(0.5 * scale, 2.5 * scale, 8);
+    const exhaustMat = new THREE.MeshBasicMaterial({
+      color: exhaustColor,
       transparent: true,
-      opacity: 0.6,
+      opacity: 0.9,
+    });
+    const exhaust = new THREE.Mesh(exhaustGeom, exhaustMat);
+    exhaust.name = 'exhaust';
+    exhaust.rotation.x = -Math.PI / 2;
+    exhaust.position.z = -5.5 * scale;
+    group.add(exhaust);
+
+    // Outer exhaust glow - named for later update
+    const glowGeom = new THREE.ConeGeometry(1.0 * scale, 4 * scale, 8);
+    const glowMat = new THREE.MeshBasicMaterial({
+      color: glowColor,
+      transparent: true,
+      opacity: 0.4,
     });
     const glow = new THREE.Mesh(glowGeom, glowMat);
-    glow.position.z = -2.5; // At back of cone
+    glow.name = 'exhaustGlow';
+    glow.rotation.x = -Math.PI / 2;
+    glow.position.z = -6 * scale;
     group.add(glow);
 
     return group;
+  }
+
+  /**
+   * Update missile exhaust visibility based on flight phase.
+   * Engine cuts out during cruise phase (in space) and reignites for reentry.
+   */
+  private updateMissileExhaust(
+    head: THREE.Group,
+    progress: number,
+    isInterceptor: boolean,
+    missile?: Missile | PhysicsMissile
+  ): void {
+    const exhaust = head.getObjectByName('exhaust') as THREE.Mesh | undefined;
+    const exhaustGlow = head.getObjectByName('exhaustGlow') as THREE.Mesh | undefined;
+
+    if (!exhaust || !exhaustGlow) return;
+
+    // Physics missiles: exhaust visible when engine has fuel
+    if (missile && isPhysicsMissile(missile)) {
+      const engineOn = missile.fuel > 0 && !missile.engineFlameout;
+      exhaust.visible = engineOn;
+      exhaustGlow.visible = engineOn;
+      return;
+    }
+
+    // Legacy interceptors keep engine on the whole time (short flight)
+    if (isInterceptor) {
+      exhaust.visible = true;
+      exhaustGlow.visible = true;
+      return;
+    }
+
+    // ICBMs: Engine on during launch (0-20%) and reentry (85-100%)
+    // Engine off during cruise phase in space (20-85%)
+    const engineOn = progress < 0.20 || progress > 0.85;
+
+    exhaust.visible = engineOn;
+    exhaustGlow.visible = engineOn;
   }
 
   private disposeMissileObjects(objects: { trail: THREE.Line; head: THREE.Group; maxAltitude: number; flightDuration: number; plannedRoute?: THREE.Line }): void {
@@ -1824,7 +2634,7 @@ export class GlobeRenderer {
     }
   }
 
-  private calculateTraveledTrailSmooth(startGeo: GeoPosition, endGeo: GeoPosition, progress: number, maxAltitude: number, flightDuration: number): THREE.Vector3[] {
+  private calculateTraveledTrailSmooth(startGeo: GeoPosition, endGeo: GeoPosition, progress: number, maxAltitude: number, flightDuration: number, seed?: number): THREE.Vector3[] {
     const points: THREE.Vector3[] = [];
 
     // Draw trail from launch to current position
@@ -1832,7 +2642,7 @@ export class GlobeRenderer {
     const steps = Math.max(10, Math.floor(60 * progress));
     for (let i = 0; i <= steps; i++) {
       const t = (i / steps) * progress;
-      const pos = getMissilePosition3D(startGeo, endGeo, t, maxAltitude, GLOBE_RADIUS, flightDuration);
+      const pos = getMissilePosition3D(startGeo, endGeo, t, maxAltitude, GLOBE_RADIUS, flightDuration, seed);
       points.push(new THREE.Vector3(pos.x, pos.y, pos.z));
     }
 
@@ -1840,7 +2650,7 @@ export class GlobeRenderer {
   }
 
   // Calculate the full planned route path (0% to 100% progress)
-  private calculateFullRoutePath(startGeo: GeoPosition, endGeo: GeoPosition, maxAltitude: number, flightDuration: number): THREE.Vector3[] {
+  private calculateFullRoutePath(startGeo: GeoPosition, endGeo: GeoPosition, maxAltitude: number, flightDuration: number, seed?: number): THREE.Vector3[] {
     const points: THREE.Vector3[] = [];
 
     // Draw full path from launch to target
@@ -1848,11 +2658,995 @@ export class GlobeRenderer {
     const steps = 60;
     for (let i = 0; i <= steps; i++) {
       const t = i / steps;
-      const pos = getMissilePosition3D(startGeo, endGeo, t, maxAltitude, GLOBE_RADIUS, flightDuration);
+      const pos = getMissilePosition3D(startGeo, endGeo, t, maxAltitude, GLOBE_RADIUS, flightDuration, seed);
       points.push(new THREE.Vector3(pos.x, pos.y, pos.z));
     }
 
     return points;
+  }
+
+  // Get interceptor position along straight line toward target ICBM's 3D position
+  /**
+   * Get interceptor position with phase-aware trajectory:
+   * - Boost Phase (0-boostEndProgress): Smooth acceleration UP with slight forward lean
+   * - Track Phase (boostEndProgress-1): Constant speed (linear) toward target
+   * - Miss Phase (1+): Continue past target, descending toward ground
+   */
+  private getInterceptorPositionTowardTarget(
+    startGeo: GeoPosition,
+    progress: number,
+    targetMissileId?: string,
+    boostEndProgress: number = 0.25,
+    flightPhase?: 'boost' | 'track',
+    missedTarget?: boolean,
+    missDirection?: GeoPosition,
+    flameoutProgress?: number
+  ): { x: number; y: number; z: number } {
+    // For missed interceptors, progress can exceed 1.0
+    const t = Math.max(0, progress);
+
+    // Get launch position on globe surface
+    const startPos = geoToSphere(startGeo, GLOBE_RADIUS);
+    const startVec = new THREE.Vector3(startPos.x, startPos.y, startPos.z);
+
+    // Higher boost altitude for more dramatic launch (~20 units)
+    const maxBoostAltitude = 20;
+
+    // Determine current phase based on progress (fallback if flightPhase not provided)
+    const inBoostPhase = flightPhase === 'boost' || (flightPhase === undefined && t <= boostEndProgress);
+
+    // Get target ICBM's 3D position
+    // IMPORTANT: After flameout, we freeze the target position - no more tracking!
+    let targetPos3D: { x: number; y: number; z: number } | null = null;
+    const actualFlameoutProgress = flameoutProgress ?? 1.0;
+    const pastFlameout = t > actualFlameoutProgress;
+
+    if (pastFlameout && !missedTarget) {
+      // After flameout but before miss: calculate where ICBM WAS at flameout time
+      // The interceptor coasts toward that frozen position
+      targetPos3D = this.getTargetIcbmPositionAtProgress(targetMissileId, actualFlameoutProgress, boostEndProgress);
+    } else if (missedTarget && t > 1 && missDirection) {
+      // After a miss: use stored miss direction
+      const missPos = geoToSphere(missDirection, GLOBE_RADIUS);
+      // Estimate the altitude the target was at when missed (roughly mid-arc)
+      const missAltitude = 15; // Approximate altitude at intercept
+      const missVec = new THREE.Vector3(missPos.x, missPos.y, missPos.z).normalize();
+      targetPos3D = {
+        x: missVec.x * (GLOBE_RADIUS + missAltitude),
+        y: missVec.y * (GLOBE_RADIUS + missAltitude),
+        z: missVec.z * (GLOBE_RADIUS + missAltitude)
+      };
+    } else {
+      // Normal tracking: get ICBM's current live position
+      targetPos3D = this.getTargetIcbm3DPosition(targetMissileId);
+    }
+
+    if (inBoostPhase) {
+      // BOOST PHASE: Smooth acceleration upward (ease-in quadratic)
+      const boostProgress = t / boostEndProgress;
+      // Ease-in for acceleration (starts slow, picks up speed)
+      const easedBoost = boostProgress * boostProgress;
+      const currentBoostAltitude = maxBoostAltitude * easedBoost;
+
+      // Also move slightly toward target during boost (10% of ground distance)
+      let forwardProgress = 0;
+      if (targetPos3D) {
+        forwardProgress = boostProgress * 0.1; // Slight forward lean
+        const targetVec = new THREE.Vector3(targetPos3D.x, targetPos3D.y, targetPos3D.z);
+        const targetGroundVec = targetVec.clone().normalize().multiplyScalar(GLOBE_RADIUS);
+
+        // Interpolate ground position slightly toward target
+        const groundPos = new THREE.Vector3().lerpVectors(startVec, targetGroundVec, forwardProgress);
+        groundPos.normalize().multiplyScalar(GLOBE_RADIUS + currentBoostAltitude);
+
+        return { x: groundPos.x, y: groundPos.y, z: groundPos.z };
+      }
+
+      // No target - just go straight up
+      const direction = startVec.clone().normalize();
+      const boostedPos = startVec.clone().add(direction.multiplyScalar(currentBoostAltitude));
+      return { x: boostedPos.x, y: boostedPos.y, z: boostedPos.z };
+    }
+
+    // TRACK PHASE (or MISS PHASE): Linear interpolation for constant speed
+    if (!targetPos3D) {
+      // No target - hover at boost altitude
+      const direction = startVec.clone().normalize();
+      const boostedPos = startVec.clone().add(direction.multiplyScalar(maxBoostAltitude));
+      return { x: boostedPos.x, y: boostedPos.y, z: boostedPos.z };
+    }
+
+    // Calculate progress through track phase (0 to 1, can exceed 1 for missed)
+    const trackProgress = (t - boostEndProgress) / (1 - boostEndProgress);
+
+    // LINEAR interpolation for constant speed (no easing - maintains speed throughout)
+    const linearProgress = trackProgress;
+
+    // Calculate positions at boost end (where track phase starts from)
+    const targetVec = new THREE.Vector3(targetPos3D.x, targetPos3D.y, targetPos3D.z);
+    const targetGroundVec = targetVec.clone().normalize().multiplyScalar(GLOBE_RADIUS);
+
+    // Boost end position (10% toward target, at max boost altitude)
+    const boostEndGroundPos = new THREE.Vector3().lerpVectors(startVec, targetGroundVec, 0.1);
+    boostEndGroundPos.normalize().multiplyScalar(GLOBE_RADIUS);
+
+    // Target altitude
+    const targetAltitude = targetVec.length() - GLOBE_RADIUS;
+
+    if (missedTarget && linearProgress > 1) {
+      // MISS PHASE: Continue past target, descending toward ground
+      const missProgress = linearProgress - 1; // 0 at target, increasing after
+
+      // Direction of travel at intercept (from boost end toward target)
+      const travelDir = new THREE.Vector3().subVectors(targetGroundVec, boostEndGroundPos).normalize();
+
+      // Continue in travel direction past target
+      const continueDistance = missProgress * 0.3; // Continue at reduced rate
+      const missGroundPos = targetGroundVec.clone().add(travelDir.multiplyScalar(continueDistance * GLOBE_RADIUS));
+      missGroundPos.normalize().multiplyScalar(GLOBE_RADIUS);
+
+      // Descend toward ground (fuel running out)
+      const descentRate = missProgress * 0.8; // Rapid descent
+      const missAltitude = Math.max(0, targetAltitude * (1 - descentRate));
+
+      const finalPos = missGroundPos.clone().normalize().multiplyScalar(GLOBE_RADIUS + missAltitude);
+      return { x: finalPos.x, y: finalPos.y, z: finalPos.z };
+    }
+
+    // Normal tracking: linear interpolation from boost end to target
+    const groundPos = new THREE.Vector3().lerpVectors(boostEndGroundPos, targetGroundVec, linearProgress);
+    groundPos.normalize().multiplyScalar(GLOBE_RADIUS);
+
+    // Altitude: linear from boost altitude to target altitude (constant climb rate)
+    const currentAltitude = maxBoostAltitude + (targetAltitude - maxBoostAltitude) * linearProgress;
+
+    // Apply altitude to ground position
+    const finalPos = groundPos.clone().normalize().multiplyScalar(GLOBE_RADIUS + currentAltitude);
+
+    return { x: finalPos.x, y: finalPos.y, z: finalPos.z };
+  }
+
+  // Get the target ICBM's current 3D position (including altitude from its ballistic arc)
+  private getTargetIcbm3DPosition(targetMissileId?: string): { x: number; y: number; z: number } | null {
+    if (!targetMissileId || !this.gameState) return null;
+
+    const targetIcbm = this.gameState.missiles[targetMissileId];
+    if (!targetIcbm || !targetIcbm.geoLaunchPosition || !targetIcbm.geoTargetPosition) {
+      return null;
+    }
+
+    // Calculate the ICBM's altitude for its arc
+    const icbmAltitude = calculateMissileAltitude(targetIcbm.geoLaunchPosition, targetIcbm.geoTargetPosition);
+
+    // Get the ICBM's current 3D position using its progress
+    const seed = this.hashStringToNumber(targetIcbm.id);
+    const progress = targetIcbm.progress ?? 0;
+    const flightDuration = targetIcbm.flightDuration ?? 30000;
+    return getMissilePosition3D(
+      targetIcbm.geoLaunchPosition,
+      targetIcbm.geoTargetPosition,
+      progress,
+      icbmAltitude,
+      GLOBE_RADIUS,
+      flightDuration,
+      seed
+    );
+  }
+
+  /**
+   * Get the target ICBM's 3D position at a specific interceptor progress.
+   * Used to calculate where the ICBM was when the interceptor ran out of fuel (flameout).
+   * This allows the interceptor to coast toward that frozen position instead of continuing to track.
+   */
+  private getTargetIcbmPositionAtProgress(
+    targetMissileId?: string,
+    interceptorProgress?: number,
+    boostEndProgress: number = 0.25
+  ): { x: number; y: number; z: number } | null {
+    if (!targetMissileId || !this.gameState || interceptorProgress === undefined) return null;
+
+    const targetIcbm = this.gameState.missiles[targetMissileId];
+    if (!targetIcbm || !targetIcbm.geoLaunchPosition || !targetIcbm.geoTargetPosition) {
+      return null;
+    }
+
+    // Calculate what the ICBM's progress was when the interceptor reached its flameout point
+    // We need to figure out how much time elapsed from interceptor launch to flameout
+    // and where the ICBM was at that moment
+    const targetFlightDuration = targetIcbm.flightDuration ?? 30000;
+    const interceptorSpeed = 1 / targetFlightDuration; // Approximate - not exact but close
+    const icbmSpeed = 1 / targetFlightDuration;
+
+    // Time from interceptor launch to flameout (as fraction of interceptor's flight)
+    // ICBM progress at that time = icbm.launchProgress + (interceptor elapsed time * icbm speed)
+    // This is approximate since we don't have exact timing, but it's close enough for visual effect
+
+    // Estimate: when interceptor was at flameout progress, how much had ICBM advanced?
+    // Use the current ICBM progress as a reference point
+    const interceptorId = Object.keys(this.gameState.missiles).find(
+      id => this.gameState!.missiles[id].targetId === targetMissileId
+    );
+    const currentInterceptorProgress = interceptorId
+      ? (this.gameState.missiles[interceptorId]?.progress ?? interceptorProgress)
+      : interceptorProgress;
+
+    // Scale ICBM progress proportionally
+    const targetProgress = targetIcbm.progress ?? 0;
+    const icbmProgressAtFlameout = Math.min(
+      1,
+      targetProgress * (interceptorProgress / Math.max(0.01, currentInterceptorProgress))
+    );
+
+    // Get ICBM's geo position at that progress
+    const icbmGeoAtFlameout = geoInterpolate(
+      targetIcbm.geoLaunchPosition,
+      targetIcbm.geoTargetPosition,
+      icbmProgressAtFlameout
+    );
+
+    // Calculate the ICBM's altitude for its arc at that progress
+    const icbmAltitude = calculateMissileAltitude(targetIcbm.geoLaunchPosition, targetIcbm.geoTargetPosition);
+
+    // Get the ICBM's 3D position using its progress at flameout
+    const seed = this.hashStringToNumber(targetIcbm.id);
+    return getMissilePosition3D(
+      targetIcbm.geoLaunchPosition,
+      targetIcbm.geoTargetPosition,
+      icbmProgressAtFlameout,
+      icbmAltitude,
+      GLOBE_RADIUS,
+      targetIcbm.flightDuration,
+      seed
+    );
+  }
+
+  // Hash string to a deterministic number for seeding randomness
+  private hashStringToNumber(str: string): number {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash; // Convert to 32bit integer
+    }
+    return Math.abs(hash);
+  }
+
+  /**
+   * Update communication chain visualization.
+   * Shows data flow: ICBM → Radar → Silo → Interceptor
+   * Only displayed when an interceptor is tracked (selected).
+   */
+  private updateCommunicationChain(deltaTime: number): void {
+    // Clear existing visualization
+    this.clearCommunicationChain();
+
+    if (!this.trackedMissileId || !this.gameState) return;
+
+    // Get the tracked missile
+    const trackedMissile = getMissiles(this.gameState).find(m => m.id === this.trackedMissileId);
+    if (!trackedMissile || trackedMissile.type !== 'interceptor') return;
+    if (trackedMissile.detonated || trackedMissile.intercepted) return;
+
+    // Get the target ICBM
+    const targetIcbm = trackedMissile.targetId ? this.gameState.missiles[trackedMissile.targetId] : null;
+    if (!targetIcbm || !targetIcbm.geoCurrentPosition) return;
+
+    // Get the detecting radar
+    const radarId = trackedMissile.detectedByRadarId;
+    const radar = radarId ? this.gameState.buildings[radarId] as Radar : null;
+
+    // Get the launching silo
+    const siloId = trackedMissile.launchingSiloId || trackedMissile.sourceId;
+    const silo = siloId ? this.gameState.buildings[siloId] as Silo : null;
+
+    // Get positions - using geo positions for 3D visualization
+    const icbmPos = targetIcbm.geoCurrentPosition;
+    const radarPos = radar?.geoPosition;
+    const siloPos = silo?.geoPosition;
+    const interceptorPos = trackedMissile.geoCurrentPosition;
+
+    // Create the chain if we have all positions
+    if (!interceptorPos) return;
+
+    // Helper to create 3D position above globe surface (for visibility)
+    const getPos3D = (geo: GeoPosition, altitude: number = 5) => {
+      const pos = geoToSphere(geo, GLOBE_RADIUS + altitude);
+      return new THREE.Vector3(pos.x, pos.y, pos.z);
+    };
+
+    // Colors for different segments
+    const colors = {
+      detection: 0xff8800,    // Orange: ICBM → Radar
+      targetData: 0x00ff88,   // Green: Radar → Silo
+      guidance: 0x00ffff,     // Cyan: Silo → Interceptor
+    };
+
+    // Update animation time
+    this.packetAnimationTime += deltaTime;
+
+    // Create chain segments
+    const segments: { start: THREE.Vector3; end: THREE.Vector3; color: number; label: string }[] = [];
+
+    // Get interceptor 3D position (at its current flight altitude)
+    let interceptorVec: THREE.Vector3;
+    if (isPhysicsMissile(trackedMissile)) {
+      // Physics missile: use position directly
+      interceptorVec = new THREE.Vector3(
+        trackedMissile.position.x,
+        trackedMissile.position.y,
+        trackedMissile.position.z
+      );
+    } else {
+      // Legacy missile: calculate position from trajectory
+      const boostEnd = trackedMissile.boostEndProgress ?? 0.15;
+      const flameoutProgress = this.calculateFlameoutProgress(trackedMissile);
+      const missileProgress = trackedMissile.progress ?? 0;
+      const interceptor3D = this.getInterceptorPositionTowardTarget(
+        trackedMissile.geoLaunchPosition!,
+        missileProgress,
+        trackedMissile.targetId,
+        boostEnd,
+        trackedMissile.flightPhase,
+        trackedMissile.missedTarget,
+        trackedMissile.missDirection,
+        flameoutProgress
+      );
+      interceptorVec = new THREE.Vector3(interceptor3D.x, interceptor3D.y, interceptor3D.z);
+    }
+
+    // Get ICBM 3D position (at its current flight altitude)
+    const icbm3D = this.getTargetIcbm3DPosition(targetIcbm.id);
+    if (icbm3D) {
+      const icbmVec = new THREE.Vector3(icbm3D.x, icbm3D.y, icbm3D.z);
+
+      if (radarPos) {
+        const radarVec = getPos3D(radarPos, 3);
+        // ICBM → Radar (detection)
+        segments.push({ start: icbmVec, end: radarVec, color: colors.detection, label: 'detection' });
+
+        if (siloPos) {
+          const siloVec = getPos3D(siloPos, 3);
+          // Radar → Silo (target data)
+          segments.push({ start: radarVec, end: siloVec, color: colors.targetData, label: 'target data' });
+          // Silo → Interceptor (guidance)
+          segments.push({ start: siloVec, end: interceptorVec, color: colors.guidance, label: 'guidance' });
+        } else {
+          // No silo info, just show Radar → Interceptor
+          segments.push({ start: radarVec, end: interceptorVec, color: colors.guidance, label: 'guidance' });
+        }
+      } else if (siloPos) {
+        // No radar info, show Silo → Interceptor
+        const siloVec = getPos3D(siloPos, 3);
+        segments.push({ start: siloVec, end: interceptorVec, color: colors.guidance, label: 'guidance' });
+      }
+    }
+
+    // Create line segments and packets
+    for (const segment of segments) {
+      // Create curved line that arcs above the globe surface
+      const curvePoints = this.createArcedLine(segment.start, segment.end, 16);
+      const lineGeom = new THREE.BufferGeometry().setFromPoints(curvePoints);
+      const lineMat = new THREE.LineDashedMaterial({
+        color: segment.color,
+        dashSize: 3,
+        gapSize: 2,
+        transparent: true,
+        opacity: 0.6,
+      });
+      const line = new THREE.Line(lineGeom, lineMat);
+      line.computeLineDistances();
+      this.commChainGroup.add(line);
+      this.commChainLines.push(line);
+
+      // Create animated packets (3 per segment, staggered)
+      for (let i = 0; i < 3; i++) {
+        const packetGeom = new THREE.SphereGeometry(0.4, 6, 6);
+        const packetMat = new THREE.MeshBasicMaterial({
+          color: segment.color,
+          transparent: true,
+          opacity: 0.9,
+        });
+        const packet = new THREE.Mesh(packetGeom, packetMat);
+
+        // Calculate packet position along curved segment
+        const speed = 0.5; // Traversals per second
+        const offset = i / 3; // Stagger packets
+        const rawProgress = ((this.packetAnimationTime * speed) + offset) % 1;
+
+        // Smooth sine-wave opacity pulse
+        packetMat.opacity = 0.4 + 0.5 * Math.sin(rawProgress * Math.PI);
+
+        // Position along curved arc (use the pre-computed curve points)
+        const curveIndex = rawProgress * (curvePoints.length - 1);
+        const lowerIndex = Math.floor(curveIndex);
+        const upperIndex = Math.min(lowerIndex + 1, curvePoints.length - 1);
+        const localT = curveIndex - lowerIndex;
+        packet.position.lerpVectors(curvePoints[lowerIndex], curvePoints[upperIndex], localT);
+
+        this.commChainGroup.add(packet);
+        this.commChainPackets.push(packet);
+      }
+    }
+  }
+
+  /**
+   * Create an arced line between two 3D points that curves away from the globe.
+   * This prevents lines from intersecting the globe surface.
+   */
+  private createArcedLine(start: THREE.Vector3, end: THREE.Vector3, segments: number = 16): THREE.Vector3[] {
+    const points: THREE.Vector3[] = [];
+
+    // Base altitude above globe surface for the arc
+    const baseAltitude = GLOBE_RADIUS + 5;
+
+    // Calculate the angular distance to determine arc height
+    const startNorm = start.clone().normalize();
+    const endNorm = end.clone().normalize();
+    const angularDist = Math.acos(Math.max(-1, Math.min(1, startNorm.dot(endNorm))));
+
+    // Arc height scales with angular distance - longer arcs need higher peaks
+    const arcHeight = Math.max(8, angularDist * GLOBE_RADIUS * 0.3);
+
+    for (let i = 0; i <= segments; i++) {
+      const t = i / segments;
+
+      // Spherical interpolation for direction (stays on sphere surface)
+      const dir = new THREE.Vector3().lerpVectors(startNorm, endNorm, t).normalize();
+
+      // Calculate how much to lift this point (parabolic arc - highest at middle)
+      const arcFactor = 4 * t * (1 - t); // 0 at ends, 1 at middle
+      const altitude = baseAltitude + arcHeight * arcFactor;
+
+      // Position at altitude above globe
+      const point = dir.multiplyScalar(altitude);
+      points.push(point);
+    }
+
+    return points;
+  }
+
+  /**
+   * Clear communication chain visualization.
+   */
+  private clearCommunicationChain(): void {
+    // Remove and dispose lines
+    for (const line of this.commChainLines) {
+      this.commChainGroup.remove(line);
+      line.geometry.dispose();
+      if (line.material instanceof THREE.Material) {
+        line.material.dispose();
+      }
+    }
+    this.commChainLines = [];
+
+    // Remove and dispose packets
+    for (const packet of this.commChainPackets) {
+      this.commChainGroup.remove(packet);
+      packet.geometry.dispose();
+      if (packet.material instanceof THREE.Material) {
+        packet.material.dispose();
+      }
+    }
+    this.commChainPackets = [];
+  }
+
+  /**
+   * Update intercept prediction visualization for tracked interceptor.
+   * Shows: predicted intercept point, chance of interception, engine flameout marker.
+   */
+  private updateInterceptPrediction(): void {
+    // Clear existing visualization
+    this.clearInterceptPrediction();
+
+    if (!this.trackedMissileId || !this.gameState) return;
+
+    // Get the tracked missile
+    const interceptor = getMissiles(this.gameState).find(m => m.id === this.trackedMissileId);
+    if (!interceptor || interceptor.type !== 'interceptor') return;
+    if (interceptor.detonated || interceptor.intercepted) return;
+
+    // Get the target ICBM
+    const targetIcbm = interceptor.targetId ? this.gameState.missiles[interceptor.targetId] : null;
+    if (!targetIcbm || targetIcbm.detonated || targetIcbm.intercepted) return;
+
+    // Physics missiles: use server-provided predicted intercept point
+    if (isPhysicsMissile(interceptor)) {
+      this.updateInterceptPredictionForPhysicsMissile(interceptor, targetIcbm);
+      return;
+    }
+
+    // Legacy interceptor: calculate intercept point locally
+    const interceptPoint = this.calculateInterceptPoint(interceptor, targetIcbm as Missile);
+    if (!interceptPoint) return;
+
+    // Calculate interception chance
+    const chance = this.calculateInterceptionChance(interceptor, targetIcbm as Missile, interceptPoint);
+
+    // Create intercept marker (pulsing diamond shape)
+    this.createInterceptMarker(interceptPoint.position, chance);
+
+    // Create chance label
+    this.createChanceLabel(interceptPoint.position, chance);
+
+    // Only show flameout marker AFTER it has happened
+    const flameoutProgress = this.calculateFlameoutProgress(interceptor);
+    if (interceptor.progress > flameoutProgress) {
+      this.createFlameoutMarker(interceptor, flameoutProgress);
+    }
+
+    // Show fuel and speed beside the missile
+    this.createMissileStatsLabel(interceptor, flameoutProgress);
+  }
+
+  /**
+   * Update intercept prediction for physics-based missiles.
+   * Uses server-provided data for more accurate visualization.
+   */
+  private updateInterceptPredictionForPhysicsMissile(
+    interceptor: PhysicsMissile,
+    targetIcbm: Missile | PhysicsMissile
+  ): void {
+    // Use server-calculated predicted intercept point
+    if (interceptor.predictedInterceptPoint) {
+      const pt = interceptor.predictedInterceptPoint;
+      const position = new THREE.Vector3(pt.x, pt.y, pt.z);
+
+      // Calculate interception chance based on physics state
+      const chance = this.calculatePhysicsMissileChance(interceptor);
+
+      // Create intercept marker
+      this.createInterceptMarker(position, chance);
+
+      // Create chance label
+      this.createChanceLabel(position, chance);
+    }
+
+    // Show flameout marker if engine has flamed out
+    if (interceptor.engineFlameout) {
+      this.createPhysicsFlameoutMarker(interceptor);
+    }
+
+    // Show fuel and time-to-intercept stats
+    this.createPhysicsMissileStatsLabel(interceptor);
+  }
+
+  /**
+   * Calculate interception chance for physics missiles.
+   */
+  private calculatePhysicsMissileChance(missile: PhysicsMissile): number {
+    let chance = 0.7; // Base chance
+
+    // Coast phase (no fuel) has very low chance
+    if (missile.phase === 'coast' || missile.engineFlameout) {
+      return 0.05;
+    }
+
+    // Terminal phase has higher chance
+    if (missile.phase === 'terminal') {
+      chance += 0.1;
+    }
+
+    // Low fuel reduces chance
+    if (missile.fuel < 2) {
+      chance -= 0.15;
+    }
+
+    // Close to intercept increases chance
+    if (missile.timeToIntercept !== undefined && missile.timeToIntercept < 2) {
+      chance += 0.1;
+    }
+
+    return Math.max(0.05, Math.min(0.85, chance));
+  }
+
+  /**
+   * Create flameout marker for physics missiles.
+   */
+  private createPhysicsFlameoutMarker(missile: PhysicsMissile): void {
+    // Position marker at current missile location
+    const pos = missile.position;
+    const markerGroup = new THREE.Group();
+
+    // Red X shape for flameout
+    const xMaterial = new THREE.LineBasicMaterial({ color: 0xff4444 });
+    const size = 1.5;
+
+    const xGeom1 = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(-size, 0, -size),
+      new THREE.Vector3(size, 0, size),
+    ]);
+    const xGeom2 = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(-size, 0, size),
+      new THREE.Vector3(size, 0, -size),
+    ]);
+
+    markerGroup.add(new THREE.Line(xGeom1, xMaterial));
+    markerGroup.add(new THREE.Line(xGeom2, xMaterial));
+
+    markerGroup.position.set(pos.x, pos.y, pos.z);
+    markerGroup.lookAt(0, 0, 0);
+
+    // Store reference so it gets cleaned up properly
+    this.flameoutMarker = markerGroup;
+    this.interceptPredictionGroup.add(markerGroup);
+  }
+
+  /**
+   * Create stats label for physics missiles showing fuel and time to intercept.
+   */
+  private createPhysicsMissileStatsLabel(missile: PhysicsMissile): void {
+    // Create stats display near the missile
+    const fuelPercent = Math.round((missile.fuel / missile.maxFuel) * 100);
+    const timeToInt = missile.timeToIntercept !== undefined
+      ? `T-${missile.timeToIntercept.toFixed(1)}s`
+      : '--';
+    const phase = missile.phase.toUpperCase();
+
+    // Create label (simplified - just add to debug if needed)
+    // Full implementation would create a sprite or HTML overlay
+  }
+
+  /**
+   * Calculate where the interceptor will meet the ICBM.
+   */
+  private calculateInterceptPoint(
+    interceptor: Missile,
+    icbm: Missile
+  ): { position: THREE.Vector3; progress: number } | null {
+    if (!interceptor.geoLaunchPosition || !icbm.geoLaunchPosition || !icbm.geoTargetPosition) {
+      return null;
+    }
+
+    // Calculate when interceptor will reach the ICBM
+    const interceptorSpeed = 1 / interceptor.flightDuration;
+    const icbmSpeed = 1 / icbm.flightDuration;
+
+    // Time until interceptor reaches progress=1 (or flameout if sooner)
+    const flameoutProgress = this.calculateFlameoutProgress(interceptor);
+    const effectiveInterceptorEnd = Math.min(1, flameoutProgress);
+    const interceptorTimeToEnd = (effectiveInterceptorEnd - interceptor.progress) / interceptorSpeed;
+
+    // Where will ICBM be at that time?
+    const icbmProgressAtIntercept = Math.min(1, icbm.progress + icbmSpeed * interceptorTimeToEnd);
+
+    // Get ICBM's predicted 3D position using proper altitude calculation
+    const icbmGeoAtIntercept = geoInterpolate(
+      icbm.geoLaunchPosition,
+      icbm.geoTargetPosition,
+      icbmProgressAtIntercept
+    );
+
+    // ICBM altitude follows parabolic arc: 4 * apex * p * (1-p)
+    // Scale apex to globe units (apex is in abstract units, roughly 1 unit = 1 degree)
+    const icbmAltitude = 4 * icbm.apexHeight * icbmProgressAtIntercept * (1 - icbmProgressAtIntercept);
+    const altitudeInGlobeUnits = icbmAltitude * 0.3; // Scale factor for visualization
+
+    const icbmPos = geoToSphere(icbmGeoAtIntercept, GLOBE_RADIUS + altitudeInGlobeUnits);
+
+    return {
+      position: new THREE.Vector3(icbmPos.x, icbmPos.y, icbmPos.z),
+      progress: icbmProgressAtIntercept
+    };
+  }
+
+  /**
+   * Calculate the probability of successful interception.
+   * Factors: fuel remaining (can't maneuver without fuel), ICBM descent phase
+   */
+  private calculateInterceptionChance(
+    interceptor: Missile,
+    icbm: Missile,
+    interceptPoint: { position: THREE.Vector3; progress: number }
+  ): number {
+    const flameoutProgress = this.calculateFlameoutProgress(interceptor);
+
+    // If already missed, chance is 0
+    if (interceptor.missedTarget) {
+      return 0;
+    }
+
+    // If past flameout, can't maneuver - chance drops drastically
+    // Only a lucky hit if already on perfect trajectory
+    if (interceptor.progress >= flameoutProgress) {
+      return 0.05; // 5% - coasting, can't adjust
+    }
+
+    // Base hit probability
+    let chance = 0.7;
+
+    // Factor 1: Fuel remaining affects maneuverability
+    const fuelRatio = 1 - (interceptor.progress / flameoutProgress);
+    if (fuelRatio < 0.3) {
+      // Low fuel = less ability to make course corrections
+      chance -= (0.3 - fuelRatio) * 0.3;
+    }
+
+    // Factor 2: ICBM is descending (harder to hit during descent - faster, steeper angle)
+    if (interceptPoint.progress > 0.5) {
+      const descentPenalty = (interceptPoint.progress - 0.5) * 0.2;
+      chance -= descentPenalty;
+    }
+
+    // Clamp to valid range
+    return Math.max(0.05, Math.min(0.85, chance));
+  }
+
+  /**
+   * Calculate when the interceptor engine flames out (runs out of fuel).
+   * Returns progress value (0-1) at which flameout occurs.
+   *
+   * Fuel model:
+   * - Interceptor has ~12 seconds of fuel
+   * - Boost phase (0-25%) burns at 2x rate
+   * - Track phase burns at 1x rate
+   * - Flameout happens when fuel runs out (time-based, not progress-based)
+   */
+  private calculateFlameoutProgress(interceptor: Missile): number {
+    const totalFuelSeconds = 12; // Total fuel capacity in seconds
+    const boostBurnRate = 2.0;   // Boost burns fuel 2x faster
+    const trackBurnRate = 1.0;   // Track burns at normal rate
+    const boostEndProgress = interceptor.boostEndProgress ?? 0.25;
+
+    // Calculate how long each phase takes in real time
+    const flightDurationSec = interceptor.flightDuration / 1000;
+    const boostDurationSec = boostEndProgress * flightDurationSec;
+
+    // Fuel used during boost
+    const boostFuelUsed = boostDurationSec * boostBurnRate;
+
+    // Remaining fuel after boost
+    const remainingFuel = Math.max(0, totalFuelSeconds - boostFuelUsed);
+
+    // How long can we track with remaining fuel?
+    const trackDurationOnFuel = remainingFuel / trackBurnRate;
+
+    // Total time until flameout
+    const flameoutTimeSec = boostDurationSec + trackDurationOnFuel;
+
+    // Convert to progress (capped at 1.0 for normal flight)
+    const flameoutProgress = Math.min(1.0, flameoutTimeSec / flightDurationSec);
+
+    return flameoutProgress;
+  }
+
+  /**
+   * Create the intercept point marker - a small diamond that shows where intercept will happen.
+   */
+  private createInterceptMarker(position: THREE.Vector3, chance: number): void {
+    const markerGroup = new THREE.Group();
+    markerGroup.position.copy(position);
+
+    // Small diamond shape (octahedron) - much smaller
+    const geometry = new THREE.OctahedronGeometry(0.5, 0);
+    const color = chance > 0.5 ? 0x00ff88 : (chance > 0.25 ? 0xffff00 : 0xff4444);
+    const material = new THREE.MeshBasicMaterial({
+      color: color,
+      transparent: true,
+      opacity: 0.7,
+      wireframe: true,
+    });
+    const diamond = new THREE.Mesh(geometry, material);
+    markerGroup.add(diamond);
+
+    this.interceptMarker = markerGroup;
+    this.interceptPredictionGroup.add(markerGroup);
+  }
+
+  /**
+   * Create a small text label showing interception chance.
+   */
+  private createChanceLabel(position: THREE.Vector3, chance: number): void {
+    // Create small canvas for text
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d')!;
+    canvas.width = 48;
+    canvas.height = 16;
+
+    // Draw minimal text - just the percentage
+    const color = chance > 0.5 ? '#00ff88' : (chance > 0.25 ? '#ffff00' : '#ff4444');
+    ctx.fillStyle = color;
+    ctx.font = 'bold 12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${Math.round(chance * 100)}%`, canvas.width / 2, 12);
+
+    // Create sprite
+    const texture = new THREE.CanvasTexture(canvas);
+    const material = new THREE.SpriteMaterial({
+      map: texture,
+      transparent: true,
+      depthTest: false,
+    });
+    const sprite = new THREE.Sprite(material);
+    sprite.position.copy(position);
+    sprite.position.y += 1.5; // Small offset above marker
+    sprite.scale.set(2, 0.7, 1);
+
+    this.interceptChanceLabel = sprite;
+    this.interceptPredictionGroup.add(sprite);
+  }
+
+  /**
+   * Create a small marker on the trail showing where engine flameout occurs.
+   */
+  private createFlameoutMarker(interceptor: Missile, flameoutProgress: number): void {
+    if (!interceptor.geoLaunchPosition) return;
+
+    // Calculate position at flameout progress
+    const boostEnd = interceptor.boostEndProgress ?? 0.25;
+    const flameoutPos = this.getInterceptorPositionTowardTarget(
+      interceptor.geoLaunchPosition,
+      flameoutProgress,
+      interceptor.targetId,
+      boostEnd,
+      undefined,
+      interceptor.missedTarget,
+      interceptor.missDirection
+    );
+
+    const markerGroup = new THREE.Group();
+    markerGroup.position.set(flameoutPos.x, flameoutPos.y, flameoutPos.z);
+
+    // Tiny dot marker
+    const dotGeom = new THREE.SphereGeometry(0.15, 6, 6);
+    const dotMat = new THREE.MeshBasicMaterial({ color: 0xff8800, transparent: true, opacity: 0.8 });
+    const dot = new THREE.Mesh(dotGeom, dotMat);
+    markerGroup.add(dot);
+
+    // Small "F" label
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d')!;
+    canvas.width = 16;
+    canvas.height = 16;
+
+    ctx.fillStyle = '#ff8800';
+    ctx.font = 'bold 12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('F', canvas.width / 2, 12);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    const spriteMat = new THREE.SpriteMaterial({
+      map: texture,
+      transparent: true,
+      depthTest: false,
+    });
+    const label = new THREE.Sprite(spriteMat);
+    label.position.set(0, 0.5, 0);
+    label.scale.set(0.8, 0.8, 1);
+    markerGroup.add(label);
+
+    this.flameoutMarker = markerGroup;
+    this.interceptPredictionGroup.add(markerGroup);
+  }
+
+  /**
+   * Create fuel and speed stats label beside the tracked missile.
+   */
+  private createMissileStatsLabel(interceptor: Missile, flameoutProgress: number): void {
+    if (!interceptor.geoLaunchPosition) return;
+
+    // Get current missile position (use flameoutProgress to stop tracking after fuel runs out)
+    const boostEnd = interceptor.boostEndProgress ?? 0.25;
+    const missilePos = this.getInterceptorPositionTowardTarget(
+      interceptor.geoLaunchPosition,
+      interceptor.progress,
+      interceptor.targetId,
+      boostEnd,
+      interceptor.flightPhase,
+      interceptor.missedTarget,
+      interceptor.missDirection,
+      flameoutProgress
+    );
+
+    // Calculate fuel remaining based on elapsed time and burn rates
+    const totalFuelSeconds = 12;
+    const boostBurnRate = 2.0;
+    const trackBurnRate = 1.0;
+    const boostEndProgress = interceptor.boostEndProgress ?? 0.25;
+
+    const flightDurationSec = interceptor.flightDuration / 1000;
+    const elapsedSec = interceptor.progress * flightDurationSec;
+    const boostDurationSec = boostEndProgress * flightDurationSec;
+
+    let fuelUsed = 0;
+    if (elapsedSec <= boostDurationSec) {
+      // Still in boost
+      fuelUsed = elapsedSec * boostBurnRate;
+    } else {
+      // Past boost
+      fuelUsed = boostDurationSec * boostBurnRate + (elapsedSec - boostDurationSec) * trackBurnRate;
+    }
+
+    const fuelRemaining = Math.max(0, Math.round((1 - fuelUsed / totalFuelSeconds) * 100));
+
+    // Calculate speed (relative units)
+    const speed = interceptor.missedTarget ? 0 : Math.round((1 - interceptor.progress * 0.3) * 100);
+
+    // Create small canvas
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d')!;
+    canvas.width = 48;
+    canvas.height = 24;
+
+    // Draw stats - compact format
+    ctx.fillStyle = fuelRemaining > 20 ? '#00ff88' : '#ff8800';
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`F:${fuelRemaining}%`, 2, 10);
+
+    ctx.fillStyle = '#00ffff';
+    ctx.fillText(`S:${speed}`, 2, 22);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    const material = new THREE.SpriteMaterial({
+      map: texture,
+      transparent: true,
+      depthTest: false,
+    });
+    const sprite = new THREE.Sprite(material);
+
+    // Position beside the missile (offset to the side)
+    sprite.position.set(missilePos.x, missilePos.y, missilePos.z);
+    const offset = new THREE.Vector3(missilePos.x, missilePos.y, missilePos.z)
+      .normalize()
+      .multiplyScalar(2);
+    sprite.position.add(offset);
+    sprite.scale.set(1.5, 0.75, 1);
+
+    this.missileStatsLabel = sprite;
+    this.interceptPredictionGroup.add(sprite);
+  }
+
+  /**
+   * Clear intercept prediction visualization.
+   */
+  private clearInterceptPrediction(): void {
+    if (this.interceptMarker) {
+      this.interceptPredictionGroup.remove(this.interceptMarker);
+      this.interceptMarker.traverse((child) => {
+        if (child instanceof THREE.Mesh) {
+          child.geometry.dispose();
+          if (child.material instanceof THREE.Material) {
+            child.material.dispose();
+          }
+        }
+      });
+      this.interceptMarker = null;
+    }
+
+    if (this.interceptChanceLabel) {
+      this.interceptPredictionGroup.remove(this.interceptChanceLabel);
+      if (this.interceptChanceLabel.material instanceof THREE.SpriteMaterial) {
+        this.interceptChanceLabel.material.map?.dispose();
+        this.interceptChanceLabel.material.dispose();
+      }
+      this.interceptChanceLabel = null;
+    }
+
+    if (this.flameoutMarker) {
+      this.interceptPredictionGroup.remove(this.flameoutMarker);
+      this.flameoutMarker.traverse((child) => {
+        if (child instanceof THREE.Mesh || child instanceof THREE.LineSegments) {
+          child.geometry.dispose();
+          if (child.material instanceof THREE.Material) {
+            child.material.dispose();
+          }
+        }
+        if (child instanceof THREE.Sprite && child.material instanceof THREE.SpriteMaterial) {
+          child.material.map?.dispose();
+          child.material.dispose();
+        }
+      });
+      this.flameoutMarker = null;
+    }
+
+    if (this.missileStatsLabel) {
+      this.interceptPredictionGroup.remove(this.missileStatsLabel);
+      if (this.missileStatsLabel.material instanceof THREE.SpriteMaterial) {
+        this.missileStatsLabel.material.map?.dispose();
+        this.missileStatsLabel.material.dispose();
+      }
+      this.missileStatsLabel = null;
+    }
   }
 
   private showExplosionAt(geoPos: GeoPosition): void {
@@ -1936,6 +3730,174 @@ export class GlobeRenderer {
       }
     };
     animate();
+  }
+
+  /**
+   * Create a small ground impact explosion for missed interceptors.
+   * This is smaller and less dramatic than nuclear detonations.
+   */
+  private createGroundImpactExplosion(pos3d: { x: number; y: number; z: number }): void {
+    const explosionGroup = new THREE.Group();
+    explosionGroup.position.set(pos3d.x, pos3d.y, pos3d.z);
+    this.effectGroup.add(explosionGroup);
+
+    // Small orange flash
+    const flashGeom = new THREE.SphereGeometry(1.5, 8, 8);
+    const flashMat = new THREE.MeshBasicMaterial({
+      color: 0xffaa44,
+      transparent: true,
+      opacity: 1,
+    });
+    const flash = new THREE.Mesh(flashGeom, flashMat);
+    explosionGroup.add(flash);
+
+    // Small debris ring
+    const ringGeom = new THREE.RingGeometry(0.5, 2, 16);
+    const ringMat = new THREE.MeshBasicMaterial({
+      color: 0xaa6633,
+      transparent: true,
+      opacity: 0.6,
+      side: THREE.DoubleSide,
+    });
+    const ring = new THREE.Mesh(ringGeom, ringMat);
+    // Orient ring perpendicular to surface normal
+    const normal = new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z).normalize();
+    ring.lookAt(normal.clone().add(new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z)));
+    explosionGroup.add(ring);
+
+    // Animate
+    let frame = 0;
+    const maxFrames = 30; // Shorter animation than nuclear
+
+    const animate = () => {
+      frame++;
+      const progress = frame / maxFrames;
+
+      // Flash fades quickly
+      flashMat.opacity = Math.max(0, 1 - progress * 2);
+      flash.scale.setScalar(1 + progress * 2);
+
+      // Ring expands and fades
+      ring.scale.setScalar(1 + progress * 3);
+      ringMat.opacity = Math.max(0, 0.6 - progress * 0.8);
+
+      if (frame < maxFrames) {
+        requestAnimationFrame(animate);
+      } else {
+        // Cleanup
+        this.effectGroup.remove(explosionGroup);
+        flashGeom.dispose();
+        flashMat.dispose();
+        ringGeom.dispose();
+        ringMat.dispose();
+      }
+    };
+    animate();
+  }
+
+  /**
+   * Update fading missiles - missiles that have detonated/been intercepted
+   * and are now fading out with their trails shrinking to the impact point
+   */
+  private updateFadingMissiles(): void {
+    const now = Date.now();
+    const toRemove: string[] = [];
+
+    for (const [id, fading] of this.fadingMissiles) {
+      const elapsed = now - fading.fadeStartTime;
+      const progress = Math.min(1, elapsed / fading.fadeDuration);
+
+      if (progress >= 1) {
+        // Fade complete - remove
+        toRemove.push(id);
+        continue;
+      }
+
+      // Ease-out for smooth deceleration
+      const easedProgress = 1 - Math.pow(1 - progress, 2);
+
+      // Fade out the missile head
+      fading.objects.head.traverse((child) => {
+        if (child instanceof THREE.Mesh && child.material) {
+          const mat = child.material as THREE.MeshBasicMaterial;
+          if (mat.transparent !== undefined) {
+            mat.transparent = true;
+            mat.opacity = 1 - easedProgress;
+          }
+        }
+      });
+
+      // Shrink trail toward impact point
+      if (fading.trailPoints.length > 1) {
+        const numPoints = fading.trailPoints.length;
+        // Calculate how many points to keep (shrinking from start toward end)
+        const keepRatio = 1 - easedProgress;
+        const pointsToRemove = Math.floor(numPoints * easedProgress);
+        const remainingPoints = fading.trailPoints.slice(pointsToRemove);
+
+        if (remainingPoints.length >= 2) {
+          // Update trail geometry
+          const positions = new Float32Array(remainingPoints.length * 3);
+          for (let i = 0; i < remainingPoints.length; i++) {
+            positions[i * 3] = remainingPoints[i].x;
+            positions[i * 3 + 1] = remainingPoints[i].y;
+            positions[i * 3 + 2] = remainingPoints[i].z;
+          }
+          fading.objects.trail.geometry.setAttribute(
+            'position',
+            new THREE.BufferAttribute(positions, 3)
+          );
+          fading.objects.trail.geometry.attributes.position.needsUpdate = true;
+        }
+
+        // Also fade the trail
+        const trailMat = fading.objects.trail.material as THREE.LineBasicMaterial;
+        if (trailMat) {
+          trailMat.transparent = true;
+          trailMat.opacity = 1 - easedProgress;
+        }
+      }
+
+      // Animate explosion sphere (pulse and fade)
+      if (fading.objects.explosionSphere) {
+        const explosionMat = fading.objects.explosionSphere.material as THREE.MeshBasicMaterial;
+        // Pulse size: start at 1, grow to 2, then shrink
+        const pulseProgress = progress < 0.3 ? progress / 0.3 : 1 - (progress - 0.3) / 0.7;
+        const scale = 1 + pulseProgress * 1.5;
+        fading.objects.explosionSphere.scale.setScalar(scale);
+        // Fade out
+        explosionMat.opacity = 1 - easedProgress;
+      }
+
+      // Missile head stays in place (no movement toward impact)
+    }
+
+    // Remove completed fades
+    for (const id of toRemove) {
+      const fading = this.fadingMissiles.get(id);
+      if (fading) {
+        // Dispose and remove
+        this.missileGroup.remove(fading.objects.trail);
+        this.missileGroup.remove(fading.objects.head);
+        fading.objects.trail.geometry.dispose();
+        (fading.objects.trail.material as THREE.Material).dispose();
+        fading.objects.head.traverse((child) => {
+          if (child instanceof THREE.Mesh) {
+            child.geometry.dispose();
+            if (child.material) {
+              (child.material as THREE.Material).dispose();
+            }
+          }
+        });
+        // Dispose explosion sphere
+        if (fading.objects.explosionSphere) {
+          this.missileGroup.remove(fading.objects.explosionSphere);
+          fading.objects.explosionSphere.geometry.dispose();
+          (fading.objects.explosionSphere.material as THREE.Material).dispose();
+        }
+        this.fadingMissiles.delete(id);
+      }
+    }
   }
 
   private updateSatellites(): void {
@@ -2548,10 +4510,26 @@ export class GlobeRenderer {
     this.renderer.setSize(rect.width, rect.height);
   };
 
+  private handleMouseDown = (event: MouseEvent): void => {
+    this.mouseDownPosition = { x: event.clientX, y: event.clientY };
+  };
+
   private handleClick = (event: MouseEvent): void => {
     const rect = this.renderer.domElement.getBoundingClientRect();
     const canvasX = event.clientX - rect.left;
     const canvasY = event.clientY - rect.top;
+
+    // Check if this was a drag (mouse moved too much since mousedown)
+    if (this.mouseDownPosition) {
+      const dx = event.clientX - this.mouseDownPosition.x;
+      const dy = event.clientY - this.mouseDownPosition.y;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      this.mouseDownPosition = null; // Reset for next click
+
+      if (distance > this.DRAG_THRESHOLD) {
+        return; // This was a drag, not a click - ignore
+      }
+    }
 
     // Check if click is over HUD first
     if (this.hudRenderer.handleClick(canvasX, canvasY)) {
@@ -2585,8 +4563,8 @@ export class GlobeRenderer {
             const missiles = getMissiles(this.gameState);
             const missile = missiles.find(m => m.id === missileId);
             if (missile) {
-              const geoPos = missile.geoCurrentPosition ||
-                this.pixelToGeoFallback(missile.currentPosition);
+              const geoPos = missile.geoCurrentPosition
+                || (missile.currentPosition ? this.pixelToGeoFallback(missile.currentPosition) : { lat: 0, lng: 0 });
               this.centerCameraOnGeo(geoPos);
             }
           }
@@ -2675,16 +4653,27 @@ export class GlobeRenderer {
     if (cityIntersects.length > 0) {
       let obj = cityIntersects[0].object;
       // Walk up to find group with city data
-      while (obj && !obj.userData?.city && obj.parent) {
+      while (obj && obj.userData?.type !== 'city' && obj.parent) {
         obj = obj.parent as THREE.Object3D;
       }
-      if (obj?.userData?.city) {
-        const city = obj.userData.city;
+      if (obj?.userData?.type === 'city') {
+        const cityData = obj.userData;
         // Stop any missile tracking
         this.trackedMissileId = null;
-        // Center camera on the city
-        const geoPos = city.geoPosition || this.pixelToGeoFallback(city.position);
-        this.centerCameraOnGeo(geoPos);
+        // Get geo position from CITY_GEO_DATA
+        const territoryId = cityData.territoryId;
+        const cityName = cityData.name;
+        const citiesInTerritory = CITY_GEO_DATA[territoryId];
+        const cityGeoData = citiesInTerritory?.find(c => c.name === cityName);
+        if (cityGeoData) {
+          this.centerCameraOnGeo(cityGeoData.position);
+          // Show city info in HUD
+          this.selectedCityInfo = {
+            name: cityName,
+            population: cityData.population,
+            territoryId: territoryId,
+          };
+        }
         return;
       }
     }
@@ -2720,12 +4709,20 @@ export class GlobeRenderer {
 
     // Check for globe clicks
     const globeIntersects = this.raycaster.intersectObject(this.globe);
-    if (globeIntersects.length > 0 && this.onClickCallback) {
-      const point = globeIntersects[0].point;
-      const geoPos = this.spherePointToGeo(point);
-      this.onClickCallback(geoPos);
+    if (globeIntersects.length > 0) {
+      // Clear city selection when clicking on globe
+      this.selectedCityInfo = null;
+      if (this.onClickCallback) {
+        const point = globeIntersects[0].point;
+        const geoPos = this.spherePointToGeo(point);
+        this.onClickCallback(geoPos);
+      }
     }
   };
+
+  getSelectedCityInfo(): { name: string; population: number; territoryId: string } | null {
+    return this.selectedCityInfo;
+  }
 
   private spherePointToGeo(point: THREE.Vector3): GeoPosition {
     const normalized = point.clone().normalize();
@@ -2795,8 +4792,8 @@ export class GlobeRenderer {
         const missiles = getMissiles(this.gameState);
         const trackedMissile = missiles.find(m => m.id === this.trackedMissileId);
         if (trackedMissile && !trackedMissile.detonated && !trackedMissile.intercepted) {
-          const missileGeo = trackedMissile.geoCurrentPosition ||
-            this.pixelToGeoFallback(trackedMissile.currentPosition);
+          const missileGeo = trackedMissile.geoCurrentPosition
+            || (trackedMissile.currentPosition ? this.pixelToGeoFallback(trackedMissile.currentPosition) : { lat: 0, lng: 0 });
           // Smoothly follow the missile
           const targetPos = geoToSphere(missileGeo, this.camera.position.length());
           this.camera.position.lerp(new THREE.Vector3(targetPos.x, targetPos.y, targetPos.z), 0.05);
@@ -2846,6 +4843,15 @@ export class GlobeRenderer {
 
       // Update game objects
       this.updateGameObjects();
+
+      // Update communication chain visualization (for tracked interceptor)
+      this.updateCommunicationChain(deltaTime);
+
+      // Update intercept prediction visualization (for tracked interceptor)
+      this.updateInterceptPrediction();
+
+      // Update fading missiles (post-detonation effects)
+      this.updateFadingMissiles();
 
       // Apply view toggle visibility
       this.applyViewToggles();

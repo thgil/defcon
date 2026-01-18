@@ -1,6 +1,145 @@
 import type { GeoCoordinate } from './types';
 import type { Vector2 } from '../types';
 
+// ============================================================================
+// Vector3 Types and Math Utilities
+// ============================================================================
+
+export interface Vector3 {
+  x: number;
+  y: number;
+  z: number;
+}
+
+// Basic vector operations
+export function vec3Add(a: Vector3, b: Vector3): Vector3 {
+  return { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z };
+}
+
+export function vec3Subtract(a: Vector3, b: Vector3): Vector3 {
+  return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
+}
+
+export function vec3Scale(v: Vector3, s: number): Vector3 {
+  return { x: v.x * s, y: v.y * s, z: v.z * s };
+}
+
+export function vec3Dot(a: Vector3, b: Vector3): number {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+export function vec3Cross(a: Vector3, b: Vector3): Vector3 {
+  return {
+    x: a.y * b.z - a.z * b.y,
+    y: a.z * b.x - a.x * b.z,
+    z: a.x * b.y - a.y * b.x,
+  };
+}
+
+export function vec3Magnitude(v: Vector3): number {
+  return Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+}
+
+export function vec3Normalize(v: Vector3): Vector3 {
+  const mag = vec3Magnitude(v);
+  if (mag < 0.00001) return { x: 0, y: 0, z: 0 };
+  return { x: v.x / mag, y: v.y / mag, z: v.z / mag };
+}
+
+export function vec3Lerp(a: Vector3, b: Vector3, t: number): Vector3 {
+  return {
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+    z: a.z + (b.z - a.z) * t,
+  };
+}
+
+export function vec3Distance(a: Vector3, b: Vector3): number {
+  return vec3Magnitude(vec3Subtract(b, a));
+}
+
+export function vec3AngleBetween(a: Vector3, b: Vector3): number {
+  const dot = vec3Dot(vec3Normalize(a), vec3Normalize(b));
+  // Clamp to prevent NaN from acos
+  return Math.acos(Math.max(-1, Math.min(1, dot)));
+}
+
+/**
+ * Rotate vector 'from' toward vector 'to' by at most 'maxAngle' radians
+ */
+export function vec3RotateToward(from: Vector3, to: Vector3, maxAngle: number): Vector3 {
+  const fromNorm = vec3Normalize(from);
+  const toNorm = vec3Normalize(to);
+  const angle = vec3AngleBetween(fromNorm, toNorm);
+
+  if (angle < 0.0001) return fromNorm;
+
+  const t = Math.min(1, maxAngle / angle);
+  // Spherical lerp (simplified - works well for small angles)
+  const result = vec3Lerp(fromNorm, toNorm, t);
+  return vec3Normalize(result);
+}
+
+/**
+ * Convert geo coordinates to Cartesian 3D position
+ * @param geo Geographic coordinates
+ * @param altitude Altitude above the sphere surface
+ * @param sphereRadius Radius of the sphere
+ */
+export function geoToCartesian(geo: GeoCoordinate, altitude: number, sphereRadius: number): Vector3 {
+  const phi = (90 - geo.lat) * (Math.PI / 180);
+  const theta = (geo.lng + 180) * (Math.PI / 180);
+  const r = sphereRadius + altitude;
+
+  return {
+    x: -r * Math.sin(phi) * Math.cos(theta),
+    y: r * Math.cos(phi),
+    z: r * Math.sin(phi) * Math.sin(theta),
+  };
+}
+
+/**
+ * Convert Cartesian 3D position to geo coordinates
+ * @param pos 3D position
+ * @param sphereRadius Radius of the sphere (used to calculate altitude)
+ * @returns Geographic coordinates with altitude
+ */
+export function cartesianToGeo(pos: Vector3, sphereRadius: number): GeoCoordinate & { altitude: number } {
+  const r = vec3Magnitude(pos);
+
+  // Handle zero-length vector (at origin)
+  if (r < 0.00001) {
+    return { lat: 0, lng: 0, altitude: -sphereRadius };
+  }
+
+  const altitude = r - sphereRadius;
+
+  // Normalize to unit sphere
+  const nx = pos.x / r;
+  const ny = pos.y / r;
+  const nz = pos.z / r;
+
+  const lat = 90 - Math.acos(Math.max(-1, Math.min(1, ny))) * (180 / Math.PI);
+  let lng = Math.atan2(nz, -nx) * (180 / Math.PI) - 180;
+
+  // Normalize longitude to -180 to 180
+  if (lng < -180) lng += 360;
+  if (lng > 180) lng -= 360;
+
+  return { lat, lng, altitude };
+}
+
+/**
+ * Get the "up" vector (radially outward from globe center) at a given position
+ */
+export function getUpVector(pos: Vector3): Vector3 {
+  return vec3Normalize(pos);
+}
+
+// ============================================================================
+// Geographic Utilities
+// ============================================================================
+
 // Convert geographic coordinates to 3D sphere position
 // Returns {x, y, z} where:
 // - x is left/right (negative west, positive east)
@@ -21,11 +160,17 @@ export function geoToSphere(coord: GeoCoordinate, radius: number): { x: number; 
 export function sphereToGeo(point: { x: number; y: number; z: number }, radius: number): GeoCoordinate {
   // Normalize the point to unit sphere
   const len = Math.sqrt(point.x * point.x + point.y * point.y + point.z * point.z);
+
+  // Handle zero-length vector (at origin)
+  if (len < 0.00001) {
+    return { lat: 0, lng: 0 };
+  }
+
   const nx = point.x / len;
   const ny = point.y / len;
   const nz = point.z / len;
 
-  const lat = 90 - Math.acos(ny) * (180 / Math.PI);
+  const lat = 90 - Math.acos(Math.max(-1, Math.min(1, ny))) * (180 / Math.PI);
   let lng = Math.atan2(nz, -nx) * (180 / Math.PI) - 180;
 
   // Normalize longitude to -180 to 180
@@ -110,37 +255,101 @@ export function icbmEaseProgress(linearProgress: number): number {
   }
 }
 
-// Fixed phase durations in real-world seconds (consistent visual pacing)
-const LAUNCH_DURATION_SECONDS = 15.0;  // All missiles take 15s to climb (realistic rocket launch)
-const REENTRY_DURATION_SECONDS = 8.0;  // All missiles take 8s to descend
-const MAX_PHASE_FRACTION = 0.45;       // Cap each phase at 45% to prevent overlap
-
-// Easing helpers - using sine-based for gentle, natural curves
-function easeOutSine(t: number): number {
-  // Gentle acceleration at start, smooth approach to max altitude
-  return Math.sin(t * Math.PI / 2);
+// Easing helper
+function smootherstep(t: number): number {
+  // Ken Perlin's smoother version - zero 1st and 2nd derivatives at endpoints
+  return t * t * t * (t * (t * 6 - 15) + 10);
 }
 
-function easeInSine(t: number): number {
-  // Gentle start in space, smooth acceleration during descent
-  return 1 - Math.cos(t * Math.PI / 2);
+/**
+ * Compute a smooth ballistic altitude profile using a single continuous function.
+ * No phase boundaries - uses a modified raised cosine that:
+ * - Starts at 0 with zero velocity (on the ground)
+ * - Rises with a natural rocket trajectory
+ * - Has a flattened top (cruise phase)
+ * - Descends smoothly to target
+ * - Ends at 0
+ *
+ * The sqrt(sin) function naturally creates the flattened cruise phase
+ * while remaining perfectly smooth (C∞ continuous).
+ */
+function ballisticAltitude(t: number): number {
+  // Clamp input
+  const progress = Math.max(0, Math.min(1, t));
+
+  // Use sin(π*t) as the base - goes from 0 to 1 to 0 smoothly
+  // sin already has zero derivative at the endpoints
+  const sinCurve = Math.sin(progress * Math.PI);
+
+  // Apply sqrt to flatten the top (cruise phase)
+  // sqrt(sin(x)) spends more time near the peak value
+  // This creates the "cruise at altitude" effect naturally
+  const flattenedCurve = Math.sqrt(sinCurve);
+
+  return flattenedCurve;
+}
+
+/**
+ * Ground progress - use linear (constant speed) for smooth motion.
+ * The visual effect of "slow launch" comes from the steep altitude climb,
+ * not from actually slowing the ground speed. This avoids velocity
+ * discontinuities at phase boundaries.
+ */
+function ballisticGroundProgress(t: number): number {
+  // Simple linear progress - no phase-based speed changes
+  // The altitude curve creates the visual impression of speed variation
+  return Math.max(0, Math.min(1, t));
+}
+
+// Simple seeded random for deterministic variation
+function seededRandom(seed: number): number {
+  const x = Math.sin(seed * 12.9898 + 78.233) * 43758.5453;
+  return x - Math.floor(x);
 }
 
 // Get 3D position along missile arc (great circle + altitude)
-// Uses fixed real-time durations for climb/descent for consistent visual pacing
+// Uses smooth ballistic curves for natural rocket-like motion
 export function getMissilePosition3D(
   startGeo: GeoCoordinate,
   endGeo: GeoCoordinate,
   progress: number,
   maxAltitude: number,
   sphereRadius: number,
-  flightDuration?: number // in milliseconds - used to calculate fixed-time phases
+  flightDuration?: number, // in milliseconds (used for reference, but curves are normalized)
+  seed?: number // optional seed for adding variation to missile path
 ): { x: number; y: number; z: number } {
   // Clamp progress
   const t = Math.max(0, Math.min(1, progress));
 
-  // Get ground position along great circle
-  const groundGeo = geoInterpolate(startGeo, endGeo, t);
+  // Calculate ground progress using ballistic speed profile
+  // (slow at launch, constant in cruise, accelerating in descent)
+  const groundProgress = ballisticGroundProgress(t);
+
+  // Add slight randomness to path if seed provided
+  let pathOffset = 0;
+  if (seed !== undefined) {
+    // Create a slight lateral wobble that varies along the path
+    // Maximum offset at mid-flight, zero at start and end
+    const wobbleFactor = Math.sin(groundProgress * Math.PI); // 0 at ends, 1 in middle
+    const randomOffset = (seededRandom(seed) - 0.5) * 2; // -1 to 1
+    pathOffset = wobbleFactor * randomOffset * 0.008; // Small offset in radians
+  }
+
+  // Get ground position along great circle with possible offset
+  let groundGeo = geoInterpolate(startGeo, endGeo, groundProgress);
+
+  // Apply lateral offset perpendicular to path
+  if (pathOffset !== 0) {
+    // Calculate bearing and offset perpendicular to it
+    const bearing = calculateBearing(startGeo, endGeo);
+    const perpBearing = (bearing + 90) % 360;
+    // Offset the position slightly perpendicular to the path
+    groundGeo = {
+      lat: groundGeo.lat + pathOffset * Math.cos(perpBearing * Math.PI / 180) * 10,
+      lng: groundGeo.lng + pathOffset * Math.sin(perpBearing * Math.PI / 180) * 10,
+    };
+  }
+
   const groundPos = geoToSphere(groundGeo, sphereRadius);
 
   // Safety check for NaN (can happen with bad geo coordinates)
@@ -150,33 +359,16 @@ export function getMissilePosition3D(
     return startPos;
   }
 
-  // Calculate phase boundaries based on fixed real-time durations
-  // This ensures all missiles take ~4s to climb and ~3s to descend
-  const flightSeconds = (flightDuration || 15000) / 1000;
-
-  // Calculate phase boundaries as fractions of total flight
-  // Cap each phase at MAX_PHASE_FRACTION to ensure they don't overlap
-  const launchPhaseEnd = Math.min(MAX_PHASE_FRACTION, LAUNCH_DURATION_SECONDS / flightSeconds);
-  const reentryPhaseDuration = Math.min(MAX_PHASE_FRACTION, REENTRY_DURATION_SECONDS / flightSeconds);
-  const reentryPhaseStart = 1.0 - reentryPhaseDuration;
-
-  // Calculate altitude using dynamic phase boundaries
-  let altitude: number;
-
-  if (t < launchPhaseEnd) {
-    // Launch phase: Gentle climb to space
-    // Smooth acceleration, gradual approach to cruise altitude
-    const launchProgress = t / launchPhaseEnd;
-    altitude = maxAltitude * easeOutSine(launchProgress);
-  } else if (t > reentryPhaseStart) {
-    // Reentry phase: Gentle descent from space
-    // Smooth start, gradual acceleration during descent
-    const reentryProgress = (t - reentryPhaseStart) / reentryPhaseDuration;
-    altitude = maxAltitude * (1 - easeInSine(reentryProgress));
-  } else {
-    // Cruise phase: Constant altitude in space
-    altitude = maxAltitude;
+  // Calculate altitude using smooth ballistic profile
+  // Add slight altitude variation from seed
+  let altitudeVariation = 1.0;
+  if (seed !== undefined) {
+    altitudeVariation = 0.95 + seededRandom(seed + 2) * 0.1; // 0.95 to 1.05
   }
+
+  // Get smooth altitude from ballistic curve (returns 0-1+ range)
+  const altitudeFactor = ballisticAltitude(t);
+  const altitude = maxAltitude * altitudeVariation * altitudeFactor;
 
   // Move position outward from sphere center by altitude
   const len = Math.sqrt(groundPos.x * groundPos.x + groundPos.y * groundPos.y + groundPos.z * groundPos.z);
@@ -202,14 +394,15 @@ export function getMissileDirection3D(
   progress: number,
   maxAltitude: number,
   sphereRadius: number,
-  flightDuration?: number
+  flightDuration?: number,
+  seed?: number
 ): { x: number; y: number; z: number } {
   // Get position slightly ahead to calculate direction
   const delta = 0.01;
   const nextProgress = Math.min(1, progress + delta);
 
-  const currentPos = getMissilePosition3D(startGeo, endGeo, progress, maxAltitude, sphereRadius, flightDuration);
-  const nextPos = getMissilePosition3D(startGeo, endGeo, nextProgress, maxAltitude, sphereRadius, flightDuration);
+  const currentPos = getMissilePosition3D(startGeo, endGeo, progress, maxAltitude, sphereRadius, flightDuration, seed);
+  const nextPos = getMissilePosition3D(startGeo, endGeo, nextProgress, maxAltitude, sphereRadius, flightDuration, seed);
 
   // Direction vector
   const dx = nextPos.x - currentPos.x;
@@ -382,4 +575,31 @@ export function satellitesCanCommunicate(
   const angularDistance = greatCircleDistance(sat1Pos, sat2Pos);
   const distanceDegrees = angularDistance * (180 / Math.PI);
   return distanceDegrees <= maxRangeDegrees;
+}
+
+/**
+ * Check if a point is inside a polygon using ray casting algorithm.
+ * Works with geo coordinates (lat/lng).
+ *
+ * The algorithm counts how many times a horizontal ray from the point
+ * crosses polygon edges. An odd count means the point is inside.
+ */
+export function pointInPolygon(point: GeoCoordinate, polygon: GeoCoordinate[]): boolean {
+  if (polygon.length < 3) return false;
+
+  let inside = false;
+  const x = point.lng;
+  const y = point.lat;
+
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].lng, yi = polygon[i].lat;
+    const xj = polygon[j].lng, yj = polygon[j].lat;
+
+    const intersect = ((yi > y) !== (yj > y)) &&
+      (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+
+    if (intersect) inside = !inside;
+  }
+
+  return inside;
 }

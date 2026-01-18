@@ -13,7 +13,7 @@ import {
 // Satellite configuration constants
 export const SATELLITE_CONFIG = {
   ORBITAL_PERIOD: 90000,       // 90 seconds for full orbit
-  ORBITAL_ALTITUDE: 50,        // 50 globe units above surface
+  ORBITAL_ALTITUDE: 120,       // 120 globe units above surface (above interceptor range)
   LAUNCH_COOLDOWN: 30000,      // 30 seconds between launches
   STARTING_SATELLITES: 2,      // Initial satellites per facility
   HEALTH: 100,                 // Satellite health points
@@ -56,9 +56,20 @@ export class SatelliteSimulator {
     const clampedInclination = Math.max(0, Math.min(90, inclination));
 
     // Calculate starting longitude from facility position
-    const startingLongitude = facility.geoPosition
-      ? facility.geoPosition.lng
-      : ((facility.position.x / MAP_WIDTH) * 360) - 180;
+    let startingLongitude: number;
+    if (facility.geoPosition && typeof facility.geoPosition.lng === 'number' && !isNaN(facility.geoPosition.lng)) {
+      startingLongitude = facility.geoPosition.lng;
+    } else if (facility.position && typeof facility.position.x === 'number' && !isNaN(facility.position.x)) {
+      startingLongitude = ((facility.position.x / MAP_WIDTH) * 360) - 180;
+    } else {
+      // Fallback to 0 longitude if position data is invalid
+      console.warn('[SATELLITE] Invalid facility position, using default longitude 0');
+      startingLongitude = 0;
+    }
+
+    // Normalize longitude to valid range [-180, 180]
+    while (startingLongitude > 180) startingLongitude -= 360;
+    while (startingLongitude < -180) startingLongitude += 360;
 
     const satelliteId = uuidv4();
     const satellite: Satellite = {

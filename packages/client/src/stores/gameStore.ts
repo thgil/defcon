@@ -8,8 +8,21 @@ import {
   type DefconLevel,
   type Vector2,
   type BuildingType,
+  type GeoPosition,
+  type LaunchDetectedEvent,
   getBuildings,
 } from '@defcon/shared';
+
+// Alert types for HUD display
+export interface GameAlert {
+  id: string;
+  type: 'launch_detected' | 'incoming' | 'impact';
+  message: string;
+  position?: GeoPosition;
+  regionName?: string;
+  timestamp: number;
+  expiresAt: number;
+}
 
 interface GameStore {
   // State
@@ -20,6 +33,7 @@ interface GameStore {
   gameEnded: boolean;
   winner: string | null;
   finalScores: Record<string, number> | null;
+  alerts: GameAlert[];
 
   // Actions
   initGame: (state: GameState, playerId: string) => void;
@@ -40,6 +54,7 @@ interface GameStore {
   getDefconColor: () => string;
   getMyBuildings: () => Building[];
   getMySilos: () => Building[];
+  getAlerts: () => GameAlert[];
 }
 
 const DEFCON_COLORS: Record<DefconLevel, string> = {
@@ -58,6 +73,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
   gameEnded: false,
   winner: null,
   finalScores: null,
+  alerts: [],
 
   initGame: (state, playerId) => {
     set({
@@ -68,6 +84,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
       gameEnded: false,
       winner: null,
       finalScores: null,
+      alerts: [],
     });
   },
 
@@ -76,14 +93,23 @@ export const useGameStore = create<GameStore>((set, get) => ({
   },
 
   applyDelta: (events, buildingUpdates, missileUpdates, removedMissileIds, satelliteUpdates, removedSatelliteIds) => {
-    const { gameState, selectedBuilding } = get();
+    const { gameState, selectedBuilding, playerId } = get();
     if (!gameState) return;
 
     const newState = { ...gameState };
     let updatedSelectedBuilding = selectedBuilding;
+    const newAlerts: GameAlert[] = [];
+
+    // Validate arrays before iterating (protect against null/undefined)
+    const safeEvents = events || [];
+    const safeBuildingUpdates = buildingUpdates || [];
+    const safeMissileUpdates = missileUpdates || [];
+    const safeRemovedMissileIds = removedMissileIds || [];
+    const safeSatelliteUpdates = satelliteUpdates || [];
+    const safeRemovedSatelliteIds = removedSatelliteIds || [];
 
     // Apply building updates
-    for (const building of buildingUpdates) {
+    for (const building of safeBuildingUpdates) {
       newState.buildings = {
         ...newState.buildings,
         [building.id]: building,
@@ -95,12 +121,12 @@ export const useGameStore = create<GameStore>((set, get) => ({
       }
     }
 
-    if (buildingUpdates.length > 0) {
-      console.log('[DEBUG] applyDelta buildingUpdates:', buildingUpdates.length, 'selectedBuilding updated:', updatedSelectedBuilding !== selectedBuilding);
+    if (safeBuildingUpdates.length > 0) {
+      console.log('[DEBUG] applyDelta buildingUpdates:', safeBuildingUpdates.length, 'selectedBuilding updated:', updatedSelectedBuilding !== selectedBuilding);
     }
 
     // Apply missile updates
-    for (const missile of missileUpdates) {
+    for (const missile of safeMissileUpdates) {
       newState.missiles = {
         ...newState.missiles,
         [missile.id]: missile,
@@ -108,14 +134,14 @@ export const useGameStore = create<GameStore>((set, get) => ({
     }
 
     // Remove missiles
-    for (const id of removedMissileIds) {
+    for (const id of safeRemovedMissileIds) {
       const { [id]: removed, ...rest } = newState.missiles;
       newState.missiles = rest;
     }
 
     // Apply satellite updates
-    if (satelliteUpdates) {
-      for (const satellite of satelliteUpdates) {
+    if (safeSatelliteUpdates.length > 0) {
+      for (const satellite of safeSatelliteUpdates) {
         newState.satellites = {
           ...newState.satellites,
           [satellite.id]: satellite,
@@ -124,8 +150,8 @@ export const useGameStore = create<GameStore>((set, get) => ({
     }
 
     // Remove satellites
-    if (removedSatelliteIds) {
-      for (const id of removedSatelliteIds) {
+    if (safeRemovedSatelliteIds.length > 0) {
+      for (const id of safeRemovedSatelliteIds) {
         const { [id]: removed, ...rest } = newState.satellites;
         newState.satellites = rest;
       }
@@ -133,7 +159,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
 
     // Process events
     let shouldClearPlacement = false;
-    for (const event of events) {
+    for (const event of safeEvents) {
       switch (event.type) {
         case 'defcon_change':
           newState.defconLevel = event.newLevel;
@@ -178,14 +204,36 @@ export const useGameStore = create<GameStore>((set, get) => ({
             };
           }
           break;
+
+        case 'launch_detected':
+          // Only show alerts for the detecting player
+          if (event.detectedByPlayerId === playerId) {
+            const now = Date.now();
+            const regionText = event.regionName || 'Unknown Region';
+            newAlerts.push({
+              id: `launch-${now}-${Math.random()}`,
+              type: 'launch_detected',
+              message: `LAUNCH DETECTED: ${regionText}`,
+              position: event.approximatePosition,
+              regionName: event.regionName,
+              timestamp: now,
+              expiresAt: now + 8000, // Show for 8 seconds
+            });
+          }
+          break;
       }
     }
 
+    // Clean up expired alerts and add new ones
+    const now = Date.now();
+    const currentAlerts = get().alerts.filter(a => a.expiresAt > now);
+    const finalAlerts = [...currentAlerts, ...newAlerts];
+
     // Update game state and optionally clear placement mode
     if (shouldClearPlacement) {
-      set({ gameState: newState, placementMode: null, selectedBuilding: null });
+      set({ gameState: newState, placementMode: null, selectedBuilding: null, alerts: finalAlerts });
     } else {
-      set({ gameState: newState, selectedBuilding: updatedSelectedBuilding });
+      set({ gameState: newState, selectedBuilding: updatedSelectedBuilding, alerts: finalAlerts });
     }
   },
 
@@ -225,5 +273,11 @@ export const useGameStore = create<GameStore>((set, get) => ({
     return getBuildings(gameState).filter(
       (b) => b.ownerId === playerId && b.type === 'silo' && !b.destroyed
     );
+  },
+
+  getAlerts: () => {
+    const { alerts } = get();
+    const now = Date.now();
+    return alerts.filter(a => a.expiresAt > now);
   },
 }));

@@ -27,11 +27,17 @@ import {
   CITY_GEO_DATA,
   geoToPixel,
   pixelToGeo,
+  greatCircleDistance,
+  pointInPolygon,
+  isPhysicsMissile,
+  PhysicsMissile,
 } from '@defcon/shared';
 import { Lobby, LobbyPlayer } from '../lobby/Lobby';
 import { ConnectionManager } from '../ConnectionManager';
 import { MissileSimulator } from '../simulation/MissileSimulator';
 import { SatelliteSimulator, SATELLITE_CONFIG } from '../simulation/SatelliteSimulator';
+import { InterceptorPhysics } from '../simulation/InterceptorPhysics';
+import { AIPlayer, AIAction } from './AIPlayer';
 
 const TICK_RATE = 20; // 20 Hz
 const TICK_INTERVAL = 1000 / TICK_RATE;
@@ -122,6 +128,8 @@ export class GameRoom {
   private connectionManager: ConnectionManager;
   private missileSimulator: MissileSimulator;
   private satelliteSimulator: SatelliteSimulator;
+  private interceptorPhysics: InterceptorPhysics;
+  private aiPlayer: AIPlayer | null = null;
 
   private tickInterval: NodeJS.Timeout | null = null;
   private lastFullSync = 0;
@@ -134,6 +142,7 @@ export class GameRoom {
     this.connectionManager = connectionManager;
     this.missileSimulator = new MissileSimulator(this.config.missileSpeed);
     this.satelliteSimulator = new SatelliteSimulator();
+    this.interceptorPhysics = new InterceptorPhysics();
 
     this.state = this.initializeGameState(lobby.getPlayers());
   }
@@ -257,12 +266,24 @@ export class GameRoom {
     // Update DEFCON timer
     this.updateDefconTimer(TICK_INTERVAL);
 
-    // Update missiles
+    // Update ICBMs (legacy missiles)
     const missileEvents = this.missileSimulator.update(
       this.state,
       TICK_INTERVAL / 1000
     );
     this.pendingEvents.push(...missileEvents);
+
+    // Update physics-based interceptors
+    for (const missile of getMissiles(this.state)) {
+      if (isPhysicsMissile(missile)) {
+        const physicsEvents = this.interceptorPhysics.update(
+          missile as PhysicsMissile,
+          this.state,
+          TICK_INTERVAL / 1000
+        );
+        this.pendingEvents.push(...physicsEvents);
+      }
+    }
 
     // Update satellites
     const satelliteEvents = this.satelliteSimulator.update(
@@ -271,6 +292,12 @@ export class GameRoom {
       SPHERE_RADIUS
     );
     this.pendingEvents.push(...satelliteEvents);
+
+    // Update AI player
+    if (this.aiPlayer) {
+      const aiActions = this.aiPlayer.update(this.state, now);
+      this.executeAIActions(aiActions);
+    }
 
     // Check for interceptions
     const interceptionEvents = this.checkInterceptions();
@@ -341,46 +368,64 @@ export class GameRoom {
         (b as Silo).airDefenseAmmo > 0
     );
 
+    // Track which missiles already have interceptors targeting them
+    const missilesBeingTargeted = new Set<string>();
+    for (const missile of getMissiles(this.state)) {
+      if (missile.type === 'interceptor' && missile.targetId) {
+        missilesBeingTargeted.add(missile.targetId);
+      }
+    }
+
     // Check each incoming missile
     for (const missile of getMissiles(this.state)) {
       if (missile.detonated || missile.intercepted) continue;
       if (missile.type === 'interceptor') continue;
+
+      // Don't launch multiple interceptors at the same missile
+      if (missilesBeingTargeted.has(missile.id)) continue;
 
       for (const silo of airDefenseSilos) {
         // Only intercept missiles heading toward this player's territory
         const targetTerritory = this.getTerritoryAt(missile.targetPosition);
         if (!targetTerritory || targetTerritory.ownerId !== silo.ownerId) continue;
 
-        // Check if missile is within interception range
-        const distance = this.distance(missile.currentPosition, silo.position);
-        const interceptionRange = 150;
-        if (distance > interceptionRange) continue;
+        // RADAR REQUIREMENT: Check if ANY radar belonging to this player can see the missile
+        const detectingRadar = this.findDetectingRadar(missile, silo.ownerId);
+        if (!detectingRadar) continue; // No radar can see it - cannot engage
+
+        // Don't launch if missile is too close (won't have time to intercept)
+        // Allow engagement up to 75% progress to match interception logic
+        if (missile.progress > 0.75) continue;
 
         // Check cooldown
         const now = Date.now();
         if (now - silo.lastFireTime < silo.fireCooldown) continue;
 
-        // Interception probability
-        const baseProbability = 0.7;
-        const distanceFactor = 1 - distance / interceptionRange;
-        const progressFactor = missile.progress > 0.8 ? 0.5 : 1;
-        const probability = baseProbability * distanceFactor * progressFactor;
+        // Launch an interceptor missile with radar tracking info
+        const interceptor = this.missileSimulator.launchInterceptor(
+          silo,
+          missile,
+          silo.ownerId,
+          detectingRadar.id
+        );
 
-        if (Math.random() < probability) {
-          missile.intercepted = true;
-          silo.airDefenseAmmo--;
-          silo.lastFireTime = now;
+        this.state.missiles[interceptor.id] = interceptor;
+        silo.airDefenseAmmo--;
+        silo.lastFireTime = now;
 
-          events.push({
-            type: 'interception',
-            tick: this.state.tick,
-            missileId: missile.id,
-            interceptorId: silo.id,
-            position: { ...missile.currentPosition },
-          });
+        // Track that this missile is now being targeted
+        missilesBeingTargeted.add(missile.id);
 
-          break;
-        }
+        events.push({
+          type: 'missile_launch',
+          tick: this.state.tick,
+          missileId: interceptor.id,
+          playerId: silo.ownerId,
+          sourcePosition: silo.position,
+          targetPosition: interceptor.targetPosition || silo.position,
+        });
+
+        break; // Only one silo launches at each missile
       }
     }
 
@@ -399,57 +444,9 @@ export class GameRoom {
         (b as Silo).airDefenseAmmo > 0
     );
 
-    // Check each satellite
-    for (const satellite of getSatellites(this.state)) {
-      if (satellite.destroyed) continue;
-
-      // Get satellite ground position
-      const satPos = satellite.geoPosition;
-      if (!satPos) continue;
-
-      for (const silo of airDefenseSilos) {
-        // Can only target enemy satellites
-        if (silo.ownerId === satellite.ownerId) continue;
-
-        // Check if satellite is within interception range (using geo position)
-        const siloGeo = silo.geoPosition || pixelToGeoLocal(silo.position);
-        const latDiff = Math.abs(satPos.lat - siloGeo.lat);
-        const lngDiff = Math.abs(satPos.lng - siloGeo.lng);
-        const angularDistance = Math.sqrt(latDiff * latDiff + lngDiff * lngDiff);
-
-        // Satellites can be targeted within ~20 degrees of a silo
-        const interceptionRangeDegrees = 20;
-        if (angularDistance > interceptionRangeDegrees) continue;
-
-        // Check cooldown
-        const now = Date.now();
-        if (now - silo.lastFireTime < silo.fireCooldown) continue;
-
-        // Interception probability (lower than missiles due to altitude)
-        const baseProbability = 0.3;
-        const distanceFactor = 1 - angularDistance / interceptionRangeDegrees;
-        const probability = baseProbability * distanceFactor;
-
-        if (Math.random() < probability) {
-          silo.airDefenseAmmo--;
-          silo.lastFireTime = now;
-
-          // Use the satellite simulator to damage/destroy the satellite
-          const destroyEvent = this.satelliteSimulator.damageSatellite(
-            satellite,
-            SATELLITE_CONFIG.HEALTH, // One hit kill for now
-            silo.id,
-            this.state.tick
-          );
-
-          if (destroyEvent) {
-            events.push(destroyEvent);
-          }
-
-          break;
-        }
-      }
-    }
+    // Satellites orbit at high altitude (120 units) - well above interceptor missile range (~50 units)
+    // They cannot be shot down by ground-based air defense silos
+    // This section is disabled - satellites are immune to interception
 
     return events;
   }
@@ -464,9 +461,15 @@ export class GameRoom {
   }
 
   private isPointInTerritory(point: Vector2, territory: Territory): boolean {
-    // Use geo bounds for more accurate checking
+    const geo = pixelToGeoLocal(point);
+
+    // Use polygon containment if boundary exists
+    if (territory.geoBoundary && territory.geoBoundary.length >= 3) {
+      return pointInPolygon(geo, territory.geoBoundary);
+    }
+
+    // Fallback to bounds check (shouldn't happen with proper data)
     if (territory.geoBounds) {
-      const geo = pixelToGeoLocal(point);
       const bounds = territory.geoBounds;
       return (
         geo.lat >= bounds.south &&
@@ -476,23 +479,115 @@ export class GameRoom {
       );
     }
 
-    // Fallback to simple bounding box check with pixel coordinates
-    for (const boundary of territory.boundaries) {
-      if (boundary.length < 3) continue;
-      const minX = Math.min(...boundary.map((p) => p.x));
-      const maxX = Math.max(...boundary.map((p) => p.x));
-      const minY = Math.min(...boundary.map((p) => p.y));
-      const maxY = Math.max(...boundary.map((p) => p.y));
-
-      if (point.x >= minX && point.x <= maxX && point.y >= minY && point.y <= maxY) {
-        return true;
-      }
-    }
     return false;
   }
 
   private distance(a: Vector2, b: Vector2): number {
     return Math.hypot(b.x - a.x, b.y - a.y);
+  }
+
+  /**
+   * Find a radar that can detect the given missile.
+   * Uses the radar's range property and great-circle distance.
+   * Returns the radar that can see the missile, or null if none can.
+   */
+  private findDetectingRadar(missile: Missile, ownerId: string): Radar | null {
+    const radars = getBuildings(this.state).filter(
+      (b): b is Radar =>
+        b.type === 'radar' &&
+        !b.destroyed &&
+        b.active &&
+        b.ownerId === ownerId
+    );
+
+    if (radars.length === 0) return null;
+
+    const missileGeo = missile.geoCurrentPosition || pixelToGeoLocal(missile.currentPosition);
+
+    for (const radar of radars) {
+      const radarGeo = radar.geoPosition || pixelToGeoLocal(radar.position);
+
+      // Calculate angular distance in degrees
+      const angularDistanceRadians = greatCircleDistance(radarGeo, missileGeo);
+      const angularDistanceDegrees = angularDistanceRadians * (180 / Math.PI);
+
+      // Radar range is configured in game config (default ~300 units which is ~27 degrees)
+      // Convert radar range to degrees (roughly 11 degrees per 100 units)
+      const radarRangeDegrees = (radar.range / 100) * 11;
+
+      if (angularDistanceDegrees <= radarRangeDegrees) {
+        return radar;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Check if any enemy satellites can see a launch at the given position.
+   * Returns LaunchDetectedEvent for each player who detects the launch.
+   */
+  private checkSatelliteLaunchDetection(
+    launchPosition: GeoPosition,
+    launchingPlayerId: string
+  ): GameEvent[] {
+    const events: GameEvent[] = [];
+    const satellites = getSatellites(this.state);
+
+    // Satellite vision range in degrees
+    const visionRangeDegrees = SATELLITE_CONFIG.VISION_RANGE_DEGREES;
+
+    // Track which players have already detected (only one alert per player)
+    const detectingPlayers = new Set<string>();
+
+    for (const satellite of satellites) {
+      if (satellite.destroyed) continue;
+      // Only enemy satellites detect launches
+      if (satellite.ownerId === launchingPlayerId) continue;
+      // Don't alert the same player twice
+      if (detectingPlayers.has(satellite.ownerId)) continue;
+
+      const satPos = satellite.geoPosition;
+      if (!satPos) continue;
+
+      // Calculate angular distance between satellite and launch position
+      const angularDistanceRadians = greatCircleDistance(satPos, launchPosition);
+      const angularDistanceDegrees = angularDistanceRadians * (180 / Math.PI);
+
+      if (angularDistanceDegrees <= visionRangeDegrees) {
+        detectingPlayers.add(satellite.ownerId);
+
+        // Add some randomness to the position (approximate detection)
+        const jitterDegrees = 2; // +/- 2 degrees of uncertainty
+        const approximatePosition: GeoPosition = {
+          lat: launchPosition.lat + (Math.random() - 0.5) * jitterDegrees * 2,
+          lng: launchPosition.lng + (Math.random() - 0.5) * jitterDegrees * 2,
+        };
+
+        // Find the territory name if possible
+        let regionName: string | undefined;
+        for (const territory of getTerritories(this.state)) {
+          if (territory.ownerId === launchingPlayerId) {
+            regionName = territory.name;
+            break;
+          }
+        }
+
+        events.push({
+          type: 'launch_detected',
+          tick: this.state.tick,
+          detectedByPlayerId: satellite.ownerId,
+          launchingPlayerId,
+          approximatePosition,
+          regionName,
+          satelliteId: satellite.id,
+        });
+
+        console.log(`[SATELLITE] Launch detected by ${satellite.ownerId}'s satellite over ${regionName || 'unknown region'}`);
+      }
+    }
+
+    return events;
   }
 
   private checkGameEnd(): void {
@@ -798,6 +893,11 @@ export class GameRoom {
       sourcePosition: silo.position,
       targetPosition,
     });
+
+    // Check if any enemy satellites can detect this launch
+    const launchGeoPos = silo.geoPosition || pixelToGeoLocal(silo.position);
+    const detectionEvents = this.checkSatelliteLaunchDetection(launchGeoPos, playerId);
+    this.pendingEvents.push(...detectionEvents);
   }
 
   handleSetSiloMode(playerId: string, siloId: string, mode: SiloMode): void {
@@ -870,8 +970,8 @@ export class GameRoom {
     this.pendingEvents.push(result.event);
   }
 
-  handleDebugCommand(command: string, value?: number): void {
-    console.log(`[DEBUG] Command: ${command}, value: ${value}`);
+  handleDebugCommand(command: string, value?: number, targetRegion?: string): void {
+    console.log(`[DEBUG] Command: ${command}, value: ${value}, targetRegion: ${targetRegion}`);
 
     switch (command) {
       case 'advance_defcon':
@@ -926,9 +1026,316 @@ export class GameRoom {
         }
         console.log('[DEBUG] Replenished all silo ammo');
         break;
+
+      case 'launch_test_missiles':
+        this.launchTestMissiles(value || 5, targetRegion);
+        break;
     }
 
     // Send immediate full sync after debug command
     this.sendFullSync();
+  }
+
+  private launchTestMissiles(count: number, targetRegion?: string): void {
+    // Test missiles only allowed at DEFCON 1 (like regular missiles)
+    if (this.state.defconLevel !== 1) {
+      console.log('[DEBUG] Test missiles only available at DEFCON 1');
+      return;
+    }
+
+    // Get all silos that have missiles
+    const allSilos = Object.values(this.state.buildings).filter(
+      (b): b is Silo => b.type === 'silo' && !b.destroyed && (b as Silo).missileCount > 0
+    );
+
+    if (allSilos.length === 0) {
+      console.log('[DEBUG] No silos with missiles available');
+      return;
+    }
+
+    // Get all cities, optionally filtered by target region
+    const allCities: { position: Vector2; geoPosition: GeoPosition; name: string; territoryId: string }[] = [];
+
+    for (const [territoryId, cities] of Object.entries(CITY_DATA)) {
+      // If targetRegion is specified, only include cities from that territory
+      if (targetRegion && territoryId !== targetRegion) continue;
+
+      for (const city of cities) {
+        allCities.push({
+          position: city.position,
+          geoPosition: city.geoPosition,
+          name: city.name,
+          territoryId,
+        });
+      }
+    }
+
+    if (allCities.length === 0) {
+      console.log(`[DEBUG] No target cities available${targetRegion ? ` in ${targetRegion}` : ''}`);
+      return;
+    }
+
+    // Launch missiles from random silos to random cities
+    const launchCount = Math.min(count, allSilos.length * 2); // Cap at 2 missiles per silo
+    console.log(`[DEBUG] Launching ${launchCount} test missiles${targetRegion ? ` toward ${targetRegion}` : ''}`);
+
+    for (let i = 0; i < launchCount; i++) {
+      // Pick a random silo that still has missiles
+      const availableSilos = allSilos.filter(s => s.missileCount > 0);
+      if (availableSilos.length === 0) break;
+
+      const silo = availableSilos[Math.floor(Math.random() * availableSilos.length)];
+
+      // Pick a random city that's not in the silo owner's territory
+      const targetCities = allCities.filter(c => {
+        const territory = this.state.territories[c.territoryId];
+        return !territory || territory.ownerId !== silo.ownerId;
+      });
+
+      if (targetCities.length === 0) continue;
+
+      const target = targetCities[Math.floor(Math.random() * targetCities.length)];
+
+      // Create missile
+      const missile = this.missileSimulator.launchMissile(
+        silo,
+        target.position,
+        silo.ownerId,
+        undefined
+      );
+
+      this.state.missiles[missile.id] = missile;
+      silo.missileCount--;
+
+      this.pendingEvents.push({
+        type: 'missile_launch',
+        tick: this.state.tick,
+        missileId: missile.id,
+        playerId: silo.ownerId,
+        sourcePosition: silo.position,
+        targetPosition: target.position,
+      });
+
+      console.log(`[DEBUG] Test missile ${i + 1}: ${target.name}`);
+    }
+  }
+
+  // AI-related methods
+
+  handleEnableAI(region: string): void {
+    // Check if territory exists and isn't already taken
+    const territory = this.state.territories[region];
+    if (!territory) {
+      console.log(`[AI] Invalid territory: ${region}`);
+      return;
+    }
+
+    if (territory.ownerId) {
+      console.log(`[AI] Territory already owned: ${region}`);
+      return;
+    }
+
+    // Remove existing AI if any
+    if (this.aiPlayer) {
+      this.handleDisableAI();
+    }
+
+    // Create new AI player
+    this.aiPlayer = new AIPlayer(region);
+    const playerCount = Object.keys(this.state.players).length;
+    const aiPlayerData = this.aiPlayer.createPlayer(playerCount);
+
+    // Add AI player to game state
+    this.state.players[this.aiPlayer.id] = aiPlayerData;
+
+    // Assign territory to AI
+    territory.ownerId = this.aiPlayer.id;
+
+    // Add cities for AI territory
+    if (CITY_DATA[region]) {
+      for (const cityData of CITY_DATA[region]) {
+        const cityId = uuidv4();
+        this.state.cities[cityId] = {
+          id: cityId,
+          territoryId: region,
+          name: cityData.name,
+          position: cityData.position,
+          population: cityData.population,
+          maxPopulation: cityData.population,
+          destroyed: false,
+          geoPosition: cityData.geoPosition,
+        };
+        territory.cities.push(cityId);
+        aiPlayerData.populationRemaining += cityData.population;
+      }
+    }
+
+    console.log(`[AI] Enabled AI player ${this.aiPlayer.name} with territory ${region}`);
+
+    // If we're at DEFCON 5, immediately place buildings
+    if (this.state.defconLevel === 5) {
+      const actions = this.aiPlayer.placeBuildings();
+      this.executeAIActions(actions);
+    }
+
+    // Send full sync to update all clients
+    this.sendFullSync();
+  }
+
+  handleDisableAI(): void {
+    if (!this.aiPlayer) return;
+
+    const aiId = this.aiPlayer.id;
+    console.log(`[AI] Disabling AI player ${this.aiPlayer.name}`);
+
+    // Remove AI player
+    delete this.state.players[aiId];
+
+    // Remove AI territory ownership
+    for (const territory of Object.values(this.state.territories)) {
+      if (territory.ownerId === aiId) {
+        territory.ownerId = null;
+      }
+    }
+
+    // Remove AI buildings
+    const buildingsToRemove: string[] = [];
+    for (const [id, building] of Object.entries(this.state.buildings)) {
+      if (building.ownerId === aiId) {
+        buildingsToRemove.push(id);
+      }
+    }
+    for (const id of buildingsToRemove) {
+      delete this.state.buildings[id];
+    }
+
+    // Remove AI cities
+    const citiesToRemove: string[] = [];
+    for (const [id, city] of Object.entries(this.state.cities)) {
+      const territory = this.state.territories[city.territoryId];
+      if (territory && !territory.ownerId) {
+        citiesToRemove.push(id);
+      }
+    }
+    for (const id of citiesToRemove) {
+      delete this.state.cities[id];
+    }
+
+    // Clear territory city references
+    for (const territory of Object.values(this.state.territories)) {
+      if (!territory.ownerId) {
+        territory.cities = [];
+        territory.buildings = [];
+      }
+    }
+
+    // Remove AI missiles
+    const missilesToRemove: string[] = [];
+    for (const [id, missile] of Object.entries(this.state.missiles)) {
+      if (missile.ownerId === aiId) {
+        missilesToRemove.push(id);
+      }
+    }
+    for (const id of missilesToRemove) {
+      delete this.state.missiles[id];
+    }
+
+    this.aiPlayer = null;
+
+    // Send full sync
+    this.sendFullSync();
+  }
+
+  private executeAIActions(actions: AIAction[]): void {
+    for (const action of actions) {
+      switch (action.type) {
+        case 'place_building':
+          if (action.buildingType && action.position && action.geoPosition) {
+            this.placeAIBuilding(action.buildingType, action.position, action.geoPosition);
+          }
+          break;
+
+        case 'launch_missile':
+          if (action.siloId && action.targetPosition) {
+            this.handleLaunchMissile(
+              this.aiPlayer!.id,
+              action.siloId,
+              action.targetPosition
+            );
+          }
+          break;
+
+        case 'set_silo_mode':
+          if (action.siloId && action.mode) {
+            this.handleSetSiloMode(
+              this.aiPlayer!.id,
+              action.siloId,
+              action.mode
+            );
+          }
+          break;
+      }
+    }
+  }
+
+  private placeAIBuilding(
+    buildingType: 'silo' | 'radar',
+    position: Vector2,
+    geoPosition: GeoPosition
+  ): void {
+    if (!this.aiPlayer) return;
+
+    const territory = this.state.territories[this.aiPlayer.territoryId];
+    if (!territory) return;
+
+    const buildingId = uuidv4();
+    let building: Building;
+
+    switch (buildingType) {
+      case 'silo':
+        building = {
+          id: buildingId,
+          type: 'silo',
+          territoryId: territory.id,
+          ownerId: this.aiPlayer.id,
+          position,
+          health: 100,
+          destroyed: false,
+          geoPosition,
+          mode: 'air_defense',  // Start in defense mode
+          modeSwitchCooldown: 0,
+          missileCount: 10,
+          airDefenseAmmo: 20,
+          lastFireTime: 0,
+          fireCooldown: 2000,
+        };
+        break;
+
+      case 'radar':
+        building = {
+          id: buildingId,
+          type: 'radar',
+          territoryId: territory.id,
+          ownerId: this.aiPlayer.id,
+          position,
+          health: 100,
+          destroyed: false,
+          geoPosition,
+          range: this.config.radarRange,
+          active: true,
+        };
+        break;
+    }
+
+    this.state.buildings[buildingId] = building;
+    territory.buildings.push(buildingId);
+
+    this.pendingEvents.push({
+      type: 'building_placed',
+      tick: this.state.tick,
+      building,
+    });
+
+    console.log(`[AI] Placed ${buildingType} at (${position.x.toFixed(0)}, ${position.y.toFixed(0)})`);
   }
 }

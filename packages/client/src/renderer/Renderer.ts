@@ -59,6 +59,11 @@ export class Renderer {
   // Trail storage for missiles
   private missileTrails = new Map<string, Vector2[]>();
 
+  // Bound resize handler for proper event listener removal
+  private handleResize = (): void => {
+    this.resize();
+  };
+
   constructor(container: HTMLElement) {
     this.container = container;
     this.canvas = document.createElement('canvas');
@@ -66,13 +71,13 @@ export class Renderer {
     this.container.appendChild(this.canvas);
 
     this.resize();
-    window.addEventListener('resize', this.resize);
+    window.addEventListener('resize', this.handleResize);
 
     this.startRenderLoop();
   }
 
   destroy(): void {
-    window.removeEventListener('resize', this.resize);
+    window.removeEventListener('resize', this.handleResize);
     if (this.animationFrame) {
       cancelAnimationFrame(this.animationFrame);
     }
@@ -407,9 +412,13 @@ export class Renderer {
     const ctx = this.ctx;
 
     for (const missile of getMissiles(this.gameState)) {
+      // Skip missiles without currentPosition (shouldn't happen but be safe)
+      const pos = missile.currentPosition;
+      if (!pos) continue;
+
       if (missile.intercepted || missile.detonated) {
         // Draw explosion
-        this.drawExplosion(missile.currentPosition);
+        this.drawExplosion(pos);
         this.missileTrails.delete(missile.id);
         continue;
       }
@@ -420,7 +429,7 @@ export class Renderer {
         trail = [];
         this.missileTrails.set(missile.id, trail);
       }
-      trail.push({ ...missile.currentPosition });
+      trail.push({ ...pos });
       if (trail.length > 30) {
         trail.shift();
       }
@@ -454,7 +463,7 @@ export class Renderer {
       ctx.save();
       ctx.globalCompositeOperation = 'lighter';
       ctx.beginPath();
-      ctx.arc(missile.currentPosition.x, missile.currentPosition.y, 8, 0, Math.PI * 2);
+      ctx.arc(pos.x, pos.y, 8, 0, Math.PI * 2);
       ctx.fillStyle = headColor + '40';
       ctx.filter = 'blur(4px)';
       ctx.fill();
@@ -462,7 +471,7 @@ export class Renderer {
 
       // Head
       ctx.beginPath();
-      ctx.arc(missile.currentPosition.x, missile.currentPosition.y, 3, 0, Math.PI * 2);
+      ctx.arc(pos.x, pos.y, 3, 0, Math.PI * 2);
       ctx.fillStyle = headColor;
       ctx.fill();
     }

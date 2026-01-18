@@ -48,8 +48,25 @@ export class ConnectionManager {
 
     ws.on('message', (data) => {
       try {
-        const message = parseMessage(data.toString()) as ClientMessage;
-        this.handleMessage(connection, message);
+        const message = parseMessage(data.toString());
+        if (!message) {
+          this.send(connection, {
+            type: 'error',
+            code: 'INVALID_MESSAGE',
+            message: 'Failed to parse message: invalid JSON',
+          });
+          return;
+        }
+        // Validate that this is a client message (has a type property)
+        if (!('type' in message) || typeof message.type !== 'string') {
+          this.send(connection, {
+            type: 'error',
+            code: 'INVALID_MESSAGE',
+            message: 'Invalid message format',
+          });
+          return;
+        }
+        this.handleMessage(connection, message as ClientMessage);
       } catch (error) {
         console.error('Failed to parse message:', error);
         this.send(connection, {
@@ -160,7 +177,21 @@ export class ConnectionManager {
       case 'debug':
         if (connection.gameId) {
           const game = this.lobbyManager.getGame(connection.gameId);
-          game?.handleDebugCommand(message.command, message.value);
+          game?.handleDebugCommand(message.command, message.value, message.targetRegion);
+        }
+        break;
+
+      case 'enable_ai':
+        if (connection.gameId) {
+          const game = this.lobbyManager.getGame(connection.gameId);
+          game?.handleEnableAI(message.region);
+        }
+        break;
+
+      case 'disable_ai':
+        if (connection.gameId) {
+          const game = this.lobbyManager.getGame(connection.gameId);
+          game?.handleDisableAI();
         }
         break;
     }

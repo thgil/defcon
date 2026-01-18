@@ -45,11 +45,14 @@ interface NetworkState {
   launchMissile: (siloId: string, targetPosition: Vector2, targetId?: string) => void;
   launchSatellite: (facilityId: string, inclination: number) => void;
   setSiloMode: (siloId: string, mode: SiloMode) => void;
-  sendDebugCommand: (command: 'advance_defcon' | 'set_defcon' | 'add_missiles' | 'skip_timer', value?: number) => void;
+  sendDebugCommand: (command: 'advance_defcon' | 'set_defcon' | 'add_missiles' | 'skip_timer' | 'launch_test_missiles', value?: number, targetRegion?: string) => void;
+  enableAI: (region: string) => void;
+  disableAI: () => void;
   quickStart: () => void;
 }
 
 let ws: WebSocket | null = null;
+let isConnecting = false;
 
 export const useNetworkStore = create<NetworkState>((set, get) => ({
   connected: false,
@@ -59,28 +62,33 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   error: null,
 
   connect: () => {
-    if (ws) return;
+    // Prevent concurrent connection attempts
+    if (ws || isConnecting) return;
+    isConnecting = true;
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = import.meta.env.DEV
-      ? 'ws://localhost:3001'
+      ? 'ws://localhost:3002'
       : `${protocol}//${window.location.host}/ws`;
 
     ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
       console.log('Connected to server');
+      isConnecting = false;
       set({ connected: true, error: null });
     };
 
     ws.onclose = () => {
       console.log('Disconnected from server');
+      isConnecting = false;
       set({ connected: false, playerId: null });
       ws = null;
     };
 
     ws.onerror = (error) => {
       console.error('WebSocket error:', error);
+      isConnecting = false;
       set({ error: 'Connection error' });
     };
 
@@ -154,8 +162,16 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     send({ type: 'set_silo_mode', siloId, mode });
   },
 
-  sendDebugCommand: (command: 'advance_defcon' | 'set_defcon' | 'add_missiles' | 'skip_timer', value?: number) => {
-    send({ type: 'debug', command, value });
+  sendDebugCommand: (command: 'advance_defcon' | 'set_defcon' | 'add_missiles' | 'skip_timer' | 'launch_test_missiles', value?: number, targetRegion?: string) => {
+    send({ type: 'debug', command, value, targetRegion });
+  },
+
+  enableAI: (region: string) => {
+    send({ type: 'enable_ai', region });
+  },
+
+  disableAI: () => {
+    send({ type: 'disable_ai' });
   },
 
   quickStart: () => {
@@ -178,10 +194,12 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       },
     });
 
-    // Set up auto-start sequence
+    // Set up auto-start sequence with cleanup timeout
+    let subscriptionCleanedUp = false;
     const unsubscribe = useNetworkStore.subscribe((state, prevState) => {
       // When we get lobby update, select territory and ready up
-      if (state.lobbyState && !prevState.lobbyState) {
+      if (state.lobbyState && !prevState.lobbyState && !subscriptionCleanedUp) {
+        subscriptionCleanedUp = true;
         setTimeout(() => {
           send({ type: 'select_territory', territoryId: 'north_america' });
           setTimeout(() => {
@@ -194,6 +212,15 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
         }, 100);
       }
     });
+
+    // Safety cleanup: unsubscribe after 30 seconds if nothing happened
+    setTimeout(() => {
+      if (!subscriptionCleanedUp) {
+        subscriptionCleanedUp = true;
+        unsubscribe();
+        console.warn('[quickStart] Auto-start subscription timed out');
+      }
+    }, 30000);
   },
 }));
 

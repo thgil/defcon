@@ -25,7 +25,9 @@ export type ClientMessage =
   | LaunchSatelliteMessage
   | SetSiloModeMessage
   | PingMessage
-  | DebugCommandMessage;
+  | DebugCommandMessage
+  | EnableAIMessage
+  | DisableAIMessage;
 
 export interface CreateLobbyMessage {
   type: 'create_lobby';
@@ -90,8 +92,18 @@ export interface PingMessage {
 
 export interface DebugCommandMessage {
   type: 'debug';
-  command: 'advance_defcon' | 'set_defcon' | 'add_missiles' | 'skip_timer';
+  command: 'advance_defcon' | 'set_defcon' | 'add_missiles' | 'skip_timer' | 'launch_test_missiles';
   value?: number;
+  targetRegion?: string; // For launch_test_missiles: target region ID
+}
+
+export interface EnableAIMessage {
+  type: 'enable_ai';
+  region: string;
+}
+
+export interface DisableAIMessage {
+  type: 'disable_ai';
 }
 
 // ============ SERVER -> CLIENT ============
@@ -203,6 +215,10 @@ export function serializeMessage(msg: ClientMessage | ServerMessage): string {
 }
 
 // Helper to parse messages
-export function parseMessage(data: string): ClientMessage | ServerMessage {
-  return JSON.parse(data);
+export function parseMessage(data: string): ClientMessage | ServerMessage | null {
+  try {
+    return JSON.parse(data);
+  } catch {
+    return null;
+  }
 }

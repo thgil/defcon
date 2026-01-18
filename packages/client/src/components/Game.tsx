@@ -1,8 +1,7 @@
-import { useRef, useEffect, useCallback, useState } from 'react';
+import { useRef, useEffect, useCallback } from 'react';
 import { useGameStore } from '../stores/gameStore';
 import { useNetworkStore } from '../stores/networkStore';
 import { GlobeRenderer } from '../renderer/GlobeRenderer';
-import DebugPanel from './DebugPanel';
 import { type Vector2, type Silo, type SiloMode, type GeoPosition, type Building, geoToPixel } from '@defcon/shared';
 
 // Map dimensions for converting geo to pixel (must match server)
@@ -12,7 +11,6 @@ const MAP_HEIGHT = 700;
 export default function Game() {
   const containerRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<GlobeRenderer | null>(null);
-  const [showDebug, setShowDebug] = useState(true);
   const gameState = useGameStore((s) => s.gameState);
   const playerId = useGameStore((s) => s.playerId);
   const placementMode = useGameStore((s) => s.placementMode);
@@ -22,13 +20,18 @@ export default function Game() {
   const launchMissile = useNetworkStore((s) => s.launchMissile);
   const launchSatellite = useNetworkStore((s) => s.launchSatellite);
   const setSiloMode = useNetworkStore((s) => s.setSiloMode);
+  const sendDebugCommand = useNetworkStore((s) => s.sendDebugCommand);
+  const enableAI = useNetworkStore((s) => s.enableAI);
+  const disableAI = useNetworkStore((s) => s.disableAI);
   const gameEnded = useGameStore((s) => s.gameEnded);
 
   // Debug panel keyboard toggle
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'd' || e.key === 'D') {
-        setShowDebug((prev) => !prev);
+        if (rendererRef.current) {
+          rendererRef.current.toggleDebugPanel();
+        }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -113,15 +116,25 @@ export default function Game() {
   useEffect(() => {
     if (!containerRef.current) return;
 
-    const renderer = new GlobeRenderer(containerRef.current);
-    rendererRef.current = renderer;
+    const newRenderer = new GlobeRenderer(containerRef.current);
+    rendererRef.current = newRenderer;
 
     // Set up click handlers
+    const renderer = newRenderer;
     renderer.setOnClick(handleGlobeClick);
     renderer.setOnBuildingClick(handleBuildingClick);
     renderer.setOnModeChange(handleModeChange);
     renderer.setOnPlacementMode(handlePlacementModeChange);
     renderer.setOnLaunchSatellite(handleLaunchSatellite);
+
+    // Set up debug panel callbacks
+    renderer.setDebugCallbacks(
+      (command, value, targetRegion) => {
+        sendDebugCommand(command as any, value, targetRegion);
+      },
+      enableAI,
+      disableAI
+    );
 
     // Subscribe directly to store for immediate updates (bypasses React render cycle)
     const unsubscribe = useGameStore.subscribe((state) => {
@@ -130,6 +143,7 @@ export default function Game() {
       }
       renderer.setPlacementMode(state.placementMode);
       renderer.setSelectedBuilding(state.selectedBuilding);
+      renderer.setAlerts(state.getAlerts());
     });
 
     // Initial state
@@ -142,7 +156,7 @@ export default function Game() {
       unsubscribe();
       renderer.destroy();
     };
-  }, [handleGlobeClick, handleBuildingClick, handleModeChange, handlePlacementModeChange, handleLaunchSatellite]);
+  }, [handleGlobeClick, handleBuildingClick, handleModeChange, handlePlacementModeChange, handleLaunchSatellite, sendDebugCommand, enableAI, disableAI]);
 
   // Handle right click to cancel
   const handleContextMenu = useCallback(
@@ -192,7 +206,6 @@ export default function Game() {
         }}
         onContextMenu={handleContextMenu}
       />
-      {showDebug && <DebugPanel />}
       {gameEnded && <GameEndOverlay />}
     </div>
   );
