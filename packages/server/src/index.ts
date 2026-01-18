@@ -1,10 +1,24 @@
+import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { ConnectionManager } from './ConnectionManager';
 import { LobbyManager } from './lobby/LobbyManager';
 
 const PORT = parseInt(process.env.PORT || '3002', 10);
+const HOST = '0.0.0.0';
 
-const wss = new WebSocketServer({ port: PORT });
+// Create HTTP server for Fly.io compatibility
+const server = createServer((req, res) => {
+  // Health check endpoint
+  if (req.url === '/health') {
+    res.writeHead(200);
+    res.end('OK');
+    return;
+  }
+  res.writeHead(200);
+  res.end('DEFCON WebSocket Server');
+});
+
+const wss = new WebSocketServer({ server });
 const lobbyManager = new LobbyManager();
 const connectionManager = new ConnectionManager(lobbyManager);
 
@@ -12,8 +26,8 @@ wss.on('connection', (ws: WebSocket) => {
   connectionManager.handleConnection(ws);
 });
 
-wss.on('listening', () => {
-  console.log(`DEFCON server running on ws://localhost:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`DEFCON server running on http://${HOST}:${PORT}`);
 });
 
 wss.on('error', (error) => {
@@ -24,7 +38,9 @@ wss.on('error', (error) => {
 process.on('SIGINT', () => {
   console.log('\nShutting down server...');
   wss.close(() => {
-    console.log('Server closed');
-    process.exit(0);
+    server.close(() => {
+      console.log('Server closed');
+      process.exit(0);
+    });
   });
 });
