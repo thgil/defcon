@@ -7,15 +7,12 @@ COPY package.json package-lock.json ./
 COPY packages/server/package.json ./packages/server/
 COPY packages/shared/package.json ./packages/shared/
 
-# Install dependencies
-RUN npm ci
+# Install dependencies (including dev for tsx)
+RUN npm ci --include=dev
 
 # Copy source code
 COPY packages/shared ./packages/shared
 COPY packages/server ./packages/server
-
-# Build server
-RUN npm run build -w @defcon/server
 
 # Expose port
 EXPOSE 8080
