@@ -66,10 +66,9 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
     if (ws || isConnecting) return;
     isConnecting = true;
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = import.meta.env.DEV
       ? 'ws://localhost:3002'
-      : `${protocol}//${window.location.host}/ws`;
+      : (import.meta.env.VITE_WS_URL || `wss://${window.location.host}/ws`);
 
     ws = new WebSocket(wsUrl);
 
