@@ -24,6 +24,21 @@ export interface GameAlert {
   expiresAt: number;
 }
 
+// Intercept info for manual intercept UI
+export interface InterceptSiloInfo {
+  siloId: string;
+  siloName: string;
+  hitProbability: number;
+  estimatedInterceptProgress: number;
+  ammoRemaining: number;
+}
+
+export interface ManualInterceptState {
+  targetMissileId: string | null;
+  availableSilos: InterceptSiloInfo[];
+  selectedSiloIds: Set<string>;
+}
+
 interface GameStore {
   // State
   gameState: GameState | null;
@@ -34,6 +49,7 @@ interface GameStore {
   winner: string | null;
   finalScores: Record<string, number> | null;
   alerts: GameAlert[];
+  manualIntercept: ManualInterceptState;
 
   // Actions
   initGame: (state: GameState, playerId: string) => void;
@@ -49,6 +65,12 @@ interface GameStore {
   selectBuilding: (building: Building | null) => void;
   setPlacementMode: (type: BuildingType | null) => void;
   handleGameEnd: (winner: string | null, scores: Record<string, number>) => void;
+
+  // Manual intercept actions
+  setInterceptTarget: (targetMissileId: string | null) => void;
+  setInterceptInfo: (targetMissileId: string, availableSilos: InterceptSiloInfo[]) => void;
+  toggleInterceptSilo: (siloId: string) => void;
+  clearInterceptSelection: () => void;
 
   // Computed
   getDefconColor: () => string;
@@ -74,6 +96,11 @@ export const useGameStore = create<GameStore>((set, get) => ({
   winner: null,
   finalScores: null,
   alerts: [],
+  manualIntercept: {
+    targetMissileId: null,
+    availableSilos: [],
+    selectedSiloIds: new Set(),
+  },
 
   initGame: (state, playerId) => {
     set({
@@ -85,6 +112,11 @@ export const useGameStore = create<GameStore>((set, get) => ({
       winner: null,
       finalScores: null,
       alerts: [],
+      manualIntercept: {
+        targetMissileId: null,
+        availableSilos: [],
+        selectedSiloIds: new Set(),
+      },
     });
   },
 
@@ -250,6 +282,56 @@ export const useGameStore = create<GameStore>((set, get) => ({
       gameEnded: true,
       winner,
       finalScores: scores,
+    });
+  },
+
+  // Manual intercept actions
+  setInterceptTarget: (targetMissileId) => {
+    set({
+      manualIntercept: {
+        targetMissileId,
+        availableSilos: [],
+        selectedSiloIds: new Set(),
+      },
+    });
+  },
+
+  setInterceptInfo: (targetMissileId, availableSilos) => {
+    const current = get().manualIntercept;
+    // Only update if this is for the current target
+    if (current.targetMissileId === targetMissileId) {
+      set({
+        manualIntercept: {
+          ...current,
+          availableSilos,
+        },
+      });
+    }
+  },
+
+  toggleInterceptSilo: (siloId) => {
+    const current = get().manualIntercept;
+    const newSelectedSiloIds = new Set(current.selectedSiloIds);
+    if (newSelectedSiloIds.has(siloId)) {
+      newSelectedSiloIds.delete(siloId);
+    } else {
+      newSelectedSiloIds.add(siloId);
+    }
+    set({
+      manualIntercept: {
+        ...current,
+        selectedSiloIds: newSelectedSiloIds,
+      },
+    });
+  },
+
+  clearInterceptSelection: () => {
+    set({
+      manualIntercept: {
+        targetMissileId: null,
+        availableSilos: [],
+        selectedSiloIds: new Set(),
+      },
     });
   },
 

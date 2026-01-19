@@ -194,6 +194,28 @@ export class ConnectionManager {
           game?.handleDisableAI();
         }
         break;
+
+      case 'request_intercept_info':
+        if (connection.gameId) {
+          const game = this.lobbyManager.getGame(connection.gameId);
+          game?.handleRequestInterceptInfo(
+            connection,
+            connection.playerId!,
+            message.targetMissileId
+          );
+        }
+        break;
+
+      case 'manual_intercept':
+        if (connection.gameId) {
+          const game = this.lobbyManager.getGame(connection.gameId);
+          game?.handleManualIntercept(
+            connection.playerId!,
+            message.targetMissileId,
+            message.siloIds
+          );
+        }
+        break;
     }
   }
 

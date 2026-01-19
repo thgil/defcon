@@ -1,5 +1,5 @@
 import type { GameState, Building, Silo, SatelliteLaunchFacility, DefconLevel, Player } from '@defcon/shared';
-import type { GameAlert } from '../stores/gameStore';
+import type { GameAlert, ManualInterceptState, InterceptSiloInfo } from '../stores/gameStore';
 
 const DEFCON_COLORS: Record<DefconLevel, string> = {
   5: '#00ff00',
@@ -94,6 +94,12 @@ export class HUDRenderer {
   private fogOfWarEnabled = true;
   private onFogOfWarToggle: ((enabled: boolean) => void) | null = null;
 
+  // Manual intercept UI state
+  private manualInterceptState: ManualInterceptState | null = null;
+  private onToggleInterceptSilo: ((siloId: string) => void) | null = null;
+  private onLaunchIntercept: (() => void) | null = null;
+  private onCancelIntercept: (() => void) | null = null;
+
   // Timer interpolation state
   private lastStateUpdateTime = performance.now();
   private lastDefconTimer = 0;
@@ -163,6 +169,20 @@ export class HUDRenderer {
 
   setDebugPanelVisible(visible: boolean): void {
     this.debugPanelVisible = visible;
+  }
+
+  setManualInterceptCallbacks(
+    onToggleSilo: (siloId: string) => void,
+    onLaunch: () => void,
+    onCancel: () => void
+  ): void {
+    this.onToggleInterceptSilo = onToggleSilo;
+    this.onLaunchIntercept = onLaunch;
+    this.onCancelIntercept = onCancel;
+  }
+
+  setManualInterceptState(state: ManualInterceptState | null): void {
+    this.manualInterceptState = state;
   }
 
   toggleDebugPanel(): void {
@@ -260,6 +280,11 @@ export class HUDRenderer {
 
     // Draw alerts (center-left)
     this.drawAlerts(height);
+
+    // Draw manual intercept panel (center of screen)
+    if (this.manualInterceptState?.targetMissileId) {
+      this.drawInterceptPanel(width, height);
+    }
   }
 
   setAlerts(alerts: GameAlert[]): void {
@@ -306,6 +331,132 @@ export class HUDRenderer {
 
       alertY += 35;
     }
+  }
+
+  private drawInterceptPanel(width: number, height: number): void {
+    if (!this.manualInterceptState) return;
+
+    const panelWidth = 280;
+    const siloCount = this.manualInterceptState.availableSilos.length;
+    const panelHeight = 120 + siloCount * 30;
+    const panelX = (width - panelWidth) / 2;
+    const panelY = (height - panelHeight) / 2;
+
+    // Background
+    this.ctx.fillStyle = 'rgba(0, 0, 0, 0.9)';
+    this.ctx.fillRect(panelX, panelY, panelWidth, panelHeight);
+    this.ctx.strokeStyle = '#ff4444';
+    this.ctx.lineWidth = 2;
+    this.ctx.strokeRect(panelX, panelY, panelWidth, panelHeight);
+
+    // Title
+    this.ctx.fillStyle = '#ff4444';
+    this.ctx.font = FONT_LARGE;
+    this.ctx.textAlign = 'center';
+    this.ctx.fillText('MANUAL INTERCEPT', panelX + panelWidth / 2, panelY + 24);
+
+    // Target info
+    this.ctx.font = FONT;
+    this.ctx.fillStyle = '#888';
+    this.ctx.fillText(`Target: ICBM`, panelX + panelWidth / 2, panelY + 44);
+
+    if (siloCount === 0) {
+      // No silos available
+      this.ctx.fillStyle = '#666';
+      this.ctx.fillText('No silos available', panelX + panelWidth / 2, panelY + 70);
+    } else {
+      // Draw silo checkboxes
+      let siloY = panelY + 60;
+      for (const silo of this.manualInterceptState.availableSilos) {
+        const isSelected = this.manualInterceptState.selectedSiloIds.has(silo.siloId);
+
+        // Checkbox
+        const checkboxX = panelX + 16;
+        this.drawButton({
+          x: checkboxX,
+          y: siloY,
+          width: 20,
+          height: 20,
+          label: isSelected ? '✓' : '',
+          action: () => {
+            if (this.onToggleInterceptSilo) {
+              this.onToggleInterceptSilo(silo.siloId);
+            }
+          },
+          active: isSelected,
+        });
+
+        // Silo name and hit probability
+        this.ctx.textAlign = 'left';
+        this.ctx.fillStyle = isSelected ? '#00ff88' : '#888';
+        this.ctx.font = FONT;
+        const probPercent = Math.round(silo.hitProbability * 100);
+        this.ctx.fillText(`${silo.siloName} (${probPercent}%)`, checkboxX + 28, siloY + 14);
+
+        // Ammo indicator
+        this.ctx.textAlign = 'right';
+        this.ctx.fillStyle = '#666';
+        this.ctx.fillText(`${silo.ammoRemaining}`, panelX + panelWidth - 16, siloY + 14);
+
+        siloY += 26;
+      }
+
+      // Calculate combined probability
+      const selectedSilos = this.manualInterceptState.availableSilos.filter(
+        s => this.manualInterceptState!.selectedSiloIds.has(s.siloId)
+      );
+      let combinedMissProb = 1;
+      for (const silo of selectedSilos) {
+        combinedMissProb *= (1 - silo.hitProbability);
+      }
+      const combinedHitProb = 1 - combinedMissProb;
+      const combinedPercent = Math.round(combinedHitProb * 100);
+
+      // Combined probability display
+      this.ctx.textAlign = 'center';
+      this.ctx.fillStyle = selectedSilos.length > 0 ? '#00ff88' : '#666';
+      this.ctx.font = FONT;
+      this.ctx.fillText(
+        `Combined: ${combinedPercent}%`,
+        panelX + panelWidth / 2,
+        panelY + panelHeight - 50
+      );
+    }
+
+    // Action buttons
+    const buttonY = panelY + panelHeight - 35;
+    const buttonWidth = (panelWidth - 48) / 2;
+
+    // Cancel button
+    this.drawButton({
+      x: panelX + 16,
+      y: buttonY,
+      width: buttonWidth,
+      height: 24,
+      label: 'CANCEL',
+      action: () => {
+        if (this.onCancelIntercept) {
+          this.onCancelIntercept();
+        }
+      },
+    });
+
+    // Launch button
+    const hasSelection = this.manualInterceptState.selectedSiloIds.size > 0;
+    this.drawButton({
+      x: panelX + 24 + buttonWidth,
+      y: buttonY,
+      width: buttonWidth,
+      height: 24,
+      label: 'LAUNCH',
+      disabled: !hasSelection,
+      active: hasSelection,
+      action: () => {
+        if (this.onLaunchIntercept && hasSelection) {
+          this.onLaunchIntercept();
+        }
+      },
+    });
   }
 
   private drawDefconIndicator(width: number): void {
@@ -1105,6 +1256,17 @@ export class HUDRenderer {
 
     // Bottom status bar
     if (y >= height - statusBarHeight) return true;
+
+    // Manual intercept panel (centered)
+    if (this.manualInterceptState?.targetMissileId) {
+      const interceptPanelWidth = 280;
+      const siloCount = this.manualInterceptState.availableSilos.length;
+      const interceptPanelHeight = 120 + siloCount * 30;
+      const interceptPanelX = (width - interceptPanelWidth) / 2;
+      const interceptPanelY = (height - interceptPanelHeight) / 2;
+      if (x >= interceptPanelX && x <= interceptPanelX + interceptPanelWidth &&
+          y >= interceptPanelY && y <= interceptPanelY + interceptPanelHeight) return true;
+    }
 
     return false;
   }

@@ -176,6 +176,14 @@ export class GlobeRenderer {
     estimatedSpeed: number;  // Progress per second
   }>();
 
+  // Client-side interpolation for physics missiles (position-based)
+  private physicsMissileInterpolation = new Map<string, {
+    lastPosition: { x: number; y: number; z: number };
+    targetPosition: { x: number; y: number; z: number };
+    estimatedVelocity: { x: number; y: number; z: number };
+    lastUpdateTime: number;
+  }>();
+
   // Track missile positions for explosions when they're removed
   private missileTargets = new Map<string, GeoPosition>();
   private missileLastPositions = new Map<string, GeoPosition>();
@@ -232,6 +240,7 @@ export class GlobeRenderer {
   // Click callback
   private onClickCallback: ((geoPosition: GeoPosition) => void) | null = null;
   private onBuildingClickCallback: ((building: Building) => void) | null = null;
+  private onEnemyICBMClickCallback: ((missileId: string) => void) | null = null;
   private onModeChangeCallback: ((siloId: string, mode: SiloMode) => void) | null = null;
   private onPlacementModeCallback: ((type: string | null) => void) | null = null;
   private onLaunchSatelliteCallback: ((facilityId: string, inclination: number) => void) | null = null;
@@ -412,6 +421,18 @@ export class GlobeRenderer {
     this.hudRenderer.setAlerts(alerts);
   }
 
+  setManualInterceptState(state: import('../stores/gameStore').ManualInterceptState): void {
+    this.hudRenderer.setManualInterceptState(state);
+  }
+
+  setManualInterceptCallbacks(
+    onToggleSilo: (siloId: string) => void,
+    onLaunch: () => void,
+    onCancel: () => void
+  ): void {
+    this.hudRenderer.setManualInterceptCallbacks(onToggleSilo, onLaunch, onCancel);
+  }
+
   setSelectedBuilding(building: Building | null): void {
     this.selectedBuilding = building;
     // Clear satellite selection when selecting building
@@ -425,6 +446,10 @@ export class GlobeRenderer {
 
   setOnClick(callback: (geoPosition: GeoPosition) => void): void {
     this.onClickCallback = callback;
+  }
+
+  setOnEnemyICBMClick(callback: (missileId: string) => void): void {
+    this.onEnemyICBMClickCallback = callback;
   }
 
   setOnBuildingClick(callback: (building: Building) => void): void {
@@ -1919,6 +1944,7 @@ export class GlobeRenderer {
 
         // Clean up tracking
         this.missileInterpolation.delete(missile.id);
+        this.physicsMissileInterpolation.delete(missile.id);
         this.missileTargets.delete(missile.id);
         this.missileLastPositions.delete(missile.id);
         this.missileWasIntercepted.delete(missile.id);
@@ -1955,6 +1981,7 @@ export class GlobeRenderer {
             this.missileObjects.delete(missile.id);
           }
           this.missileInterpolation.delete(missile.id);
+          this.physicsMissileInterpolation.delete(missile.id);
           this.uncertainContacts.delete(missile.id);
           continue;
         }
@@ -2184,8 +2211,8 @@ export class GlobeRenderer {
         : 1.0;
 
       if (isPhysicsMissile(missile)) {
-        // Physics-based interceptor: use server-provided position directly
-        pos3d = { ...missile.position };
+        // Physics-based interceptor: use interpolated position for smooth movement
+        pos3d = this.getInterpolatedPhysicsPosition(missile, now);
       } else if (isInterceptor && missile.targetId) {
         // Legacy interceptor: use trajectory calculation
         const boostEnd = missile.boostEndProgress ?? 0.25;
@@ -2479,6 +2506,7 @@ export class GlobeRenderer {
       this.missileLastPositions.delete(id);
       this.missileWasIntercepted.delete(id);
       this.missileInterpolation.delete(id);
+      this.physicsMissileInterpolation.delete(id);
       this.uncertainContacts.delete(id);
       this.shownExplosions.delete(id);
       this.groundImpactMissiles.delete(id);
@@ -2900,6 +2928,70 @@ export class GlobeRenderer {
     );
   }
 
+  /**
+   * Get interpolated position for physics missiles for smooth client-side rendering.
+   * Interpolates between server updates to eliminate network jitter.
+   */
+  private getInterpolatedPhysicsPosition(
+    missile: PhysicsMissile,
+    now: number
+  ): { x: number; y: number; z: number } {
+    let interpState = this.physicsMissileInterpolation.get(missile.id);
+
+    if (!interpState) {
+      // New missile - initialize interpolation state
+      interpState = {
+        lastPosition: { ...missile.position },
+        targetPosition: { ...missile.position },
+        estimatedVelocity: { ...missile.velocity },
+        lastUpdateTime: now,
+      };
+      this.physicsMissileInterpolation.set(missile.id, interpState);
+      return { ...missile.position };
+    }
+
+    // Check if server sent a new position (position changed significantly)
+    const dx = missile.position.x - interpState.targetPosition.x;
+    const dy = missile.position.y - interpState.targetPosition.y;
+    const dz = missile.position.z - interpState.targetPosition.z;
+    const posDelta = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+    if (posDelta > 0.01) {
+      // Server update received - update interpolation targets
+      const timeSinceLastUpdate = Math.max(0.001, (now - interpState.lastUpdateTime) / 1000);
+
+      // Estimate velocity from position delta
+      interpState.estimatedVelocity = {
+        x: dx / timeSinceLastUpdate,
+        y: dy / timeSinceLastUpdate,
+        z: dz / timeSinceLastUpdate,
+      };
+
+      interpState.lastPosition = { ...interpState.targetPosition };
+      interpState.targetPosition = { ...missile.position };
+      interpState.lastUpdateTime = now;
+    }
+
+    // Interpolate position based on estimated velocity
+    const timeSinceUpdate = (now - interpState.lastUpdateTime) / 1000;
+
+    // Predict current position based on last known position + velocity * time
+    // But blend toward server position to prevent drift
+    const predictedX = interpState.targetPosition.x + interpState.estimatedVelocity.x * timeSinceUpdate;
+    const predictedY = interpState.targetPosition.y + interpState.estimatedVelocity.y * timeSinceUpdate;
+    const predictedZ = interpState.targetPosition.z + interpState.estimatedVelocity.z * timeSinceUpdate;
+
+    // Clamp prediction to not overshoot too much (within 0.5 seconds of predicted travel)
+    const maxExtrapolation = 0.5; // seconds
+    const clampedTime = Math.min(timeSinceUpdate, maxExtrapolation);
+
+    return {
+      x: interpState.targetPosition.x + interpState.estimatedVelocity.x * clampedTime,
+      y: interpState.targetPosition.y + interpState.estimatedVelocity.y * clampedTime,
+      z: interpState.targetPosition.z + interpState.estimatedVelocity.z * clampedTime,
+    };
+  }
+
   // Hash string to a deterministic number for seeding randomness
   private hashStringToNumber(str: string): number {
     let hash = 0;
@@ -3243,8 +3335,8 @@ export class GlobeRenderer {
    * Create flameout marker for physics missiles.
    */
   private createPhysicsFlameoutMarker(missile: PhysicsMissile): void {
-    // Position marker at current missile location
-    const pos = missile.position;
+    // Position marker at flameout location (not current position)
+    const pos = missile.flameoutPosition || missile.position;
     const markerGroup = new THREE.Group();
 
     // Red X shape for flameout
@@ -4556,8 +4648,6 @@ export class GlobeRenderer {
       // Find which missile this belongs to
       for (const [missileId, missileObjs] of this.missileObjects) {
         if (missileObjs.head === obj || missileObjs.trail === obj) {
-          // Found the missile - track it and center camera
-          this.trackedMissileId = missileId;
           // Get missile position and center on it
           if (this.gameState) {
             const missiles = getMissiles(this.gameState);
@@ -4566,6 +4656,20 @@ export class GlobeRenderer {
               const geoPos = missile.geoCurrentPosition
                 || (missile.currentPosition ? this.pixelToGeoFallback(missile.currentPosition) : { lat: 0, lng: 0 });
               this.centerCameraOnGeo(geoPos);
+
+              // Check if this is an enemy ICBM - offer manual intercept
+              const isEnemyICBM = missile.ownerId !== this.playerId &&
+                                  missile.type === 'icbm' &&
+                                  !missile.detonated &&
+                                  !missile.intercepted;
+
+              if (isEnemyICBM && this.onEnemyICBMClickCallback) {
+                // Trigger manual intercept UI
+                this.onEnemyICBMClickCallback(missileId);
+              }
+
+              // Track the missile
+              this.trackedMissileId = missileId;
             }
           }
           return;
@@ -4613,6 +4717,8 @@ export class GlobeRenderer {
           return;
         }
       }
+      // Clicked on satellite orbit/vision/link but not body - don't fall through to clear selection
+      return;
     }
 
     // Check for building clicks (silos, radars, airfields)

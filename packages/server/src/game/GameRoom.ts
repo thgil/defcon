@@ -376,6 +376,8 @@ export class GameRoom {
       }
     }
 
+    const now = Date.now();
+
     // Check each incoming missile
     for (const missile of getMissiles(this.state)) {
       if (missile.detonated || missile.intercepted) continue;
@@ -383,6 +385,12 @@ export class GameRoom {
 
       // Don't launch multiple interceptors at the same missile
       if (missilesBeingTargeted.has(missile.id)) continue;
+
+      // Don't launch if missile is too close (won't have time to intercept)
+      if (missile.progress > 0.75) continue;
+
+      // Collect all valid silos that can engage this missile, with their scores
+      const candidateSilos: Array<{ silo: Silo; score: number; radar: Radar }> = [];
 
       for (const silo of airDefenseSilos) {
         // Only intercept missiles heading toward this player's territory
@@ -393,43 +401,74 @@ export class GameRoom {
         const detectingRadar = this.findDetectingRadar(missile, silo.ownerId);
         if (!detectingRadar) continue; // No radar can see it - cannot engage
 
-        // Don't launch if missile is too close (won't have time to intercept)
-        // Allow engagement up to 75% progress to match interception logic
-        if (missile.progress > 0.75) continue;
-
         // Check cooldown
-        const now = Date.now();
         if (now - silo.lastFireTime < silo.fireCooldown) continue;
 
-        // Launch an interceptor missile with radar tracking info
-        const interceptor = this.missileSimulator.launchInterceptor(
-          silo,
-          missile,
-          silo.ownerId,
-          detectingRadar.id
-        );
-
-        this.state.missiles[interceptor.id] = interceptor;
-        silo.airDefenseAmmo--;
-        silo.lastFireTime = now;
-
-        // Track that this missile is now being targeted
-        missilesBeingTargeted.add(missile.id);
-
-        events.push({
-          type: 'missile_launch',
-          tick: this.state.tick,
-          missileId: interceptor.id,
-          playerId: silo.ownerId,
-          sourcePosition: silo.position,
-          targetPosition: interceptor.targetPosition || silo.position,
-        });
-
-        break; // Only one silo launches at each missile
+        // Score this silo based on geometry
+        const score = this.scoreSiloForIntercept(silo, missile);
+        candidateSilos.push({ silo, score, radar: detectingRadar });
       }
+
+      // No valid silos for this missile
+      if (candidateSilos.length === 0) continue;
+
+      // Sort by score (higher is better) and select the best
+      candidateSilos.sort((a, b) => b.score - a.score);
+      const best = candidateSilos[0];
+      const silo = best.silo;
+      const detectingRadar = best.radar;
+
+      // Launch an interceptor missile with radar tracking info
+      const interceptor = this.missileSimulator.launchInterceptor(
+        silo,
+        missile,
+        silo.ownerId,
+        detectingRadar.id
+      );
+
+      this.state.missiles[interceptor.id] = interceptor;
+      silo.airDefenseAmmo--;
+      silo.lastFireTime = now;
+
+      // Track that this missile is now being targeted
+      missilesBeingTargeted.add(missile.id);
+
+      events.push({
+        type: 'missile_launch',
+        tick: this.state.tick,
+        missileId: interceptor.id,
+        playerId: silo.ownerId,
+        sourcePosition: silo.position,
+        targetPosition: interceptor.targetPosition || silo.position,
+      });
     }
 
     return events;
+  }
+
+  /**
+   * Score a silo for intercepting a missile.
+   * Higher score = better choice for interception.
+   */
+  private scoreSiloForIntercept(silo: Silo, missile: Missile): number {
+    const siloGeo = silo.geoPosition || pixelToGeoLocal(silo.position);
+    const missileGeo = missile.geoCurrentPosition || pixelToGeoLocal(missile.currentPosition);
+
+    // Calculate distance from silo to missile's current position (in radians)
+    const distanceToMissile = greatCircleDistance(siloGeo, missileGeo);
+
+    // Also consider distance to missile's target (closer silos have better geometry)
+    const targetGeo = missile.geoTargetPosition || pixelToGeoLocal(missile.targetPosition);
+    const distanceToTarget = greatCircleDistance(siloGeo, targetGeo);
+
+    // Closer silos score higher (invert distance)
+    // Use weighted combination: prioritize distance to current missile position
+    const distanceScore = 1 / (1 + distanceToMissile * 10 + distanceToTarget * 5);
+
+    // More ammo = slightly better (preserve silos with low ammo for later)
+    const ammoScore = silo.airDefenseAmmo / 20;
+
+    return distanceScore * 0.8 + ammoScore * 0.2;
   }
 
   private checkSatelliteInterceptions(): GameEvent[] {
@@ -1337,5 +1376,176 @@ export class GameRoom {
     });
 
     console.log(`[AI] Placed ${buildingType} at (${position.x.toFixed(0)}, ${position.y.toFixed(0)})`);
+  }
+
+  // Manual intercept handlers
+
+  /**
+   * Handle request for intercept info - returns available silos and hit probabilities
+   */
+  handleRequestInterceptInfo(
+    connection: { id: string; ws: unknown },
+    playerId: string,
+    targetMissileId: string
+  ): void {
+    const missile = this.state.missiles[targetMissileId] as Missile | undefined;
+    if (!missile || missile.detonated || missile.intercepted || missile.type === 'interceptor') {
+      // Invalid target - send empty response
+      this.connectionManager.send(connection as any, {
+        type: 'intercept_info',
+        targetMissileId,
+        availableSilos: [],
+      });
+      return;
+    }
+
+    // Get all silos owned by this player in air defense mode
+    const silos = getBuildings(this.state).filter(
+      (b): b is Silo =>
+        b.type === 'silo' &&
+        !b.destroyed &&
+        b.ownerId === playerId &&
+        (b as Silo).mode === 'air_defense' &&
+        (b as Silo).airDefenseAmmo > 0
+    );
+
+    const now = Date.now();
+    const availableSilos: Array<{
+      siloId: string;
+      siloName: string;
+      hitProbability: number;
+      estimatedInterceptProgress: number;
+      ammoRemaining: number;
+    }> = [];
+
+    for (const silo of silos) {
+      // Check cooldown
+      if (now - silo.lastFireTime < silo.fireCooldown) continue;
+
+      // Check if radar can see the missile
+      const detectingRadar = this.findDetectingRadar(missile, playerId);
+      if (!detectingRadar) continue;
+
+      // Calculate hit probability based on geometry
+      const hitProbability = this.calculateHitProbability(silo, missile);
+
+      // Estimate where the intercept would occur
+      const interceptProgress = this.estimateInterceptProgress(silo, missile);
+
+      // Get a name for the silo based on its territory
+      const territory = this.state.territories[silo.territoryId];
+      const siloName = territory ? `${territory.name} Silo` : 'Silo';
+
+      availableSilos.push({
+        siloId: silo.id,
+        siloName,
+        hitProbability,
+        estimatedInterceptProgress: interceptProgress,
+        ammoRemaining: silo.airDefenseAmmo,
+      });
+    }
+
+    // Sort by hit probability (best first)
+    availableSilos.sort((a, b) => b.hitProbability - a.hitProbability);
+
+    this.connectionManager.send(connection as any, {
+      type: 'intercept_info',
+      targetMissileId,
+      availableSilos,
+    });
+  }
+
+  /**
+   * Handle manual intercept request - launch interceptors from specified silos
+   */
+  handleManualIntercept(
+    playerId: string,
+    targetMissileId: string,
+    siloIds: string[]
+  ): void {
+    const missile = this.state.missiles[targetMissileId] as Missile | undefined;
+    if (!missile || missile.detonated || missile.intercepted || missile.type === 'interceptor') {
+      return; // Invalid target
+    }
+
+    const now = Date.now();
+
+    for (const siloId of siloIds) {
+      const silo = this.state.buildings[siloId] as Silo | undefined;
+      if (!silo || silo.type !== 'silo' || silo.ownerId !== playerId) continue;
+      if (silo.destroyed || silo.mode !== 'air_defense' || silo.airDefenseAmmo <= 0) continue;
+
+      // Check cooldown
+      if (now - silo.lastFireTime < silo.fireCooldown) continue;
+
+      // Check if radar can see the missile
+      const detectingRadar = this.findDetectingRadar(missile, playerId);
+      if (!detectingRadar) continue;
+
+      // Launch interceptor
+      const interceptor = this.missileSimulator.launchInterceptor(
+        silo,
+        missile,
+        playerId,
+        detectingRadar.id
+      );
+
+      this.state.missiles[interceptor.id] = interceptor;
+      silo.airDefenseAmmo--;
+      silo.lastFireTime = now;
+
+      this.pendingEvents.push({
+        type: 'missile_launch',
+        tick: this.state.tick,
+        missileId: interceptor.id,
+        playerId,
+        sourcePosition: silo.position,
+        targetPosition: interceptor.targetPosition || silo.position,
+      });
+
+      console.log(`[MANUAL INTERCEPT] Player ${playerId} launched interceptor from silo ${siloId} at ICBM ${targetMissileId}`);
+    }
+  }
+
+  /**
+   * Calculate estimated hit probability for a silo engaging a missile
+   */
+  private calculateHitProbability(silo: Silo, missile: Missile): number {
+    // Base probability
+    let probability = 0.7;
+
+    // Factor in distance - closer silos have better geometry
+    const siloGeo = silo.geoPosition || pixelToGeoLocal(silo.position);
+    const missileGeo = missile.geoCurrentPosition || pixelToGeoLocal(missile.currentPosition);
+    const distance = greatCircleDistance(siloGeo, missileGeo);
+
+    // Reduce probability for distant intercepts
+    const distancePenalty = Math.min(0.3, distance * 5);
+    probability -= distancePenalty;
+
+    // Factor in missile progress - later intercepts are harder
+    if (missile.progress > 0.5) {
+      probability -= (missile.progress - 0.5) * 0.4;
+    }
+
+    return Math.max(0.1, Math.min(0.9, probability));
+  }
+
+  /**
+   * Estimate where on the missile's trajectory the intercept would occur
+   */
+  private estimateInterceptProgress(silo: Silo, missile: Missile): number {
+    // Rough estimate based on current missile progress and relative positions
+    const siloGeo = silo.geoPosition || pixelToGeoLocal(silo.position);
+    const targetGeo = missile.geoTargetPosition || pixelToGeoLocal(missile.targetPosition);
+
+    // Time for interceptor to reach target area (rough estimate)
+    const siloToTarget = greatCircleDistance(siloGeo, targetGeo);
+    const missileToTarget = 1 - missile.progress;
+
+    // If silo is closer to target than missile's remaining distance, intercept happens closer to target
+    const interceptProgress = Math.min(0.95, missile.progress + missileToTarget * 0.5);
+
+    return interceptProgress;
   }
 }

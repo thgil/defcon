@@ -3,6 +3,7 @@ import { useGameStore } from '../stores/gameStore';
 import { useNetworkStore } from '../stores/networkStore';
 import { GlobeRenderer } from '../renderer/GlobeRenderer';
 import { type Vector2, type Silo, type SiloMode, type GeoPosition, type Building, geoToPixel } from '@defcon/shared';
+import type { ManualInterceptState } from '../stores/gameStore';
 
 // Map dimensions for converting geo to pixel (must match server)
 const MAP_WIDTH = 1000;
@@ -24,6 +25,14 @@ export default function Game() {
   const enableAI = useNetworkStore((s) => s.enableAI);
   const disableAI = useNetworkStore((s) => s.disableAI);
   const gameEnded = useGameStore((s) => s.gameEnded);
+
+  // Manual intercept
+  const requestInterceptInfo = useNetworkStore((s) => s.requestInterceptInfo);
+  const manualIntercept = useNetworkStore((s) => s.manualIntercept);
+  const setInterceptTarget = useGameStore((s) => s.setInterceptTarget);
+  const toggleInterceptSilo = useGameStore((s) => s.toggleInterceptSilo);
+  const clearInterceptSelection = useGameStore((s) => s.clearInterceptSelection);
+  const manualInterceptState = useGameStore((s) => s.manualIntercept);
 
   // Debug panel keyboard toggle
   useEffect(() => {
@@ -112,6 +121,37 @@ export default function Game() {
     [launchSatellite]
   );
 
+  // Handle enemy ICBM click - open manual intercept panel
+  const handleEnemyICBMClick = useCallback(
+    (missileId: string) => {
+      setInterceptTarget(missileId);
+      requestInterceptInfo(missileId);
+    },
+    [setInterceptTarget, requestInterceptInfo]
+  );
+
+  // Handle silo toggle in intercept panel
+  const handleToggleInterceptSilo = useCallback(
+    (siloId: string) => {
+      toggleInterceptSilo(siloId);
+    },
+    [toggleInterceptSilo]
+  );
+
+  // Handle launch button in intercept panel
+  const handleLaunchIntercept = useCallback(() => {
+    const state = useGameStore.getState().manualIntercept;
+    if (state.targetMissileId && state.selectedSiloIds.size > 0) {
+      manualIntercept(state.targetMissileId, Array.from(state.selectedSiloIds));
+      clearInterceptSelection();
+    }
+  }, [manualIntercept, clearInterceptSelection]);
+
+  // Handle cancel button in intercept panel
+  const handleCancelIntercept = useCallback(() => {
+    clearInterceptSelection();
+  }, [clearInterceptSelection]);
+
   // Initialize renderer and subscribe to store updates
   useEffect(() => {
     if (!containerRef.current) return;
@@ -126,6 +166,14 @@ export default function Game() {
     renderer.setOnModeChange(handleModeChange);
     renderer.setOnPlacementMode(handlePlacementModeChange);
     renderer.setOnLaunchSatellite(handleLaunchSatellite);
+    renderer.setOnEnemyICBMClick(handleEnemyICBMClick);
+
+    // Set up manual intercept HUD callbacks
+    renderer.setManualInterceptCallbacks(
+      handleToggleInterceptSilo,
+      handleLaunchIntercept,
+      handleCancelIntercept
+    );
 
     // Set up debug panel callbacks
     renderer.setDebugCallbacks(
@@ -144,6 +192,7 @@ export default function Game() {
       renderer.setPlacementMode(state.placementMode);
       renderer.setSelectedBuilding(state.selectedBuilding);
       renderer.setAlerts(state.getAlerts());
+      renderer.setManualInterceptState(state.manualIntercept);
     });
 
     // Initial state
@@ -156,7 +205,7 @@ export default function Game() {
       unsubscribe();
       renderer.destroy();
     };
-  }, [handleGlobeClick, handleBuildingClick, handleModeChange, handlePlacementModeChange, handleLaunchSatellite, sendDebugCommand, enableAI, disableAI]);
+  }, [handleGlobeClick, handleBuildingClick, handleModeChange, handlePlacementModeChange, handleLaunchSatellite, sendDebugCommand, enableAI, disableAI, handleEnemyICBMClick, handleToggleInterceptSilo, handleLaunchIntercept, handleCancelIntercept]);
 
   // Handle right click to cancel
   const handleContextMenu = useCallback(

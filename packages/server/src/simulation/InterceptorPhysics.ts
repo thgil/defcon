@@ -84,6 +84,7 @@ export class InterceptorPhysics {
         missile.fuel = 0;
         missile.engineFlameout = true;
         missile.flameoutTime = Date.now();
+        missile.flameoutPosition = { ...missile.position };  // Store position at flameout
         missile.phase = 'coast';
       }
     }

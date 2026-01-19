@@ -49,6 +49,8 @@ interface NetworkState {
   enableAI: (region: string) => void;
   disableAI: () => void;
   quickStart: () => void;
+  requestInterceptInfo: (targetMissileId: string) => void;
+  manualIntercept: (targetMissileId: string, siloIds: string[]) => void;
 }
 
 let ws: WebSocket | null = null;
@@ -221,6 +223,14 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
       }
     }, 30000);
   },
+
+  requestInterceptInfo: (targetMissileId: string) => {
+    send({ type: 'request_intercept_info', targetMissileId });
+  },
+
+  manualIntercept: (targetMissileId: string, siloIds: string[]) => {
+    send({ type: 'manual_intercept', targetMissileId, siloIds });
+  },
 }));
 
 function send(message: ClientMessage) {
@@ -283,6 +293,10 @@ function handleMessage(message: ServerMessage) {
 
     case 'error':
       useNetworkStore.setState({ error: message.message });
+      break;
+
+    case 'intercept_info':
+      gameStore.setInterceptInfo(message.targetMissileId, message.availableSilos);
       break;
   }
 }

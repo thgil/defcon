@@ -227,6 +227,7 @@ export interface PhysicsMissile {
   detonated: boolean;
   engineFlameout: boolean;
   flameoutTime?: number;  // Timestamp when engine flamed out
+  flameoutPosition?: { x: number; y: number; z: number };  // Position when engine flamed out
 
   // For rendering compatibility (derived from position)
   geoCurrentPosition?: GeoPosition;

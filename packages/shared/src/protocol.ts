@@ -27,7 +27,9 @@ export type ClientMessage =
   | PingMessage
   | DebugCommandMessage
   | EnableAIMessage
-  | DisableAIMessage;
+  | DisableAIMessage
+  | RequestInterceptInfoMessage
+  | ManualInterceptMessage;
 
 export interface CreateLobbyMessage {
   type: 'create_lobby';
@@ -106,6 +108,19 @@ export interface DisableAIMessage {
   type: 'disable_ai';
 }
 
+// Request intercept info for a target missile (manual intercept UI)
+export interface RequestInterceptInfoMessage {
+  type: 'request_intercept_info';
+  targetMissileId: string;
+}
+
+// Launch manual intercept from selected silos
+export interface ManualInterceptMessage {
+  type: 'manual_intercept';
+  targetMissileId: string;
+  siloIds: string[];
+}
+
 // ============ SERVER -> CLIENT ============
 
 export type ServerMessage =
@@ -119,7 +134,8 @@ export type ServerMessage =
   | PlayerLeftMessage
   | GameEndMessage
   | ErrorMessage
-  | PongMessage;
+  | PongMessage
+  | InterceptInfoMessage;
 
 export interface LobbyListMessage {
   type: 'lobby_list';
@@ -207,6 +223,19 @@ export interface PongMessage {
   type: 'pong';
   clientTime: number;
   serverTime: number;
+}
+
+// Response to RequestInterceptInfoMessage - available silos for manual intercept
+export interface InterceptInfoMessage {
+  type: 'intercept_info';
+  targetMissileId: string;
+  availableSilos: Array<{
+    siloId: string;
+    siloName: string;
+    hitProbability: number;
+    estimatedInterceptProgress: number;  // 0-1, where on the missile's path the intercept would occur
+    ammoRemaining: number;
+  }>;
 }
 
 // Helper to serialize messages
