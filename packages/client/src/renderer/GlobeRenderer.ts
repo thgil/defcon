@@ -195,6 +195,12 @@ export class GlobeRenderer {
   // Track missiles that have had detonation/interception explosions shown
   private shownExplosions = new Set<string>();
 
+  // Stage markers for SpaceX-style flight event visualization
+  private stageMarkers = new Map<string, THREE.Group[]>();
+  private interceptorPhases = new Map<string, string>();  // Track previous phase for transition detection
+  private missileRadarStatus = new Map<string, boolean>(); // Track radar coverage for LOS markers
+  private icbmMarkerProgress = new Map<string, Set<string>>(); // Track which ICBM markers have been added
+
   // Fading missiles after detonation/interception
   private fadingMissiles = new Map<string, {
     objects: {
@@ -289,7 +295,7 @@ export class GlobeRenderer {
       45,
       rect.width / rect.height,
       0.1,
-      1000
+      2000
     );
     this.camera.position.z = 300;
 
@@ -302,11 +308,14 @@ export class GlobeRenderer {
     // OrbitControls for rotation/zoom
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
-    this.controls.dampingFactor = 0.05;
+    this.controls.dampingFactor = 0.12;
     this.controls.minDistance = 120;
     this.controls.maxDistance = 500;
     this.controls.rotateSpeed = 0.5;
     this.controls.zoomSpeed = 0.8;
+    // Prevent gimbal lock - restrict vertical rotation
+    this.controls.minPolarAngle = Math.PI * 0.1;  // 18° from top
+    this.controls.maxPolarAngle = Math.PI * 0.9;  // 162° from top
 
     // Create groups for organization
     this.territoryGroup = new THREE.Group();
@@ -689,41 +698,60 @@ export class GlobeRenderer {
   }
 
   private createAtmosphere(): void {
-    // Inner atmosphere layer - subtle glow close to surface
-    const innerAtmoGeometry = new THREE.SphereGeometry(GLOBE_RADIUS + 1.5, 64, 64);
-    const innerAtmoMaterial = new THREE.MeshBasicMaterial({
-      color: 0x88ccff,
-      transparent: true,
-      opacity: 0.06,
-      side: THREE.BackSide,
-    });
-    const innerAtmosphere = new THREE.Mesh(innerAtmoGeometry, innerAtmoMaterial);
-    this.scene.add(innerAtmosphere);
+    // Shared shader code for atmosphere layers
+    const vertexShader = `
+      varying vec3 vPositionW;
+      void main() {
+        vPositionW = (modelMatrix * vec4(position, 1.0)).xyz;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `;
+    const fragmentShader = `
+      uniform vec3 glowColor;
+      uniform float intensity;
+      varying vec3 vPositionW;
+      void main() {
+        vec3 viewDir = normalize(cameraPosition - vPositionW);
+        vec3 sphereNormal = normalize(vPositionW);
+        float rim = 1.0 - abs(dot(viewDir, sphereNormal));
+        float glow = smoothstep(0.0, 0.5, rim) * smoothstep(1.0, 0.6, rim);
+        gl_FragColor = vec4(glowColor, glow * intensity);
+      }
+    `;
 
-    // Outer atmosphere layer - very subtle extended glow
-    const outerAtmoGeometry = new THREE.SphereGeometry(GLOBE_RADIUS + 4, 64, 64);
-    const outerAtmoMaterial = new THREE.MeshBasicMaterial({
-      color: 0x4488ff,
-      transparent: true,
-      opacity: 0.03,
+    // Inner atmosphere layer - main glow
+    const innerGeometry = new THREE.SphereGeometry(GLOBE_RADIUS + 16, 64, 64);
+    const innerMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        glowColor: { value: new THREE.Color(0x2a5577) },
+        intensity: { value: 0.25 },
+      },
+      vertexShader,
+      fragmentShader,
       side: THREE.BackSide,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      depthTest: false,
     });
-    const outerAtmosphere = new THREE.Mesh(outerAtmoGeometry, outerAtmoMaterial);
-    this.scene.add(outerAtmosphere);
+    this.scene.add(new THREE.Mesh(innerGeometry, innerMaterial));
 
-    // Thin bright edge - like in the reference image
-    const edgeGeometry = new THREE.TorusGeometry(GLOBE_RADIUS + 0.5, 0.3, 16, 100);
-    // We'll create multiple rings at different angles to simulate a sphere edge glow
-    for (let i = 0; i < 3; i++) {
-      const edgeMaterial = new THREE.MeshBasicMaterial({
-        color: 0xaaddff,
-        transparent: true,
-        opacity: 0.1 - i * 0.02,
-      });
-      const edge = new THREE.Mesh(edgeGeometry, edgeMaterial);
-      edge.rotation.x = Math.PI / 2 + (i - 1) * 0.1;
-      // Don't add these - they look weird when rotating
-    }
+    // Outer atmosphere layer - soft fade into space
+    const outerGeometry = new THREE.SphereGeometry(GLOBE_RADIUS + 30, 64, 64);
+    const outerMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        glowColor: { value: new THREE.Color(0x223355) },
+        intensity: { value: 0.08 },
+      },
+      vertexShader,
+      fragmentShader,
+      side: THREE.BackSide,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      depthTest: false,
+    });
+    this.scene.add(new THREE.Mesh(outerGeometry, outerMaterial));
   }
 
   private createFogOfWar(): void {
@@ -2404,6 +2432,102 @@ export class GlobeRenderer {
         }
       }
 
+      // Track phase transitions for SpaceX-style stage markers (physics missiles)
+      if (isPhysicsMissile(missile)) {
+        const currentPhase = missile.phase;
+        const prevPhase = this.interceptorPhases.get(missile.id);
+
+        // Add launch marker on first update
+        if (!prevPhase && currentPhase === 'boost') {
+          const launchPos = new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z);
+          this.addStageMarker(missile.id, launchPos, 'LNC', 0x00ffff);
+        }
+
+        // Track phase transitions
+        if (prevPhase && prevPhase !== currentPhase) {
+          const phaseInfo = this.getPhaseMarkerInfo(currentPhase);
+          if (phaseInfo) {
+            const markerPos = new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z);
+            this.addStageMarker(missile.id, markerPos, phaseInfo.label, phaseInfo.color);
+          }
+        }
+
+        // Add MECO marker when engine flames out
+        if (missile.engineFlameout && prevPhase && !this.stageMarkers.get(missile.id)?.some(m => m.userData?.label === 'MECO')) {
+          const flameoutPos = missile.flameoutPosition;
+          if (flameoutPos) {
+            const mecoPos = new THREE.Vector3(flameoutPos.x, flameoutPos.y, flameoutPos.z);
+            const marker = this.createStageMarker(mecoPos, 'MECO', 0xff8800);
+            marker.userData = { label: 'MECO' };
+            if (!this.stageMarkers.has(missile.id)) {
+              this.stageMarkers.set(missile.id, []);
+            }
+            this.stageMarkers.get(missile.id)!.push(marker);
+            this.missileGroup.add(marker);
+          }
+        }
+
+        this.interceptorPhases.set(missile.id, currentPhase);
+      }
+
+      // Add ICBM milestone markers (launch, BECO, apogee, re-entry)
+      if (!isInterceptor) {
+        const markerSet = this.icbmMarkerProgress.get(missile.id) || new Set<string>();
+
+        // Launch marker - add on first frame we see this missile
+        if (!markerSet.has('LNC')) {
+          const launchPos = geoToSphere(startGeo, GLOBE_RADIUS + 1);
+          const launchVec = new THREE.Vector3(launchPos.x, launchPos.y, launchPos.z);
+          this.addStageMarker(missile.id, launchVec, 'LNC', 0xcc2200);
+          markerSet.add('LNC');
+        }
+
+        // BECO (Booster Engine Cutoff) marker at 20% progress when boost phase ends
+        // This matches updateMissileExhaust which turns engine off at progress > 0.20
+        if (!markerSet.has('BECO') && interpolatedProgress >= 0.20) {
+          const becoPos = getMissilePosition3D(startGeo, targetGeo, 0.20, maxAltitude, GLOBE_RADIUS, objects.flightDuration, seed);
+          const becoVec = new THREE.Vector3(becoPos.x, becoPos.y, becoPos.z);
+          this.addStageMarker(missile.id, becoVec, 'BECO', 0xff8800);
+          markerSet.add('BECO');
+        }
+
+        // Apogee marker when we pass 50% progress (peak altitude)
+        if (!markerSet.has('APO') && interpolatedProgress >= 0.50) {
+          const apogeePos = getMissilePosition3D(startGeo, targetGeo, 0.50, maxAltitude, GLOBE_RADIUS, objects.flightDuration, seed);
+          const apogeeVec = new THREE.Vector3(apogeePos.x, apogeePos.y, apogeePos.z);
+          this.addStageMarker(missile.id, apogeeVec, 'APO', 0xffaa00);
+          markerSet.add('APO');
+        }
+
+        // Re-entry marker when we pass 85% progress (engine reignites for terminal phase)
+        // This matches updateMissileExhaust which turns engine back on at progress > 0.85
+        if (!markerSet.has('RNT') && interpolatedProgress >= 0.85) {
+          const reentryPos = getMissilePosition3D(startGeo, targetGeo, 0.85, maxAltitude, GLOBE_RADIUS, objects.flightDuration, seed);
+          const reentryVec = new THREE.Vector3(reentryPos.x, reentryPos.y, reentryPos.z);
+          this.addStageMarker(missile.id, reentryVec, 'RNT', 0xff4444);
+          markerSet.add('RNT');
+        }
+
+        this.icbmMarkerProgress.set(missile.id, markerSet);
+      }
+
+      // Track radar coverage loss (LOS marker)
+      const missileGeo = missile.geoCurrentPosition || missile.currentPosition
+        ? sphereToGeo(pos3d, GLOBE_RADIUS)
+        : startGeo;
+      const wasInRadar = this.missileRadarStatus.get(missile.id);
+      const isInRadar = this.isMissileInRadarCoverage(missileGeo);
+
+      // Only track for enemy missiles (we always see our own)
+      if (missile.ownerId !== this.playerId) {
+        if (wasInRadar === true && !isInRadar) {
+          // Lost radar tracking - add LOS marker
+          const losPos = new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z);
+          this.addStageMarker(missile.id, losPos, 'LOS', 0xff0000);
+        }
+        this.missileRadarStatus.set(missile.id, isInRadar);
+      }
+
       // Update traveled trail with linear progress
       let trailPoints: THREE.Vector3[];
       if (isInterceptor && objects.interceptorTrailHistory) {
@@ -2510,6 +2634,12 @@ export class GlobeRenderer {
       this.uncertainContacts.delete(id);
       this.shownExplosions.delete(id);
       this.groundImpactMissiles.delete(id);
+
+      // Note: Stage markers cleaned up when fading missile is fully disposed
+      // If not going through fading state, clean up immediately
+      if (!this.fadingMissiles.has(id)) {
+        this.disposeStageMarkers(id);
+      }
     }
   }
 
@@ -3611,6 +3741,201 @@ export class GlobeRenderer {
   }
 
   /**
+   * Create a SpaceX-style stage marker label for flight events.
+   */
+  private createStageLabel(text: string, color: number): THREE.Sprite {
+    const canvas = document.createElement('canvas');
+    canvas.width = 128;
+    canvas.height = 32;
+    const ctx = canvas.getContext('2d')!;
+
+    // Convert color to hex string
+    const hexColor = `#${color.toString(16).padStart(6, '0')}`;
+
+    // Draw background with slight transparency for readability
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Draw text
+    ctx.font = 'bold 16px "Courier New", monospace';
+    ctx.fillStyle = hexColor;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, 4, canvas.height / 2);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    const material = new THREE.SpriteMaterial({
+      map: texture,
+      transparent: true,
+      depthTest: false,
+    });
+    const sprite = new THREE.Sprite(material);
+    sprite.scale.set(2.5, 0.6, 1);
+
+    return sprite;
+  }
+
+  /**
+   * Create a SpaceX-style stage marker with tick and label.
+   */
+  private createStageMarker(
+    position: THREE.Vector3,
+    label: string,
+    color: number
+  ): THREE.Group {
+    const group = new THREE.Group();
+
+    // Small dot marker at the position
+    const dotGeom = new THREE.SphereGeometry(0.2, 6, 6);
+    const dotMat = new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.9
+    });
+    const dot = new THREE.Mesh(dotGeom, dotMat);
+    group.add(dot);
+
+    // Text label sprite offset from the dot
+    const labelSprite = this.createStageLabel(label, color);
+    labelSprite.position.set(1.5, 0.3, 0);
+    group.add(labelSprite);
+
+    group.position.copy(position);
+
+    return group;
+  }
+
+  /**
+   * Add a stage marker for a missile and store it.
+   */
+  private addStageMarker(
+    missileId: string,
+    position: THREE.Vector3,
+    label: string,
+    color: number
+  ): void {
+    const marker = this.createStageMarker(position, label, color);
+
+    // Store the marker
+    if (!this.stageMarkers.has(missileId)) {
+      this.stageMarkers.set(missileId, []);
+    }
+    this.stageMarkers.get(missileId)!.push(marker);
+
+    // Add to scene
+    this.missileGroup.add(marker);
+  }
+
+  /**
+   * Get phase display info for SpaceX-style markers.
+   */
+  private getPhaseMarkerInfo(phase: string): { label: string; color: number } | null {
+    switch (phase) {
+      case 'boost':
+        return { label: 'LNC', color: 0x00ffff };
+      case 'pitch':
+        return { label: 'PITCH', color: 0x00ffff };
+      case 'cruise':
+        return { label: 'CRUISE', color: 0x88ff88 };
+      case 'terminal':
+        return { label: 'TERM', color: 0xffff00 };
+      case 'coast':
+        return { label: 'COAST', color: 0x888888 };
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Check if a missile position is within radar coverage of the player.
+   */
+  private isMissileInRadarCoverage(missileGeo: GeoPosition): boolean {
+    if (!this.gameState || !this.playerId) return false;
+
+    const buildings = getBuildings(this.gameState);
+    const radars = buildings.filter(b =>
+      b.type === 'radar' && b.ownerId === this.playerId
+    ) as Radar[];
+
+    for (const radar of radars) {
+      const radarGeo = radar.geoPosition;
+      if (!radarGeo) continue;
+
+      // Simple distance check using great circle distance approximation
+      const dLat = (missileGeo.lat - radarGeo.lat) * Math.PI / 180;
+      const dLng = (missileGeo.lng - radarGeo.lng) * Math.PI / 180;
+      const lat1 = radarGeo.lat * Math.PI / 180;
+      const lat2 = missileGeo.lat * Math.PI / 180;
+
+      const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                Math.cos(lat1) * Math.cos(lat2) *
+                Math.sin(dLng/2) * Math.sin(dLng/2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      const distDegrees = c * 180 / Math.PI;
+
+      // Use radar's configured range (in degrees, typically ~27)
+      if (distDegrees <= this.RADAR_MAX_RANGE_DEGREES) {
+        return true;
+      }
+    }
+
+    // Also check satellite coverage
+    const satellites = getSatellites(this.gameState);
+    const friendlySatellites = satellites.filter(s => s.ownerId === this.playerId);
+
+    for (const sat of friendlySatellites) {
+      const satGeo = getSatelliteGroundPosition(sat, Date.now(), GLOBE_RADIUS);
+      const dLat = (missileGeo.lat - satGeo.lat) * Math.PI / 180;
+      const dLng = (missileGeo.lng - satGeo.lng) * Math.PI / 180;
+      const lat1 = satGeo.lat * Math.PI / 180;
+      const lat2 = missileGeo.lat * Math.PI / 180;
+
+      const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                Math.cos(lat1) * Math.cos(lat2) *
+                Math.sin(dLng/2) * Math.sin(dLng/2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      const distDegrees = c * 180 / Math.PI;
+
+      if (distDegrees <= SATELLITE_VISION_RANGE_DEGREES) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Clean up stage markers for a missile.
+   */
+  private disposeStageMarkers(missileId: string): void {
+    const markers = this.stageMarkers.get(missileId);
+    if (markers) {
+      for (const marker of markers) {
+        this.missileGroup.remove(marker);
+        marker.traverse((obj) => {
+          if (obj instanceof THREE.Mesh) {
+            obj.geometry.dispose();
+            if (obj.material instanceof THREE.Material) {
+              obj.material.dispose();
+            }
+          } else if (obj instanceof THREE.Sprite) {
+            if (obj.material.map) {
+              obj.material.map.dispose();
+            }
+            obj.material.dispose();
+          }
+        });
+      }
+      this.stageMarkers.delete(missileId);
+    }
+
+    // Also clean up tracking state
+    this.interceptorPhases.delete(missileId);
+    this.missileRadarStatus.delete(missileId);
+    this.icbmMarkerProgress.delete(missileId);
+  }
+
+  /**
    * Create fuel and speed stats label beside the tracked missile.
    */
   private createMissileStatsLabel(interceptor: Missile, flameoutProgress: number): void {
@@ -3988,6 +4313,9 @@ export class GlobeRenderer {
           (fading.objects.explosionSphere.material as THREE.Material).dispose();
         }
         this.fadingMissiles.delete(id);
+
+        // Clean up stage markers for this missile
+        this.disposeStageMarkers(id);
       }
     }
   }
@@ -4579,6 +4907,51 @@ export class GlobeRenderer {
     return { lat, lng };
   }
 
+  /**
+   * Get the 3D position of a missile for camera tracking.
+   * Works with physics missiles, legacy interceptors, and ICBMs.
+   */
+  private getMissile3DPositionForTracking(missile: Missile | PhysicsMissile): THREE.Vector3 | null {
+    const now = Date.now();
+
+    // Physics missiles have direct 3D position
+    if (isPhysicsMissile(missile)) {
+      const pos = this.getInterpolatedPhysicsPosition(missile, now);
+      return new THREE.Vector3(pos.x, pos.y, pos.z);
+    }
+
+    // For legacy missiles, get geo position and convert
+    const missileGeo = missile.geoCurrentPosition
+      || (missile.currentPosition ? this.pixelToGeoFallback(missile.currentPosition) : null);
+
+    if (!missileGeo) return null;
+
+    // For ICBMs, calculate actual 3D position with altitude
+    if (missile.type === 'icbm' && missile.geoLaunchPosition && missile.geoTargetPosition) {
+      const maxAltitude = missile.apexHeight || 30;
+      const flightDuration = missile.flightDuration || 30000;
+      const seed = missile.id.charCodeAt(0);
+      const pos = getMissilePosition3D(
+        missile.geoLaunchPosition,
+        missile.geoTargetPosition,
+        missile.progress,
+        maxAltitude,
+        GLOBE_RADIUS,
+        flightDuration,
+        seed
+      );
+      return new THREE.Vector3(pos.x, pos.y, pos.z);
+    }
+
+    // For interceptors and others, use current geo position at estimated altitude
+    const progress = missile.progress || 0;
+    const apexHeight = missile.apexHeight || 20;
+    // Parabolic altitude based on progress
+    const altitude = 4 * apexHeight * progress * (1 - progress);
+    const pos = geoToSphere(missileGeo, GLOBE_RADIUS + altitude);
+    return new THREE.Vector3(pos.x, pos.y, pos.z);
+  }
+
   private disposeGroup(group: THREE.Group): void {
     group.traverse((child) => {
       if ((child as THREE.Mesh).geometry) {
@@ -4890,28 +5263,33 @@ export class GlobeRenderer {
       const deltaTime = (time - this.lastTime) / 1000;
       this.lastTime = time;
 
-      // Update controls
-      this.controls.update();
-
       // Follow tracked missile if one is selected
+      // Update both orbit target AND camera position to follow the missile
       if (this.trackedMissileId && this.gameState && !this.cameraAnimating) {
         const missiles = getMissiles(this.gameState);
         const trackedMissile = missiles.find(m => m.id === this.trackedMissileId);
         if (trackedMissile && !trackedMissile.detonated && !trackedMissile.intercepted) {
-          const missileGeo = trackedMissile.geoCurrentPosition
-            || (trackedMissile.currentPosition ? this.pixelToGeoFallback(trackedMissile.currentPosition) : { lat: 0, lng: 0 });
-          // Smoothly follow the missile
-          const targetPos = geoToSphere(missileGeo, this.camera.position.length());
-          this.camera.position.lerp(new THREE.Vector3(targetPos.x, targetPos.y, targetPos.z), 0.05);
-          this.camera.lookAt(0, 0, 0);
+          // Get the missile's 3D position
+          const missile3DPos = this.getMissile3DPositionForTracking(trackedMissile);
+          if (missile3DPos) {
+            // Calculate how much the target is moving
+            const oldTarget = this.controls.target.clone();
+
+            // Update orbit target with fast lerp for responsive tracking
+            this.controls.target.lerp(missile3DPos, 0.5);
+
+            // Move camera position by the same delta to maintain relative position
+            const targetDelta = this.controls.target.clone().sub(oldTarget);
+            this.camera.position.add(targetDelta);
+          }
         } else {
           // Missile no longer exists, stop tracking
           this.trackedMissileId = null;
         }
       }
 
-      // Update camera to follow selected satellite (both position and target)
-      // (buildings don't change rotation center - that would make targeting difficult)
+      // Update camera to follow selected satellite
+      // Update both orbit target AND camera position to follow the satellite
       if (this.selectedSatelliteId && this.gameState && !this.cameraAnimating) {
         const selectedSatellite = getSatellites(this.gameState).find(s => s.id === this.selectedSatelliteId);
         if (selectedSatellite && !selectedSatellite.destroyed) {
@@ -4926,21 +5304,50 @@ export class GlobeRenderer {
           const satPos3d = getSatellitePosition3D(orbitalParams, now, GLOBE_RADIUS);
           const satVec = new THREE.Vector3(satPos3d.x, satPos3d.y, satPos3d.z);
 
-          // Move camera to follow satellite - maintain current distance from satellite
-          const cameraDistance = this.camera.position.length();
-          const targetCameraPos = satVec.clone().normalize().multiplyScalar(cameraDistance);
-          this.camera.position.lerp(targetCameraPos, 0.05);
+          // Calculate how much the target is moving
+          const oldTarget = this.controls.target.clone();
 
-          // Set orbit controls target to satellite position
-          this.controls.target.lerp(satVec, 0.1);
+          // Update orbit target with fast lerp for responsive tracking
+          this.controls.target.lerp(satVec, 0.5);
+
+          // Move camera position by the same delta to maintain relative position
+          const targetDelta = this.controls.target.clone().sub(oldTarget);
+          this.camera.position.add(targetDelta);
         } else {
           // Satellite was destroyed, clear selection and return to origin
           this.selectedSatelliteId = null;
           this.controls.target.lerp(new THREE.Vector3(0, 0, 0), 0.05);
         }
-      } else if (!this.selectedSatelliteId && !this.controls.target.equals(new THREE.Vector3(0, 0, 0))) {
-        // No satellite selected - smoothly return to origin (globe center)
+      }
+
+      // Return orbit target to globe center when nothing is being tracked
+      const isTrackingAnything = this.trackedMissileId || this.selectedSatelliteId;
+      if (!isTrackingAnything && !this.controls.target.equals(new THREE.Vector3(0, 0, 0))) {
+        // Smoothly return to origin (globe center)
         this.controls.target.lerp(new THREE.Vector3(0, 0, 0), 0.05);
+      }
+
+      // Update controls after target changes
+      this.controls.update();
+
+      // Adjust camera constraints based on tracking state
+      if (isTrackingAnything) {
+        const targetDist = this.controls.target.length();
+        // minDistance is camera-to-target distance, not camera-to-origin
+        // To prevent camera clipping through globe when between target and origin:
+        // |camera| = targetDist - cameraDist >= GLOBE_RADIUS + buffer
+        // So: cameraDist <= targetDist - GLOBE_RADIUS - buffer
+        const buffer = 20;
+        const maxSafeMinDist = Math.max(20, targetDist - GLOBE_RADIUS - buffer);
+        // Use a reasonable viewing distance, capped to prevent clipping
+        this.controls.minDistance = Math.min(40, maxSafeMinDist);
+        this.controls.maxDistance = 200;
+        this.controls.rotateSpeed = 0.3;
+      } else if (!this.cameraAnimating) {
+        // Reset to defaults when not tracking
+        this.controls.minDistance = 120;
+        this.controls.maxDistance = 500;
+        this.controls.rotateSpeed = 0.5;
       }
 
       // Update radar sweep animation
