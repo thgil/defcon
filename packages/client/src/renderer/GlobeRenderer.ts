@@ -814,10 +814,10 @@ export class GlobeRenderer {
       vertexShader,
       fragmentShader,
       uniforms: {
-        radarPositions: { value: new Array(8).fill(new THREE.Vector3(0, 1, 0)) },
+        radarPositions: { value: new Array(8).fill(null).map(() => new THREE.Vector3(0, -1, 0)) },
         radarCount: { value: 0 },
         radarRange: { value: 0.5 }, // ~30 degrees in radians
-        satellitePositions: { value: new Array(8).fill(new THREE.Vector3(0, 1, 0)) },
+        satellitePositions: { value: new Array(8).fill(null).map(() => new THREE.Vector3(0, -1, 0)) },
         satelliteCount: { value: 0 },
         satelliteRange: { value: SATELLITE_VISION_RANGE_DEGREES * (Math.PI / 180) },
       },
@@ -847,9 +847,12 @@ export class GlobeRenderer {
       if (radarPositions.length >= 8) break;
     }
 
-    // Pad radar positions
+    // Store actual count before padding
+    const actualRadarCount = radarPositions.length;
+
+    // Pad radar positions (use far-away position that won't affect visibility)
     while (radarPositions.length < 8) {
-      radarPositions.push(new THREE.Vector3(0, 1, 0));
+      radarPositions.push(new THREE.Vector3(0, -1, 0)); // South pole, unused
     }
 
     // Collect connected satellite positions
@@ -862,13 +865,13 @@ export class GlobeRenderer {
       if (satellitePositions.length >= 8) break;
     }
 
-    // Pad satellite positions
+    // Pad satellite positions (use far-away position that won't affect visibility)
     while (satellitePositions.length < 8) {
-      satellitePositions.push(new THREE.Vector3(0, 1, 0));
+      satellitePositions.push(new THREE.Vector3(0, -1, 0)); // South pole, unused
     }
 
     this.fogOfWarMaterial.uniforms.radarPositions.value = radarPositions;
-    this.fogOfWarMaterial.uniforms.radarCount.value = Math.min(radarPositions.length, 8);
+    this.fogOfWarMaterial.uniforms.radarCount.value = actualRadarCount;
     this.fogOfWarMaterial.uniforms.satellitePositions.value = satellitePositions;
     this.fogOfWarMaterial.uniforms.satelliteCount.value = connectedSatGeoPositions.length;
   }
