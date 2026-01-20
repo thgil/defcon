@@ -144,7 +144,7 @@ export class GlobeRenderer {
     trails: true,
     coastlines: true,
     borders: true,
-    airspaces: true,
+    airspaces: false,
   };
 
   // Object maps for efficient updates
@@ -323,8 +323,8 @@ export class GlobeRenderer {
     this.controls.rotateSpeed = 0.5;
     this.controls.zoomSpeed = 0.8;
     // Prevent gimbal lock - restrict vertical rotation
-    this.controls.minPolarAngle = Math.PI * 0.1;  // 18° from top
-    this.controls.maxPolarAngle = Math.PI * 0.9;  // 162° from top
+    this.controls.minPolarAngle = Math.PI * 0.02;  // ~4° from top (near north pole)
+    this.controls.maxPolarAngle = Math.PI * 0.98;  // ~4° from bottom (near south pole)
 
     // Create groups for organization
     this.territoryGroup = new THREE.Group();
@@ -338,6 +338,7 @@ export class GlobeRenderer {
     this.coastlineGroup = new THREE.Group();
     this.borderGroup = new THREE.Group();
     this.airspaceGroup = new THREE.Group();
+    this.airspaceGroup.visible = this.viewToggles.airspaces;
 
     this.placementPreviewGroup = new THREE.Group();
     this.commChainGroup = new THREE.Group();
@@ -766,10 +767,19 @@ export class GlobeRenderer {
   private createFogOfWar(): void {
     // Shader that darkens areas outside radar and satellite coverage
     const vertexShader = `
+      uniform vec3 uCameraPos;
       varying vec3 vWorldPosition;
+      varying float vEdgeFade;
       void main() {
         vec4 worldPos = modelMatrix * vec4(position, 1.0);
         vWorldPosition = worldPos.xyz;
+
+        // Calculate fresnel/edge fade in vertex shader
+        vec3 worldNormal = normalize(worldPos.xyz); // For sphere centered at origin
+        vec3 viewDir = normalize(uCameraPos - worldPos.xyz);
+        float fresnel = dot(viewDir, worldNormal);
+        vEdgeFade = smoothstep(0.0, 0.2, fresnel);
+
         gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
       }
     `;
@@ -782,6 +792,7 @@ export class GlobeRenderer {
       uniform int satelliteCount;
       uniform float satelliteRange;
       varying vec3 vWorldPosition;
+      varying float vEdgeFade;
 
       void main() {
         float visibility = 0.0;
@@ -805,8 +816,16 @@ export class GlobeRenderer {
           visibility = max(visibility, coverage);
         }
 
-        float darkness = 0.5 * (1.0 - visibility);
-        gl_FragColor = vec4(0.0, 0.0, 0.0, darkness);
+        // Atmosphere edge color (matches inner atmosphere 0x2a5577)
+        vec3 atmosphereColor = vec3(0.165, 0.333, 0.467);
+
+        // At edges (vEdgeFade=0): use atmosphere color, low alpha
+        // At center (vEdgeFade=1): use black, full fog alpha
+        float darkness = 0.65 * (1.0 - visibility);
+        vec3 fogColor = mix(atmosphereColor, vec3(0.0), vEdgeFade);
+        float alpha = mix(0.0, darkness, vEdgeFade);
+
+        gl_FragColor = vec4(fogColor, alpha);
       }
     `;
 
@@ -820,6 +839,7 @@ export class GlobeRenderer {
         satellitePositions: { value: new Array(8).fill(null).map(() => new THREE.Vector3(0, -1, 0)) },
         satelliteCount: { value: 0 },
         satelliteRange: { value: SATELLITE_VISION_RANGE_DEGREES * (Math.PI / 180) },
+        uCameraPos: { value: new THREE.Vector3(0, 0, 300) },
       },
       transparent: true,
       side: THREE.FrontSide,
@@ -874,6 +894,7 @@ export class GlobeRenderer {
     this.fogOfWarMaterial.uniforms.radarCount.value = actualRadarCount;
     this.fogOfWarMaterial.uniforms.satellitePositions.value = satellitePositions;
     this.fogOfWarMaterial.uniforms.satelliteCount.value = connectedSatGeoPositions.length;
+    this.fogOfWarMaterial.uniforms.uCameraPos.value.copy(this.camera.position);
   }
 
   private createStarfield(): void {
@@ -5492,15 +5513,15 @@ export class GlobeRenderer {
       }
     }
 
-    // Stop tracking and clear selections when clicking elsewhere
+    // Stop tracking and clear all selections when clicking elsewhere
     this.trackedMissileId = null;
     this.selectedSatelliteId = null;
+    this.selectedBuilding = null;
+    this.selectedCityInfo = null;
 
     // Check for globe clicks
     const globeIntersects = this.raycaster.intersectObject(this.globe);
     if (globeIntersects.length > 0) {
-      // Clear city selection when clicking on globe
-      this.selectedCityInfo = null;
       if (this.onClickCallback) {
         const point = globeIntersects[0].point;
         const geoPos = this.spherePointToGeo(point);
@@ -5677,19 +5698,10 @@ export class GlobeRenderer {
           // Get the missile's 3D position
           const missile3DPos = this.getMissile3DPositionForTracking(trackedMissile);
           if (missile3DPos) {
-            // Skip target/camera movement while stabilizing after animation
+            // Skip target movement while stabilizing after animation
             if (this.cameraAnimationStabilizeFrames === 0) {
-              // Update orbit target with fast lerp for responsive tracking
+              // Update orbit target to follow missile - OrbitControls handles camera position
               this.controls.target.lerp(missile3DPos, 0.5);
-
-              // Adjust camera to look at new target while maintaining distance from ORIGIN
-              // (not distance from target, which would cause zoom drift)
-              const beforeDist = this.camera.position.length();
-              const cameraDir = this.camera.position.clone().normalize();
-              const targetDir = this.controls.target.clone().normalize();
-              cameraDir.lerp(targetDir, 0.1);
-              cameraDir.normalize();
-              this.camera.position.copy(cameraDir.multiplyScalar(beforeDist));
             }
           }
         } else {
@@ -5714,19 +5726,10 @@ export class GlobeRenderer {
           const satPos3d = getSatellitePosition3D(orbitalParams, now, GLOBE_RADIUS);
           const satVec = new THREE.Vector3(satPos3d.x, satPos3d.y, satPos3d.z);
 
-          // Skip target/camera movement while stabilizing after animation
+          // Skip target movement while stabilizing after animation
           if (this.cameraAnimationStabilizeFrames === 0) {
-            const beforeDist = this.camera.position.length();
-
-            // Update orbit target with fast lerp for responsive tracking
+            // Update orbit target to follow satellite - OrbitControls handles camera position
             this.controls.target.lerp(satVec, 0.5);
-
-            // Adjust camera to look at new target while maintaining distance from ORIGIN
-            const cameraDir = this.camera.position.clone().normalize();
-            const targetDir = this.controls.target.clone().normalize();
-            cameraDir.lerp(targetDir, 0.1);
-            cameraDir.normalize();
-            this.camera.position.copy(cameraDir.multiplyScalar(beforeDist));
           }
         } else {
           // Satellite was destroyed, clear selection and return to origin
@@ -5744,22 +5747,10 @@ export class GlobeRenderer {
           this.controls.target.lerp(new THREE.Vector3(0, 0, 0), 0.05);
         }
 
-        // When tracking, we handle camera position manually - skip controls.update() to avoid rotation drift
-        // Only call controls.update() when NOT tracking to allow normal orbit controls behavior
-        if (!isTrackingAnything) {
-          if (this.cameraAnimationStabilizeFrames === 0) {
-            this.controls.update();
-          }
-        } else if (this.cameraAnimationStabilizeFrames === 0) {
-          // When tracking, smoothly rotate camera toward target instead of snapping
-          // This prevents the jerk when tracking starts after camera animation completes
-          const targetQuat = new THREE.Quaternion();
-          const tempCamera = this.camera.clone();
-          tempCamera.lookAt(this.controls.target);
-          targetQuat.copy(tempCamera.quaternion);
-
-          // SLERP toward the target rotation for smooth tracking
-          this.camera.quaternion.slerp(targetQuat, 0.1);
+        // Always call controls.update() to allow user rotation, even when tracking
+        // The target position is updated separately to follow tracked objects
+        if (this.cameraAnimationStabilizeFrames === 0) {
+          this.controls.update();
         }
 
         // Adjust camera constraints based on tracking state
@@ -5814,7 +5805,7 @@ export class GlobeRenderer {
       // Dynamic near plane adjustment to prevent Z-fighting at far distances
       // Scale near plane based on camera distance to maintain depth buffer precision
       const cameraDist = this.camera.position.length();
-      const nearPlane = Math.max(0.1, cameraDist * 0.001);
+      const nearPlane = Math.max(0.1, cameraDist * 0.0005);
       this.camera.near = nearPlane;
       this.camera.updateProjectionMatrix();
 
