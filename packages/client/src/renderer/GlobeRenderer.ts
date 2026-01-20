@@ -6,6 +6,8 @@ import {
   type Building,
   type Missile,
   type PhysicsMissile,
+  type RailInterceptor,
+  type GuidedInterceptor,
   type City,
   type Territory,
   type GeoPosition,
@@ -18,7 +20,10 @@ import {
   sphereToGeo,
   getMissilePosition3D,
   getMissileDirection3D,
+  getInterceptorPosition3D,
+  getInterceptorDirection3D,
   geoInterpolate,
+  greatCircleDistance,
   getTerritories,
   getCities,
   getBuildings,
@@ -30,6 +35,9 @@ import {
   TERRITORY_GEO_DATA,
   CITY_GEO_DATA,
   isPhysicsMissile,
+  isRailInterceptor,
+  isGuidedInterceptor,
+  isInterceptor as isInterceptorType,
   GLOBAL_MISSILE_SPEED_MULTIPLIER,
 } from '@defcon/shared';
 import { HUDRenderer } from './HUDRenderer';
@@ -265,6 +273,7 @@ export class GlobeRenderer {
   private trackedMissileId: string | null = null;
   private cameraTargetGeo: GeoPosition | null = null;
   private cameraAnimating: boolean = false;
+  private cameraAnimationStabilizeFrames: number = 0;
 
   // Communication chain visualization (shown when interceptor is selected)
   private commChainGroup: THREE.Group;
@@ -604,24 +613,24 @@ export class GlobeRenderer {
 
     // Create preview marker based on placement mode
     if (this.placementMode === 'silo') {
-      const shape = new THREE.Shape();
-      shape.moveTo(0, 4);
-      shape.lineTo(-3, -4);
-      shape.lineTo(3, -4);
-      shape.lineTo(0, 4);
-
-      const geometry = new THREE.ShapeGeometry(shape);
-      const material = new THREE.MeshBasicMaterial({
+      // Small triangle outline (matching building marker size)
+      const points = [
+        new THREE.Vector3(0, 1.5, 0),
+        new THREE.Vector3(-1.2, -1, 0),
+        new THREE.Vector3(1.2, -1, 0),
+        new THREE.Vector3(0, 1.5, 0),
+      ];
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const material = new THREE.LineBasicMaterial({
         color: 0x00ff88,
         transparent: true,
-        opacity: 0.5,
-        side: THREE.DoubleSide,
+        opacity: 0.6,
       });
-      const mesh = new THREE.Mesh(geometry, material);
-      mesh.position.set(pos3d.x, pos3d.y, pos3d.z);
-      mesh.lookAt(0, 0, 0);
-      mesh.rotateX(Math.PI);
-      this.placementPreviewGroup.add(mesh);
+      const outline = new THREE.Line(geometry, material);
+      outline.position.set(pos3d.x, pos3d.y, pos3d.z);
+      outline.lookAt(0, 0, 0);
+      outline.rotateX(Math.PI);
+      this.placementPreviewGroup.add(outline);
     } else if (this.placementMode === 'radar') {
       // Radar icon
       const curve = new THREE.EllipseCurve(0, 0, 4, 4, 0, Math.PI, false, 0);
@@ -1597,16 +1606,9 @@ export class GlobeRenderer {
         const population = gameCity?.population ?? cityData.population;
         const destroyed = gameCity?.destroyed ?? false;
 
-        // Check fog of war - hide enemy cities outside coverage
-        if (isEnemy && !this.isWithinCoverage(geoPos)) {
-          const existingGroup = this.cityMarkers.get(cityKey);
-          if (existingGroup) {
-            this.cityGroup.remove(existingGroup);
-            this.disposeCityGroup(existingGroup);
-            this.cityMarkers.delete(cityKey);
-          }
-          continue;
-        }
+        // NOTE: Enemy cities are always visible for targeting purposes.
+        // Fog-of-war applies to missiles, interceptors, and other dynamic objects,
+        // but strategic targets (cities) remain visible on the map.
 
         existingIds.delete(cityKey);
 
@@ -2087,7 +2089,7 @@ export class GlobeRenderer {
 
       // Color based on ownership: player = blue, enemy = red, interceptors = cyan
       // Apply uncertainty tint for unclear contacts
-      const isInterceptor = missile.type === 'interceptor';
+      const isInterceptor = isInterceptorType(missile);
       let color: number;
       if (isInterceptor) {
         color = COLORS.interceptor; // Cyan
@@ -2148,7 +2150,11 @@ export class GlobeRenderer {
           interpolatedProgress = Math.max(interpolatedProgress, interpState.targetProgress);
 
           // Cap at 1.0 for normal missiles, but allow up to 1.5 for missed interceptors
-          const maxProgress = (isInterceptor && missile.missedTarget) ? 1.5 : 1.0;
+          // Allow extended progress for missed interceptors
+          const isMissed = isRailInterceptor(missile)
+            ? (missile as RailInterceptor).status === 'missed'
+            : (missile as any).missedTarget;
+          const maxProgress = (isInterceptor && isMissed) ? 1.5 : 1.0;
           interpolatedProgress = Math.min(interpolatedProgress, maxProgress);
         }
       }
@@ -2162,8 +2168,17 @@ export class GlobeRenderer {
       let maxAltitude: number;
       let seed: number;
       if (!objects) {
-        const baseAltitude = calculateMissileAltitude(startGeo, targetGeo);
-        maxAltitude = isInterceptor ? baseAltitude * 0.4 : baseAltitude; // Interceptors fly lower
+        // ICBMs: Use server-provided apexHeight
+        if (!isInterceptor && 'apexHeight' in missile && typeof missile.apexHeight === 'number') {
+          maxAltitude = Math.min(missile.apexHeight, 60);
+        } else if (isInterceptor) {
+          // Interceptors: 40% of calculated altitude
+          const baseAltitude = calculateMissileAltitude(startGeo, targetGeo);
+          maxAltitude = baseAltitude * 0.4;
+        } else {
+          // Fallback for legacy missiles without apexHeight
+          maxAltitude = calculateMissileAltitude(startGeo, targetGeo);
+        }
         // Generate deterministic seed from missile ID
         seed = this.hashStringToNumber(missile.id);
 
@@ -2214,7 +2229,11 @@ export class GlobeRenderer {
           geoToSphere(startGeo, GLOBE_RADIUS).z
         )] : undefined;
 
-        objects = { trail, head, maxAltitude, flightDuration: missileFlightDuration, seed, plannedRoute, isInterceptor, targetMissileId: missile.targetId, interceptorTrailHistory, lastTrailProgress: 0 };
+        // Get targetId from the appropriate field based on missile type
+        const targetMissileId = isRailInterceptor(missile)
+          ? (missile as RailInterceptor).targetId
+          : (missile as any).targetId;
+        objects = { trail, head, maxAltitude, flightDuration: missileFlightDuration, seed, plannedRoute, isInterceptor, targetMissileId, interceptorTrailHistory, lastTrailProgress: 0 };
         this.missileObjects.set(missile.id, objects);
       } else {
         maxAltitude = objects.maxAltitude;
@@ -2233,25 +2252,71 @@ export class GlobeRenderer {
       let pos3d: { x: number; y: number; z: number };
 
       // Calculate flameout progress for legacy interceptors (when fuel runs out)
-      // For physics missiles, engine flameout is tracked server-side via engineFlameout field
-      const flameoutProgress = isInterceptor && !isPhysicsMissile(missile)
-        ? this.calculateFlameoutProgress(missile)
+      // For physics missiles and rail interceptors, we don't use this (they handle fuel differently)
+      const flameoutProgress = isInterceptor && !isPhysicsMissile(missile) && !isRailInterceptor(missile)
+        ? this.calculateFlameoutProgress(missile as Missile)
         : 1.0;
 
-      if (isPhysicsMissile(missile)) {
+      if (isGuidedInterceptor(missile)) {
+        // Guided interceptor: use position from server (continuously updated)
+        const guidedMissile = missile as GuidedInterceptor;
+        const altitude = guidedMissile.altitude || guidedMissile.currentAltitude || 0;
+        const geoPos = guidedMissile.geoPosition || guidedMissile.geoCurrentPosition;
+        if (geoPos) {
+          const groundPos = geoToSphere(geoPos, GLOBE_RADIUS + altitude);
+          pos3d = { x: groundPos.x, y: groundPos.y, z: groundPos.z };
+        } else {
+          // Fallback to launch position
+          pos3d = geoToSphere(startGeo, GLOBE_RADIUS);
+        }
+      } else if (isRailInterceptor(missile)) {
+        // Rail-based interceptor: use pre-calculated rail path
+        const railMissile = missile as RailInterceptor;
+        if (railMissile.status === 'missed' && railMissile.missBehavior) {
+          // Missed interceptor: interpolate from miss point to crash point
+          const elapsed = now - railMissile.missBehavior.missStartTime;
+          const coastProgress = Math.min(1, elapsed / railMissile.missBehavior.duration);
+          const missGeo = geoInterpolate(
+            railMissile.rail.startGeo,
+            railMissile.rail.endGeo,
+            railMissile.missBehavior.missStartProgress
+          );
+          const currentGeo = geoInterpolate(
+            missGeo,
+            railMissile.missBehavior.endGeo,
+            coastProgress
+          );
+          // Altitude decreases during coast
+          const startAltitude = railMissile.currentAltitude || railMissile.rail.endAltitude;
+          const altitude = startAltitude * (1 - coastProgress) * (1 - coastProgress);
+          const groundPos = geoToSphere(currentGeo, GLOBE_RADIUS + altitude);
+          pos3d = { x: groundPos.x, y: groundPos.y, z: groundPos.z };
+        } else {
+          // Active interceptor: follow rail path
+          pos3d = getInterceptorPosition3D(
+            railMissile.rail.startGeo,
+            railMissile.rail.endGeo,
+            interpolatedProgress,
+            railMissile.rail.apexHeight,
+            railMissile.rail.endAltitude,
+            GLOBE_RADIUS
+          );
+        }
+      } else if (isPhysicsMissile(missile)) {
         // Physics-based interceptor: use interpolated position for smooth movement
         pos3d = this.getInterpolatedPhysicsPosition(missile, now);
-      } else if (isInterceptor && missile.targetId) {
+      } else if (isInterceptor && (missile as any).targetId) {
         // Legacy interceptor: use trajectory calculation
-        const boostEnd = missile.boostEndProgress ?? 0.25;
+        const legacyMissile = missile as Missile;
+        const boostEnd = legacyMissile.boostEndProgress ?? 0.25;
         pos3d = this.getInterceptorPositionTowardTarget(
           startGeo,
           interpolatedProgress,
-          missile.targetId,
+          legacyMissile.targetId!,
           boostEnd,
-          missile.flightPhase,
-          missile.missedTarget,
-          missile.missDirection,
+          legacyMissile.flightPhase,
+          legacyMissile.missedTarget,
+          legacyMissile.missDirection,
           flameoutProgress
         );
       } else {
@@ -2260,7 +2325,14 @@ export class GlobeRenderer {
       }
 
       // Check for ground impact on missed interceptors
-      if (isInterceptor && missile.missedTarget && missileProgress > 1) {
+      const isMissedInterceptor = isInterceptor && (
+        isRailInterceptor(missile)
+          ? (missile as RailInterceptor).status === 'missed'
+          : isGuidedInterceptor(missile)
+            ? (missile as GuidedInterceptor).status === 'missed' || (missile as GuidedInterceptor).status === 'crashed'
+            : (missile as any).missedTarget
+      );
+      if (isMissedInterceptor && missileProgress > 1) {
         const altitude = Math.sqrt(pos3d.x * pos3d.x + pos3d.y * pos3d.y + pos3d.z * pos3d.z) - GLOBE_RADIUS;
         if (altitude <= 0.5 && !this.groundImpactMissiles.has(missile.id)) {
           // Ground impact! Create small explosion (only once per missile)
@@ -2336,7 +2408,62 @@ export class GlobeRenderer {
       // Orient missile along flight path (direction of movement)
       let lookTarget: THREE.Vector3 | null = null;
 
-      if (isPhysicsMissile(missile)) {
+      if (isGuidedInterceptor(missile)) {
+        // Guided interceptor: orient along heading and climb angle
+        const guidedMissile = missile as GuidedInterceptor;
+        const headingRad = guidedMissile.heading * (Math.PI / 180);
+        const climbRad = guidedMissile.climbAngle * (Math.PI / 180);
+
+        // Calculate forward direction based on heading and climb
+        const cosClimb = Math.cos(climbRad);
+        const sinClimb = Math.sin(climbRad);
+        const cosHead = Math.cos(headingRad);
+        const sinHead = Math.sin(headingRad);
+
+        // Get up vector at current position (radially outward)
+        const up = new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z).normalize();
+
+        // North direction (tangent pointing toward north pole)
+        const north = new THREE.Vector3(0, 1, 0);
+        const east = new THREE.Vector3().crossVectors(north, up).normalize();
+        const northTangent = new THREE.Vector3().crossVectors(up, east).normalize();
+
+        // Forward direction based on heading
+        const forward = new THREE.Vector3()
+          .addScaledVector(northTangent, cosHead * cosClimb)
+          .addScaledVector(east, sinHead * cosClimb)
+          .addScaledVector(up, sinClimb)
+          .normalize();
+
+        lookTarget = new THREE.Vector3(
+          pos3d.x + forward.x * 10,
+          pos3d.y + forward.y * 10,
+          pos3d.z + forward.z * 10
+        );
+      } else if (isRailInterceptor(missile)) {
+        // Rail interceptor: calculate direction from rail path
+        const railMissile = missile as RailInterceptor;
+        if (railMissile.status === 'missed' && railMissile.missBehavior) {
+          // Missed: point toward crash location
+          const crashPos = geoToSphere(railMissile.missBehavior.endGeo, GLOBE_RADIUS);
+          lookTarget = new THREE.Vector3(crashPos.x, crashPos.y, crashPos.z);
+        } else {
+          // Active: use rail direction
+          const direction = getInterceptorDirection3D(
+            railMissile.rail.startGeo,
+            railMissile.rail.endGeo,
+            interpolatedProgress,
+            railMissile.rail.apexHeight,
+            railMissile.rail.endAltitude,
+            GLOBE_RADIUS
+          );
+          lookTarget = new THREE.Vector3(
+            pos3d.x + direction.x,
+            pos3d.y + direction.y,
+            pos3d.z + direction.z
+          );
+        }
+      } else if (isPhysicsMissile(missile)) {
         // Physics missile: orient along velocity vector (or heading if velocity is zero)
         const vel = missile.velocity;
         const velMag = Math.sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
@@ -2356,31 +2483,32 @@ export class GlobeRenderer {
             pos3d.z + hdg.z
           );
         }
-      } else if (isInterceptor && missile.targetId && this.gameState) {
+      } else if (isInterceptor && (missile as any).targetId && this.gameState) {
         // Legacy interceptor: calculate orientation from trajectory
+        const legacyMissile = missile as Missile;
         const pastFlameout = interpolatedProgress > flameoutProgress;
 
-        if (pastFlameout || missile.missedTarget) {
+        if (pastFlameout || legacyMissile.missedTarget) {
           // After flameout or miss: point along direction of travel (coasting)
           const aheadProgress = Math.min(interpolatedProgress + 0.02, 1.5);
-          const boostEnd = missile.boostEndProgress ?? 0.25;
+          const boostEnd = legacyMissile.boostEndProgress ?? 0.25;
           const aheadPos = this.getInterceptorPositionTowardTarget(
-            startGeo, aheadProgress, missile.targetId, boostEnd,
-            missile.flightPhase, missile.missedTarget, missile.missDirection, flameoutProgress
+            startGeo, aheadProgress, legacyMissile.targetId!, boostEnd,
+            legacyMissile.flightPhase, legacyMissile.missedTarget, legacyMissile.missDirection, flameoutProgress
           );
           lookTarget = new THREE.Vector3(aheadPos.x, aheadPos.y, aheadPos.z);
         } else {
           // Still tracking: point toward predicted intercept point
-          const targetIcbm = this.gameState.missiles[missile.targetId];
+          const targetIcbm = this.gameState.missiles[legacyMissile.targetId!];
           if (targetIcbm && targetIcbm.geoLaunchPosition && targetIcbm.geoTargetPosition && !isPhysicsMissile(targetIcbm)) {
             const interceptorRemaining = 1 - interpolatedProgress;
             const leadFactor = 0.5;
-            const predictedIcbmProgress = Math.min(1, targetIcbm.progress + interceptorRemaining * leadFactor);
+            const predictedIcbmProgress = Math.min(1, (targetIcbm.progress || 0) + interceptorRemaining * leadFactor);
 
             const icbmStartGeo = targetIcbm.geoLaunchPosition;
             const icbmEndGeo = targetIcbm.geoTargetPosition;
-            const icbmAltitude = calculateMissileAltitude(icbmStartGeo, icbmEndGeo);
-            const icbmObjects = this.missileObjects.get(missile.targetId);
+            const icbmAltitude = (targetIcbm as any).apexHeight ?? calculateMissileAltitude(icbmStartGeo, icbmEndGeo);
+            const icbmObjects = this.missileObjects.get(legacyMissile.targetId!);
             const icbmSeed = icbmObjects?.seed || 0;
             const icbmFlightDuration = icbmObjects?.flightDuration || 30000;
 
@@ -2646,8 +2774,21 @@ export class GlobeRenderer {
   private createICBMHead(isInterceptor: boolean, isMine: boolean): THREE.Group {
     const group = new THREE.Group();
 
-    // Base scale reduced by 50%, interceptors are even smaller
-    const scale = isInterceptor ? 0.25 : 0.5;
+    // Visual scale
+    const scale = isInterceptor ? 0.156 : 0.3125;
+
+    // Invisible hitbox for easier clicking (keeps original clickable area)
+    const hitboxSize = isInterceptor ? 4 : 6;
+    const hitboxGeom = new THREE.SphereGeometry(hitboxSize, 8, 8);
+    const hitboxMat = new THREE.MeshBasicMaterial({
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+      colorWrite: false,  // Prevents rendering while keeping raycasting
+    });
+    const hitbox = new THREE.Mesh(hitboxGeom, hitboxMat);
+    hitbox.renderOrder = -1;  // Render first (behind everything)
+    group.add(hitbox);
 
     // Colors based on ownership: player = blue, enemy = red
     // Interceptors are always cyan (defensive)
@@ -2751,8 +2892,8 @@ export class GlobeRenderer {
   private updateMissileExhaust(
     head: THREE.Group,
     progress: number,
-    isInterceptor: boolean,
-    missile?: Missile | PhysicsMissile
+    isInterceptorMissile: boolean,
+    missile?: Missile | PhysicsMissile | RailInterceptor | GuidedInterceptor
   ): void {
     const exhaust = head.getObjectByName('exhaust') as THREE.Mesh | undefined;
     const exhaustGlow = head.getObjectByName('exhaustGlow') as THREE.Mesh | undefined;
@@ -2767,8 +2908,26 @@ export class GlobeRenderer {
       return;
     }
 
+    // Rail interceptors: exhaust visible while has fuel
+    if (missile && isRailInterceptor(missile)) {
+      const railMissile = missile as RailInterceptor;
+      const engineOn = railMissile.fuel > 0 && railMissile.status === 'active';
+      exhaust.visible = engineOn;
+      exhaustGlow.visible = engineOn;
+      return;
+    }
+
+    // Guided interceptors: exhaust visible while has fuel and active
+    if (missile && isGuidedInterceptor(missile)) {
+      const guidedMissile = missile as GuidedInterceptor;
+      const engineOn = guidedMissile.fuel > 0 && guidedMissile.status === 'active';
+      exhaust.visible = engineOn;
+      exhaustGlow.visible = engineOn;
+      return;
+    }
+
     // Legacy interceptors keep engine on the whole time (short flight)
-    if (isInterceptor) {
+    if (isInterceptorMissile) {
       exhaust.visible = true;
       exhaustGlow.visible = true;
       return;
@@ -2973,8 +3132,11 @@ export class GlobeRenderer {
       return null;
     }
 
-    // Calculate the ICBM's altitude for its arc
-    const icbmAltitude = calculateMissileAltitude(targetIcbm.geoLaunchPosition, targetIcbm.geoTargetPosition);
+    // Skip rail interceptors - this method is for ICBMs
+    if (isRailInterceptor(targetIcbm)) return null;
+
+    // Calculate the ICBM's altitude for its arc (use server's apexHeight if available)
+    const icbmAltitude = (targetIcbm as any).apexHeight ?? calculateMissileAltitude(targetIcbm.geoLaunchPosition, targetIcbm.geoTargetPosition);
 
     // Get the ICBM's current 3D position using its progress
     const seed = this.hashStringToNumber(targetIcbm.id);
@@ -3007,6 +3169,9 @@ export class GlobeRenderer {
     if (!targetIcbm || !targetIcbm.geoLaunchPosition || !targetIcbm.geoTargetPosition) {
       return null;
     }
+
+    // Skip rail interceptors - this method is for ICBMs
+    if (isRailInterceptor(targetIcbm)) return null;
 
     // Calculate what the ICBM's progress was when the interceptor reached its flameout point
     // We need to figure out how much time elapsed from interceptor launch to flameout
@@ -3042,8 +3207,8 @@ export class GlobeRenderer {
       icbmProgressAtFlameout
     );
 
-    // Calculate the ICBM's altitude for its arc at that progress
-    const icbmAltitude = calculateMissileAltitude(targetIcbm.geoLaunchPosition, targetIcbm.geoTargetPosition);
+    // Calculate the ICBM's altitude for its arc at that progress (use server's apexHeight if available)
+    const icbmAltitude = (targetIcbm as any).apexHeight ?? calculateMissileAltitude(targetIcbm.geoLaunchPosition, targetIcbm.geoTargetPosition);
 
     // Get the ICBM's 3D position using its progress at flameout
     const seed = this.hashStringToNumber(targetIcbm.id);
@@ -3364,25 +3529,96 @@ export class GlobeRenderer {
 
     // Get the tracked missile
     const interceptor = getMissiles(this.gameState).find(m => m.id === this.trackedMissileId);
-    if (!interceptor || interceptor.type !== 'interceptor') return;
+    if (!interceptor || !isInterceptorType(interceptor)) return;
     if (interceptor.detonated || interceptor.intercepted) return;
 
     // Get the target ICBM
-    const targetIcbm = interceptor.targetId ? this.gameState.missiles[interceptor.targetId] : null;
+    const targetId = isRailInterceptor(interceptor)
+      ? (interceptor as RailInterceptor).targetId
+      : isGuidedInterceptor(interceptor)
+        ? (interceptor as GuidedInterceptor).targetId
+        : (interceptor as any).targetId;
+    const targetIcbm = targetId ? this.gameState.missiles[targetId] : null;
     if (!targetIcbm || targetIcbm.detonated || targetIcbm.intercepted) return;
 
-    // Physics missiles: use server-provided predicted intercept point
-    if (isPhysicsMissile(interceptor)) {
-      this.updateInterceptPredictionForPhysicsMissile(interceptor, targetIcbm);
+    // Guided interceptors: show predicted intercept point along ICBM's path
+    if (isGuidedInterceptor(interceptor)) {
+      const guidedMissile = interceptor as GuidedInterceptor;
+      const icbm = targetIcbm as Missile;
+
+      if (icbm.geoLaunchPosition && icbm.geoTargetPosition && icbm.geoCurrentPosition && icbm.flightDuration) {
+        // Iteratively estimate intercept point
+        const interceptorSpeed = guidedMissile.speed || 0.8; // degrees per second
+        let timeToIntercept = 10; // initial guess in seconds
+
+        // Refine estimate
+        for (let i = 0; i < 3; i++) {
+          // Where will ICBM be in timeToIntercept seconds?
+          const progressDelta = (timeToIntercept * 1000) / icbm.flightDuration;
+          const futureProgress = Math.min(0.98, icbm.progress + progressDelta);
+          const futureGeo = geoInterpolate(icbm.geoLaunchPosition, icbm.geoTargetPosition, futureProgress);
+
+          // How long to reach that point?
+          const distToFuture = greatCircleDistance(guidedMissile.geoPosition, futureGeo);
+          const distDegrees = distToFuture * (180 / Math.PI);
+          timeToIntercept = distDegrees / interceptorSpeed;
+        }
+
+        // Final predicted position
+        const progressDelta = (timeToIntercept * 1000) / icbm.flightDuration;
+        const interceptProgress = Math.min(0.95, icbm.progress + progressDelta);
+        const interceptGeo = geoInterpolate(icbm.geoLaunchPosition, icbm.geoTargetPosition, interceptProgress);
+        const icbmApex = icbm.apexHeight || 30;
+        const icbmAltitude = 4 * icbmApex * interceptProgress * (1 - interceptProgress);
+
+        const markerPos = geoToSphere(interceptGeo, GLOBE_RADIUS + icbmAltitude * 0.3);
+        const chance = guidedMissile.hasGuidance ? 0.75 : 0.15;
+        this.createInterceptMarker(
+          new THREE.Vector3(markerPos.x, markerPos.y, markerPos.z),
+          chance
+        );
+      }
       return;
     }
 
+    // Rail interceptors: show marker at ICBM's predicted position at intercept
+    if (isRailInterceptor(interceptor)) {
+      const railMissile = interceptor as RailInterceptor;
+      const icbm = targetIcbm as Missile;
+
+      // Get ICBM position at the intercept progress (where they'll meet)
+      if (icbm.geoLaunchPosition && icbm.geoTargetPosition) {
+        const interceptProgress = railMissile.targetProgressAtIntercept;
+        const icbmGeo = geoInterpolate(icbm.geoLaunchPosition, icbm.geoTargetPosition, interceptProgress);
+        const icbmApex = icbm.apexHeight || 30;
+        const icbmAltitude = 4 * icbmApex * interceptProgress * (1 - interceptProgress);
+
+        // Place marker at ICBM's position (on the globe surface, not at altitude)
+        const markerPos = geoToSphere(icbmGeo, GLOBE_RADIUS + icbmAltitude * 0.3);
+        const chance = railMissile.tracking.hasGuidance ? 0.7 : 0.1;
+        this.createInterceptMarker(
+          new THREE.Vector3(markerPos.x, markerPos.y, markerPos.z),
+          chance
+        );
+      }
+      return;
+    }
+
+    // Physics missiles: use server-provided predicted intercept point
+    if (isPhysicsMissile(interceptor)) {
+      this.updateInterceptPredictionForPhysicsMissile(interceptor, targetIcbm as Missile | PhysicsMissile);
+      return;
+    }
+
+    // Skip if target is a rail interceptor
+    if (isRailInterceptor(targetIcbm)) return;
+
     // Legacy interceptor: calculate intercept point locally
-    const interceptPoint = this.calculateInterceptPoint(interceptor, targetIcbm as Missile);
+    const interceptPoint = this.calculateInterceptPoint(interceptor as Missile, targetIcbm as Missile);
     if (!interceptPoint) return;
 
     // Calculate interception chance
-    const chance = this.calculateInterceptionChance(interceptor, targetIcbm as Missile, interceptPoint);
+    const chance = this.calculateInterceptionChance(interceptor as Missile, targetIcbm as Missile, interceptPoint);
 
     // Create intercept marker (pulsing diamond shape)
     this.createInterceptMarker(interceptPoint.position, chance);
@@ -4267,11 +4503,11 @@ export class GlobeRenderer {
           fading.objects.trail.geometry.attributes.position.needsUpdate = true;
         }
 
-        // Also fade the trail
+        // Also fade the trail (start from normal opacity of 0.35, not 1.0)
         const trailMat = fading.objects.trail.material as THREE.LineBasicMaterial;
         if (trailMat) {
           trailMat.transparent = true;
-          trailMat.opacity = 1 - easedProgress;
+          trailMat.opacity = 0.35 * (1 - easedProgress);
         }
       }
 
@@ -4881,6 +5117,20 @@ export class GlobeRenderer {
 
   // Updated method to include satellite coverage in fog of war
   private isWithinCoverage(geoPos: GeoPosition, altitudeKm: number = 0): boolean {
+    if (!this.gameState) return true;
+
+    // Early-game fallback: if player has no radars AND no satellites, show everything
+    // This ensures AI cities are visible before the player builds any detection infrastructure
+    const playerRadars = getBuildings(this.gameState).filter(
+      b => b.type === 'radar' && b.ownerId === this.playerId && !b.destroyed
+    );
+    const playerSatellites = getSatellites(this.gameState).filter(
+      s => s.ownerId === this.playerId && !s.destroyed
+    );
+    if (playerRadars.length === 0 && playerSatellites.length === 0) {
+      return true;
+    }
+
     // First check radar coverage
     if (this.isWithinRadarCoverage(geoPos, altitudeKm)) {
       return true;
@@ -4909,10 +5159,44 @@ export class GlobeRenderer {
 
   /**
    * Get the 3D position of a missile for camera tracking.
-   * Works with physics missiles, legacy interceptors, and ICBMs.
+   * Works with physics missiles, rail interceptors, guided interceptors, legacy interceptors, and ICBMs.
    */
-  private getMissile3DPositionForTracking(missile: Missile | PhysicsMissile): THREE.Vector3 | null {
+  private getMissile3DPositionForTracking(missile: Missile | PhysicsMissile | RailInterceptor | GuidedInterceptor): THREE.Vector3 | null {
     const now = Date.now();
+
+    // Guided interceptors use server-provided position
+    if (isGuidedInterceptor(missile)) {
+      const guidedMissile = missile as GuidedInterceptor;
+      const geoPos = guidedMissile.geoPosition || guidedMissile.geoCurrentPosition;
+      if (geoPos) {
+        const altitude = guidedMissile.altitude || guidedMissile.currentAltitude || 0;
+        const pos = geoToSphere(geoPos, GLOBE_RADIUS + altitude);
+        return new THREE.Vector3(pos.x, pos.y, pos.z);
+      }
+      return null;
+    }
+
+    // Rail interceptors use pre-calculated rail path
+    if (isRailInterceptor(missile)) {
+      const railMissile = missile as RailInterceptor;
+      if (railMissile.status === 'missed' && railMissile.missBehavior) {
+        // Use current position during miss coast
+        if (railMissile.geoCurrentPosition) {
+          const altitude = railMissile.currentAltitude || 0;
+          const pos = geoToSphere(railMissile.geoCurrentPosition, GLOBE_RADIUS + altitude);
+          return new THREE.Vector3(pos.x, pos.y, pos.z);
+        }
+      }
+      const pos = getInterceptorPosition3D(
+        railMissile.rail.startGeo,
+        railMissile.rail.endGeo,
+        railMissile.progress,
+        railMissile.rail.apexHeight,
+        railMissile.rail.endAltitude,
+        GLOBE_RADIUS
+      );
+      return new THREE.Vector3(pos.x, pos.y, pos.z);
+    }
 
     // Physics missiles have direct 3D position
     if (isPhysicsMissile(missile)) {
@@ -4921,20 +5205,21 @@ export class GlobeRenderer {
     }
 
     // For legacy missiles, get geo position and convert
-    const missileGeo = missile.geoCurrentPosition
-      || (missile.currentPosition ? this.pixelToGeoFallback(missile.currentPosition) : null);
+    const legacyMissile = missile as Missile;
+    const missileGeo = legacyMissile.geoCurrentPosition
+      || (legacyMissile.currentPosition ? this.pixelToGeoFallback(legacyMissile.currentPosition) : null);
 
     if (!missileGeo) return null;
 
     // For ICBMs, calculate actual 3D position with altitude
-    if (missile.type === 'icbm' && missile.geoLaunchPosition && missile.geoTargetPosition) {
-      const maxAltitude = missile.apexHeight || 30;
-      const flightDuration = missile.flightDuration || 30000;
-      const seed = missile.id.charCodeAt(0);
+    if (legacyMissile.type === 'icbm' && legacyMissile.geoLaunchPosition && legacyMissile.geoTargetPosition) {
+      const maxAltitude = legacyMissile.apexHeight || 30;
+      const flightDuration = legacyMissile.flightDuration || 30000;
+      const seed = legacyMissile.id.charCodeAt(0);
       const pos = getMissilePosition3D(
-        missile.geoLaunchPosition,
-        missile.geoTargetPosition,
-        missile.progress,
+        legacyMissile.geoLaunchPosition,
+        legacyMissile.geoTargetPosition,
+        legacyMissile.progress,
         maxAltitude,
         GLOBE_RADIUS,
         flightDuration,
@@ -4944,8 +5229,8 @@ export class GlobeRenderer {
     }
 
     // For interceptors and others, use current geo position at estimated altitude
-    const progress = missile.progress || 0;
-    const apexHeight = missile.apexHeight || 20;
+    const progress = legacyMissile.progress || 0;
+    const apexHeight = legacyMissile.apexHeight || 20;
     // Parabolic altitude based on progress
     const altitude = 4 * apexHeight * progress * (1 - progress);
     const pos = geoToSphere(missileGeo, GLOBE_RADIUS + altitude);
@@ -5005,6 +5290,21 @@ export class GlobeRenderer {
     this.mouse.y = -(canvasY / rect.height) * 2 + 1;
 
     this.raycaster.setFromCamera(this.mouse, this.camera);
+
+    // In placement mode, skip all object click handling that would move the camera.
+    // Only allow globe clicks to proceed for building placement.
+    if (this.placementMode) {
+      const globeIntersects = this.raycaster.intersectObject(this.globe);
+      if (globeIntersects.length > 0) {
+        this.selectedCityInfo = null;
+        if (this.onClickCallback) {
+          const point = globeIntersects[0].point;
+          const geoPos = this.spherePointToGeo(point);
+          this.onClickCallback(geoPos);
+        }
+      }
+      return;
+    }
 
     // Check for missile clicks first (they're in flight, most interesting)
     const missileIntersects = this.raycaster.intersectObjects(
@@ -5137,13 +5437,20 @@ export class GlobeRenderer {
       }
       if (obj?.userData?.type === 'city') {
         const cityData = obj.userData;
-        // Stop any missile tracking
-        this.trackedMissileId = null;
         // Get geo position from CITY_GEO_DATA
         const territoryId = cityData.territoryId;
         const cityName = cityData.name;
         const citiesInTerritory = CITY_GEO_DATA[territoryId];
         const cityGeoData = citiesInTerritory?.find(c => c.name === cityName);
+
+        // If a building is selected (silo targeting), pass click to callback instead
+        if (this.selectedBuilding && cityGeoData && this.onClickCallback) {
+          this.onClickCallback(cityGeoData.position);
+          return;
+        }
+
+        // Otherwise, normal city selection behavior
+        this.trackedMissileId = null;
         if (cityGeoData) {
           this.centerCameraOnGeo(cityGeoData.position);
           // Show city info in HUD
@@ -5217,13 +5524,22 @@ export class GlobeRenderer {
     this.cameraTargetGeo = geoPos;
     this.cameraAnimating = true;
 
-    // Calculate target camera position (looking at the point from outside)
-    const targetDist = distance || this.camera.position.length();
-    const targetPos = geoToSphere(geoPos, targetDist);
+    // Flush any pending OrbitControls state (zoom scale, rotation deltas) before animation
+    // This prevents accumulated scroll wheel zoom from being applied at animation end
+    // Must be done BEFORE capturing startPos so we animate from the flushed position
+    this.controls.update();
 
-    // Animate camera movement smoothly
+    // Calculate target camera position (looking at the point from outside)
     const startPos = this.camera.position.clone();
-    const endPos = new THREE.Vector3(targetPos.x, targetPos.y, targetPos.z);
+    const startDist = startPos.length();
+    const endDist = distance || startDist;
+    let targetPos = geoToSphere(geoPos, endDist);
+    let endPos = new THREE.Vector3(targetPos.x, targetPos.y, targetPos.z);
+
+    // Use spherical interpolation (SLERP) for direction to follow globe surface
+    const startDir = startPos.clone().normalize();
+    let endDir = endPos.clone().normalize();
+
     const startTime = performance.now();
     const duration = 800; // ms
 
@@ -5233,18 +5549,104 @@ export class GlobeRenderer {
       // Ease out cubic for smooth deceleration
       const eased = 1 - Math.pow(1 - t, 3);
 
-      // Interpolate position (spherical interpolation would be better but this works)
-      this.camera.position.lerpVectors(startPos, endPos, eased);
+      // If tracking a missile, update target to missile's current position
+      // This ensures smooth handoff when animation ends
+      if (this.trackedMissileId && this.gameState) {
+        const missiles = getMissiles(this.gameState);
+        const trackedMissile = missiles.find(m => m.id === this.trackedMissileId);
+        if (trackedMissile && !trackedMissile.detonated && !trackedMissile.intercepted) {
+          const missile3DPos = this.getMissile3DPositionForTracking(trackedMissile);
+          if (missile3DPos) {
+            endDir = missile3DPos.clone().normalize();
+            // Update geoPos for the animation end target
+            geoPos = trackedMissile.geoCurrentPosition
+              || (trackedMissile.currentPosition ? this.pixelToGeoFallback(trackedMissile.currentPosition) : geoPos);
+          }
+        }
+      }
+
+      // SLERP for direction (stays on sphere surface, arcs over globe)
+      const angle = startDir.angleTo(endDir);
+      let currentDir: THREE.Vector3;
+      if (angle > 0.01) {
+        // Use SLERP formula: (sin((1-t)*θ)/sin(θ))*v0 + (sin(t*θ)/sin(θ))*v1
+        const sinAngle = Math.sin(angle);
+        const s0 = Math.sin((1 - eased) * angle) / sinAngle;
+        const s1 = Math.sin(eased * angle) / sinAngle;
+        currentDir = startDir.clone().multiplyScalar(s0)
+          .addScaledVector(endDir, s1).normalize();
+      } else {
+        // For very small angles, linear interpolation is fine
+        currentDir = startDir.clone().lerp(endDir, eased).normalize();
+      }
+
+      // Lerp distance separately
+      const currentDist = startDist + (endDist - startDist) * eased;
+      this.camera.position.copy(currentDir).multiplyScalar(currentDist);
       this.camera.lookAt(0, 0, 0);
-      this.controls.update();
+
+      // Reset orbit target to origin during animation to prevent drift
+      this.controls.target.set(0, 0, 0);
 
       if (t < 1) {
         requestAnimationFrame(animate);
       } else {
+        // Animation complete
         this.cameraAnimating = false;
+        this.cameraAnimationStabilizeFrames = 5; // Skip updates for 5 frames to stabilize
+
+        const finalDist = this.camera.position.length();
+
+        // Set VERY permissive constraints to prevent any clamping during sync
+        this.controls.minDistance = 1;
+        this.controls.maxDistance = 1000;
+        const savedMinPolar = this.controls.minPolarAngle;
+        const savedMaxPolar = this.controls.maxPolarAngle;
+        this.controls.minPolarAngle = 0;
+        this.controls.maxPolarAngle = Math.PI;
+
+        // Set target to the current missile position (or where we animated to)
+        // This minimizes the jump when tracking starts
+        const targetOnSurface = geoToSphere(geoPos, GLOBE_RADIUS);
+        this.controls.target.set(targetOnSurface.x, targetOnSurface.y, targetOnSurface.z);
+
+        // Re-enable controls
+        this.controls.enabled = true;
+
+        // Save the desired camera state BEFORE any updates
+        const savedCameraPos = this.camera.position.clone();
+        const savedCameraQuat = this.camera.quaternion.clone();
+
+        // Call update() with damping disabled to flush any stale OrbitControls state
+        const wasDamping = this.controls.enableDamping;
+        this.controls.enableDamping = false;
+        this.controls.update();
+
+        // FORCE camera back to the saved state
+        this.camera.position.copy(savedCameraPos);
+        this.camera.quaternion.copy(savedCameraQuat);
+
+        // Call update() AGAIN to make OrbitControls adopt this state
+        this.controls.update();
+
+        // Restore camera state one final time in case update() changed it
+        this.camera.position.copy(savedCameraPos);
+        this.camera.quaternion.copy(savedCameraQuat);
+
+        this.controls.enableDamping = wasDamping;
+
+        // Restore polar angle constraints
+        this.controls.minPolarAngle = savedMinPolar;
+        this.controls.maxPolarAngle = savedMaxPolar;
+
+        // Restore reasonable distance constraints (still permissive for current distance)
+        this.controls.minDistance = Math.min(finalDist * 0.5, 120);
+        this.controls.maxDistance = Math.max(finalDist * 2, 500);
       }
     };
 
+    // Disable OrbitControls during animation to prevent conflicts
+    this.controls.enabled = false;
     animate();
   }
 
@@ -5272,15 +5674,20 @@ export class GlobeRenderer {
           // Get the missile's 3D position
           const missile3DPos = this.getMissile3DPositionForTracking(trackedMissile);
           if (missile3DPos) {
-            // Calculate how much the target is moving
-            const oldTarget = this.controls.target.clone();
+            // Skip target/camera movement while stabilizing after animation
+            if (this.cameraAnimationStabilizeFrames === 0) {
+              // Update orbit target with fast lerp for responsive tracking
+              this.controls.target.lerp(missile3DPos, 0.5);
 
-            // Update orbit target with fast lerp for responsive tracking
-            this.controls.target.lerp(missile3DPos, 0.5);
-
-            // Move camera position by the same delta to maintain relative position
-            const targetDelta = this.controls.target.clone().sub(oldTarget);
-            this.camera.position.add(targetDelta);
+              // Adjust camera to look at new target while maintaining distance from ORIGIN
+              // (not distance from target, which would cause zoom drift)
+              const beforeDist = this.camera.position.length();
+              const cameraDir = this.camera.position.clone().normalize();
+              const targetDir = this.controls.target.clone().normalize();
+              cameraDir.lerp(targetDir, 0.1);
+              cameraDir.normalize();
+              this.camera.position.copy(cameraDir.multiplyScalar(beforeDist));
+            }
           }
         } else {
           // Missile no longer exists, stop tracking
@@ -5304,15 +5711,20 @@ export class GlobeRenderer {
           const satPos3d = getSatellitePosition3D(orbitalParams, now, GLOBE_RADIUS);
           const satVec = new THREE.Vector3(satPos3d.x, satPos3d.y, satPos3d.z);
 
-          // Calculate how much the target is moving
-          const oldTarget = this.controls.target.clone();
+          // Skip target/camera movement while stabilizing after animation
+          if (this.cameraAnimationStabilizeFrames === 0) {
+            const beforeDist = this.camera.position.length();
 
-          // Update orbit target with fast lerp for responsive tracking
-          this.controls.target.lerp(satVec, 0.5);
+            // Update orbit target with fast lerp for responsive tracking
+            this.controls.target.lerp(satVec, 0.5);
 
-          // Move camera position by the same delta to maintain relative position
-          const targetDelta = this.controls.target.clone().sub(oldTarget);
-          this.camera.position.add(targetDelta);
+            // Adjust camera to look at new target while maintaining distance from ORIGIN
+            const cameraDir = this.camera.position.clone().normalize();
+            const targetDir = this.controls.target.clone().normalize();
+            cameraDir.lerp(targetDir, 0.1);
+            cameraDir.normalize();
+            this.camera.position.copy(cameraDir.multiplyScalar(beforeDist));
+          }
         } else {
           // Satellite was destroyed, clear selection and return to origin
           this.selectedSatelliteId = null;
@@ -5320,34 +5732,61 @@ export class GlobeRenderer {
         }
       }
 
-      // Return orbit target to globe center when nothing is being tracked
-      const isTrackingAnything = this.trackedMissileId || this.selectedSatelliteId;
-      if (!isTrackingAnything && !this.controls.target.equals(new THREE.Vector3(0, 0, 0))) {
-        // Smoothly return to origin (globe center)
-        this.controls.target.lerp(new THREE.Vector3(0, 0, 0), 0.05);
-      }
+      // Skip all orbit controls updates during camera animation
+      if (!this.cameraAnimating) {
+        // Return orbit target to globe center when nothing is being tracked
+        const isTrackingAnything = this.trackedMissileId || this.selectedSatelliteId;
+        if (!isTrackingAnything && !this.controls.target.equals(new THREE.Vector3(0, 0, 0))) {
+          // Smoothly return to origin (globe center)
+          this.controls.target.lerp(new THREE.Vector3(0, 0, 0), 0.05);
+        }
 
-      // Update controls after target changes
-      this.controls.update();
+        // When tracking, we handle camera position manually - skip controls.update() to avoid rotation drift
+        // Only call controls.update() when NOT tracking to allow normal orbit controls behavior
+        if (!isTrackingAnything) {
+          if (this.cameraAnimationStabilizeFrames === 0) {
+            this.controls.update();
+          }
+        } else if (this.cameraAnimationStabilizeFrames === 0) {
+          // When tracking, smoothly rotate camera toward target instead of snapping
+          // This prevents the jerk when tracking starts after camera animation completes
+          const targetQuat = new THREE.Quaternion();
+          const tempCamera = this.camera.clone();
+          tempCamera.lookAt(this.controls.target);
+          targetQuat.copy(tempCamera.quaternion);
 
-      // Adjust camera constraints based on tracking state
-      if (isTrackingAnything) {
-        const targetDist = this.controls.target.length();
-        // minDistance is camera-to-target distance, not camera-to-origin
-        // To prevent camera clipping through globe when between target and origin:
-        // |camera| = targetDist - cameraDist >= GLOBE_RADIUS + buffer
-        // So: cameraDist <= targetDist - GLOBE_RADIUS - buffer
-        const buffer = 20;
-        const maxSafeMinDist = Math.max(20, targetDist - GLOBE_RADIUS - buffer);
-        // Use a reasonable viewing distance, capped to prevent clipping
-        this.controls.minDistance = Math.min(40, maxSafeMinDist);
-        this.controls.maxDistance = 200;
-        this.controls.rotateSpeed = 0.3;
-      } else if (!this.cameraAnimating) {
-        // Reset to defaults when not tracking
-        this.controls.minDistance = 120;
-        this.controls.maxDistance = 500;
-        this.controls.rotateSpeed = 0.5;
+          // SLERP toward the target rotation for smooth tracking
+          this.camera.quaternion.slerp(targetQuat, 0.1);
+        }
+
+        // Adjust camera constraints based on tracking state
+        if (isTrackingAnything) {
+          const currentDist = this.camera.position.distanceTo(this.controls.target);
+          const targetDist = this.controls.target.length();
+          // minDistance is camera-to-target distance, not camera-to-origin
+          // To prevent camera clipping through globe when between target and origin:
+          // |camera| = targetDist - cameraDist >= GLOBE_RADIUS + buffer
+          // So: cameraDist <= targetDist - GLOBE_RADIUS - buffer
+          const buffer = 20;
+          const maxSafeMinDist = Math.max(20, targetDist - GLOBE_RADIUS - buffer);
+          // Use a reasonable viewing distance, capped to prevent clipping
+          this.controls.minDistance = Math.min(40, maxSafeMinDist);
+          // Allow current distance, but cap at reasonable max
+          this.controls.maxDistance = Math.max(200, currentDist * 1.1);
+          this.controls.rotateSpeed = 0.3;
+        } else {
+          // Reset to defaults when not tracking, but don't force camera to snap out
+          // by allowing the current camera distance as minimum
+          const currentCameraDist = this.camera.position.length();
+          this.controls.minDistance = Math.min(120, currentCameraDist * 0.95);
+          this.controls.maxDistance = 500;
+          this.controls.rotateSpeed = 0.5;
+        }
+
+        // Decrement stabilization counter
+        if (this.cameraAnimationStabilizeFrames > 0) {
+          this.cameraAnimationStabilizeFrames--;
+        }
       }
 
       // Update radar sweep animation
