@@ -304,7 +304,7 @@ export class GlobeRenderer {
       45,
       rect.width / rect.height,
       0.1,
-      2000
+      10000
     );
     this.camera.position.z = 300;
 
@@ -319,7 +319,7 @@ export class GlobeRenderer {
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.12;
     this.controls.minDistance = 120;
-    this.controls.maxDistance = 500;
+    this.controls.maxDistance = 2000;
     this.controls.rotateSpeed = 0.5;
     this.controls.zoomSpeed = 0.8;
     // Prevent gimbal lock - restrict vertical rotation
@@ -883,8 +883,8 @@ export class GlobeRenderer {
     const colors = new Float32Array(starCount * 3);
 
     for (let i = 0; i < starCount; i++) {
-      // Random position on a large sphere
-      const radius = 800 + Math.random() * 200;
+      // Random position on a large sphere (beyond max zoom distance)
+      const radius = 5000 + Math.random() * 1000;
       const theta = Math.random() * Math.PI * 2;
       const phi = Math.acos(2 * Math.random() - 1);
 
@@ -5602,7 +5602,7 @@ export class GlobeRenderer {
 
         // Set VERY permissive constraints to prevent any clamping during sync
         this.controls.minDistance = 1;
-        this.controls.maxDistance = 1000;
+        this.controls.maxDistance = 10000;
         const savedMinPolar = this.controls.minPolarAngle;
         const savedMaxPolar = this.controls.maxPolarAngle;
         this.controls.minPolarAngle = 0;
@@ -5644,7 +5644,7 @@ export class GlobeRenderer {
 
         // Restore reasonable distance constraints (still permissive for current distance)
         this.controls.minDistance = Math.min(finalDist * 0.5, 120);
-        this.controls.maxDistance = Math.max(finalDist * 2, 500);
+        this.controls.maxDistance = Math.max(finalDist * 2, 2000);
       }
     };
 
@@ -5775,14 +5775,14 @@ export class GlobeRenderer {
           // Use a reasonable viewing distance, capped to prevent clipping
           this.controls.minDistance = Math.min(40, maxSafeMinDist);
           // Allow current distance, but cap at reasonable max
-          this.controls.maxDistance = Math.max(200, currentDist * 1.1);
+          this.controls.maxDistance = Math.max(2000, currentDist * 1.1);
           this.controls.rotateSpeed = 0.3;
         } else {
           // Reset to defaults when not tracking, but don't force camera to snap out
           // by allowing the current camera distance as minimum
           const currentCameraDist = this.camera.position.length();
           this.controls.minDistance = Math.min(120, currentCameraDist * 0.95);
-          this.controls.maxDistance = 500;
+          this.controls.maxDistance = 2000;
           this.controls.rotateSpeed = 0.5;
         }
 
@@ -5810,6 +5810,13 @@ export class GlobeRenderer {
 
       // Apply view toggle visibility
       this.applyViewToggles();
+
+      // Dynamic near plane adjustment to prevent Z-fighting at far distances
+      // Scale near plane based on camera distance to maintain depth buffer precision
+      const cameraDist = this.camera.position.length();
+      const nearPlane = Math.max(0.1, cameraDist * 0.001);
+      this.camera.near = nearPlane;
+      this.camera.updateProjectionMatrix();
 
       // Render 3D scene
       this.renderer.render(this.scene, this.camera);
