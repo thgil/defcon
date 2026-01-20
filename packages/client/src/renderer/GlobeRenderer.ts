@@ -1226,7 +1226,65 @@ export class GlobeRenderer {
     this.updateCities();
     this.updateBuildings();
     this.updateMissiles();
+    this.updateMissileMarkerVisibility();
     this.updateSatellites();
+  }
+
+  // Only show stage markers (MECO, BECO, APO, etc.) and trail for the tracked missile
+  private updateMissileMarkerVisibility(): void {
+    for (const [missileId, markers] of this.stageMarkers) {
+      const isTracked = missileId === this.trackedMissileId;
+      for (const marker of markers) {
+        marker.visible = isTracked;
+      }
+    }
+
+    // Only show trail line and future path for tracked missile
+    for (const [missileId, objects] of this.missileObjects) {
+      const isTracked = missileId === this.trackedMissileId;
+      if (objects.trail) {
+        objects.trail.visible = isTracked;
+      }
+
+      // Update future path (dashed line from current position to target)
+      if (isTracked && !objects.isInterceptor && this.gameState) {
+        const missiles = getMissiles(this.gameState);
+        const missile = missiles.find(m => m.id === missileId);
+        if (missile && !missile.detonated && !missile.intercepted) {
+          const now = Date.now();
+          const elapsed = now - missile.launchTime;
+          const progress = Math.min(elapsed / objects.flightDuration, 1);
+
+          const startGeo = missile.geoLaunchPosition || (missile.launchPosition ? this.pixelToGeoFallback(missile.launchPosition) : { lat: 0, lng: 0 });
+          const targetGeo = missile.geoTargetPosition || (missile.targetPosition ? this.pixelToGeoFallback(missile.targetPosition) : { lat: 0, lng: 0 });
+
+          const futurePoints = this.calculateRemainingRoutePath(startGeo, targetGeo, progress, objects.maxAltitude, objects.flightDuration, objects.seed);
+
+          if (objects.plannedRoute) {
+            // Update existing geometry
+            objects.plannedRoute.geometry.dispose();
+            objects.plannedRoute.geometry = new THREE.BufferGeometry().setFromPoints(futurePoints);
+            objects.plannedRoute.computeLineDistances();
+            objects.plannedRoute.visible = true;
+          } else {
+            // Create new planned route
+            const routeGeom = new THREE.BufferGeometry().setFromPoints(futurePoints);
+            const routeMat = new THREE.LineDashedMaterial({
+              color: 0x888888,
+              transparent: true,
+              opacity: 0.4,
+              dashSize: 3,
+              gapSize: 2,
+            });
+            objects.plannedRoute = new THREE.Line(routeGeom, routeMat);
+            objects.plannedRoute.computeLineDistances();
+            this.missileGroup.add(objects.plannedRoute);
+          }
+        }
+      } else if (objects.plannedRoute) {
+        objects.plannedRoute.visible = false;
+      }
+    }
   }
 
   // Get all radar positions owned by the player
@@ -2221,6 +2279,7 @@ export class GlobeRenderer {
           color: color,
           transparent: true,
           opacity: isInterceptor ? 0.25 : 0.35,
+          linewidth: 2,
         });
         const trail = new THREE.Line(trailGeom, trailMat);
 
@@ -2230,21 +2289,8 @@ export class GlobeRenderer {
         this.missileGroup.add(trail);
         this.missileGroup.add(head);
 
-        // Create planned route line for player's missiles (light gray full path)
-        // For interceptors, skip planned route since target changes dynamically
+        // Planned route is created dynamically for tracked missiles only
         let plannedRoute: THREE.Line | undefined;
-        if (isMine && !isInterceptor) {
-          const routePoints = this.calculateFullRoutePath(startGeo, targetGeo, maxAltitude, missileFlightDuration, seed);
-          const routeGeom = new THREE.BufferGeometry().setFromPoints(routePoints);
-          const routeMat = new THREE.LineBasicMaterial({
-            color: 0x888888,  // Light gray
-            transparent: true,
-            opacity: 0.2,
-            linewidth: 1,
-          });
-          plannedRoute = new THREE.Line(routeGeom, routeMat);
-          this.missileGroup.add(plannedRoute);
-        }
 
         // For interceptors, initialize trail history with launch position
         const interceptorTrailHistory = isInterceptor ? [new THREE.Vector3(
@@ -2802,7 +2848,7 @@ export class GlobeRenderer {
     const scale = isInterceptor ? 0.156 : 0.3125;
 
     // Invisible hitbox for easier clicking (keeps original clickable area)
-    const hitboxSize = isInterceptor ? 4 : 6;
+    const hitboxSize = isInterceptor ? 2.8 : 4.2;
     const hitboxGeom = new THREE.SphereGeometry(hitboxSize, 8, 8);
     const hitboxMat = new THREE.MeshBasicMaterial({
       transparent: true,
@@ -2999,6 +3045,22 @@ export class GlobeRenderer {
     const steps = 60;
     for (let i = 0; i <= steps; i++) {
       const t = i / steps;
+      const pos = getMissilePosition3D(startGeo, endGeo, t, maxAltitude, GLOBE_RADIUS, flightDuration, seed);
+      points.push(new THREE.Vector3(pos.x, pos.y, pos.z));
+    }
+
+    return points;
+  }
+
+  // Calculate remaining route path from current progress to target
+  private calculateRemainingRoutePath(startGeo: GeoPosition, endGeo: GeoPosition, currentProgress: number, maxAltitude: number, flightDuration: number, seed?: number): THREE.Vector3[] {
+    const points: THREE.Vector3[] = [];
+
+    // Draw path from current position to target
+    const steps = 40;
+    const startT = Math.min(currentProgress, 0.99);
+    for (let i = 0; i <= steps; i++) {
+      const t = startT + (1 - startT) * (i / steps);
       const pos = getMissilePosition3D(startGeo, endGeo, t, maxAltitude, GLOBE_RADIUS, flightDuration, seed);
       points.push(new THREE.Vector3(pos.x, pos.y, pos.z));
     }
@@ -5345,15 +5407,12 @@ export class GlobeRenderer {
       // Find which missile this belongs to
       for (const [missileId, missileObjs] of this.missileObjects) {
         if (missileObjs.head === obj || missileObjs.trail === obj) {
-          // Get missile position and center on it
+          // Start tracking the missile - don't animate camera, maintain current rotation
+          // The tracking code will smoothly move the target to follow the missile
           if (this.gameState) {
             const missiles = getMissiles(this.gameState);
             const missile = missiles.find(m => m.id === missileId);
             if (missile) {
-              const geoPos = missile.geoCurrentPosition
-                || (missile.currentPosition ? this.pixelToGeoFallback(missile.currentPosition) : { lat: 0, lng: 0 });
-              this.centerCameraOnGeo(geoPos);
-
               // Check if this is an enemy ICBM - offer manual intercept
               const isEnemyICBM = missile.ownerId !== this.playerId &&
                                   missile.type === 'icbm' &&
@@ -5365,8 +5424,11 @@ export class GlobeRenderer {
                 this.onEnemyICBMClickCallback(missileId);
               }
 
-              // Track the missile
+              // Track the missile - camera will smoothly follow via controls.target.lerp
               this.trackedMissileId = missileId;
+              this.selectedSatelliteId = null;
+              this.selectedBuilding = null;
+              this.selectedCityInfo = null;
             }
           }
           return;
@@ -5390,23 +5452,11 @@ export class GlobeRenderer {
         const satellite = obj.userData.satellite as Satellite;
         // Only allow selecting player's own satellites
         if (satellite.ownerId === this.playerId) {
-          // Stop any missile tracking
+          // Start tracking - don't animate camera, maintain current rotation
           this.trackedMissileId = null;
-          // Clear building selection
           this.selectedBuilding = null;
-          // Set satellite selection by ID (persists across state updates)
+          this.selectedCityInfo = null;
           this.selectedSatelliteId = satellite.id;
-          // Center camera on satellite's ground position
-          const now = Date.now();
-          const orbitalParams: SatelliteOrbitalParams = {
-            launchTime: satellite.launchTime,
-            orbitalPeriod: satellite.orbitalPeriod,
-            orbitalAltitude: satellite.orbitalAltitude,
-            inclination: satellite.inclination,
-            startingLongitude: satellite.startingLongitude,
-          };
-          const groundPos = getSatelliteGroundPosition(orbitalParams, now, GLOBE_RADIUS);
-          this.centerCameraOnGeo(groundPos);
           // Update HUD
           if (this.gameState) {
             this.hudRenderer.updateState(this.gameState, this.playerId, null, this.placementMode);
@@ -5700,8 +5750,15 @@ export class GlobeRenderer {
           if (missile3DPos) {
             // Skip target movement while stabilizing after animation
             if (this.cameraAnimationStabilizeFrames === 0) {
-              // Update orbit target to follow missile - OrbitControls handles camera position
-              this.controls.target.lerp(missile3DPos, 0.5);
+              // Calculate current offset from target to camera (preserves user's rotation)
+              const cameraOffset = this.camera.position.clone().sub(this.controls.target);
+
+              // Lerp target toward missile position
+              this.controls.target.lerp(missile3DPos, 0.25);
+
+              // Move camera position to maintain same offset from new target position
+              // This translates the camera along with the target while preserving rotation
+              this.camera.position.copy(this.controls.target).add(cameraOffset);
             }
           }
         } else {
@@ -5728,8 +5785,15 @@ export class GlobeRenderer {
 
           // Skip target movement while stabilizing after animation
           if (this.cameraAnimationStabilizeFrames === 0) {
-            // Update orbit target to follow satellite - OrbitControls handles camera position
-            this.controls.target.lerp(satVec, 0.5);
+            // Calculate current offset from target to camera (preserves user's rotation)
+            const cameraOffset = this.camera.position.clone().sub(this.controls.target);
+
+            // Lerp target toward satellite position
+            this.controls.target.lerp(satVec, 0.25);
+
+            // Move camera position to maintain same offset from new target position
+            // This translates the camera along with the target while preserving rotation
+            this.camera.position.copy(this.controls.target).add(cameraOffset);
           }
         } else {
           // Satellite was destroyed, clear selection and return to origin
