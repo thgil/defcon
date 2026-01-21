@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import ConicPolygonGeometry from 'three-conic-polygon-geometry';
+import { soundEffects } from '../audio/SoundEffects';
 import {
   type GameState,
   type Building,
@@ -4919,6 +4920,13 @@ export class GlobeRenderer {
     const explosionGroup = new THREE.Group();
     explosionGroup.position.set(pos3d.x, pos3d.y, pos3d.z);
     this.effectGroup.add(explosionGroup);
+
+    // Play impact sound with positional audio (stereo panning)
+    const worldPos = new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z);
+    const screenPos = worldPos.clone().project(this.camera);
+    // screenPos.x is -1 (left) to 1 (right), convert to 0-1 range for sound manager
+    const screenX = (screenPos.x + 1) / 2;
+    soundEffects.playIcbmImpact(screenX);
 
     // Initial bright flash (larger, white, fades quickly)
     const flashGeom = new THREE.SphereGeometry(4, 16, 16);
