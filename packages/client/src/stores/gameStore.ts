@@ -3,7 +3,9 @@ import {
   type GameState,
   type Building,
   type Missile,
+  type AnyMissile,
   type Satellite,
+  type Aircraft,
   type GameEvent,
   type DefconLevel,
   type Vector2,
@@ -33,10 +35,17 @@ export interface InterceptSiloInfo {
   ammoRemaining: number;
 }
 
+export interface ExistingInterceptorInfo {
+  interceptorId: string;
+  sourceSiloName: string;
+  estimatedTimeToIntercept: number; // ms
+}
+
 export interface ManualInterceptState {
   targetMissileId: string | null;
   availableSilos: InterceptSiloInfo[];
   selectedSiloIds: Set<string>;
+  existingInterceptors: ExistingInterceptorInfo[];
 }
 
 interface GameStore {
@@ -55,12 +64,16 @@ interface GameStore {
   initGame: (state: GameState, playerId: string) => void;
   setFullState: (state: GameState) => void;
   applyDelta: (
+    tick: number,
+    timestamp: number,
     events: GameEvent[],
     buildingUpdates: Building[],
-    missileUpdates: Missile[],
+    missileUpdates: AnyMissile[],
     removedMissileIds: string[],
     satelliteUpdates?: Satellite[],
-    removedSatelliteIds?: string[]
+    removedSatelliteIds?: string[],
+    aircraftUpdates?: Aircraft[],
+    removedAircraftIds?: string[]
   ) => void;
   selectBuilding: (building: Building | null) => void;
   setPlacementMode: (type: BuildingType | null) => void;
@@ -68,7 +81,7 @@ interface GameStore {
 
   // Manual intercept actions
   setInterceptTarget: (targetMissileId: string | null) => void;
-  setInterceptInfo: (targetMissileId: string, availableSilos: InterceptSiloInfo[]) => void;
+  setInterceptInfo: (targetMissileId: string, availableSilos: InterceptSiloInfo[], existingInterceptors: ExistingInterceptorInfo[]) => void;
   toggleInterceptSilo: (siloId: string) => void;
   clearInterceptSelection: () => void;
 
@@ -100,6 +113,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
     targetMissileId: null,
     availableSilos: [],
     selectedSiloIds: new Set(),
+    existingInterceptors: [],
   },
 
   initGame: (state, playerId) => {
@@ -116,6 +130,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
         targetMissileId: null,
         availableSilos: [],
         selectedSiloIds: new Set(),
+        existingInterceptors: [],
       },
     });
   },
@@ -124,11 +139,11 @@ export const useGameStore = create<GameStore>((set, get) => ({
     set({ gameState: state });
   },
 
-  applyDelta: (events, buildingUpdates, missileUpdates, removedMissileIds, satelliteUpdates, removedSatelliteIds) => {
+  applyDelta: (tick, timestamp, events, buildingUpdates, missileUpdates, removedMissileIds, satelliteUpdates, removedSatelliteIds, aircraftUpdates, removedAircraftIds) => {
     const { gameState, selectedBuilding, playerId } = get();
     if (!gameState) return;
 
-    const newState = { ...gameState };
+    const newState = { ...gameState, tick, timestamp };
     let updatedSelectedBuilding = selectedBuilding;
     const newAlerts: GameAlert[] = [];
 
@@ -139,6 +154,8 @@ export const useGameStore = create<GameStore>((set, get) => ({
     const safeRemovedMissileIds = removedMissileIds || [];
     const safeSatelliteUpdates = satelliteUpdates || [];
     const safeRemovedSatelliteIds = removedSatelliteIds || [];
+    const safeAircraftUpdates = aircraftUpdates || [];
+    const safeRemovedAircraftIds = removedAircraftIds || [];
 
     // Apply building updates
     for (const building of safeBuildingUpdates) {
@@ -186,6 +203,24 @@ export const useGameStore = create<GameStore>((set, get) => ({
       for (const id of safeRemovedSatelliteIds) {
         const { [id]: removed, ...rest } = newState.satellites;
         newState.satellites = rest;
+      }
+    }
+
+    // Apply aircraft updates
+    if (safeAircraftUpdates.length > 0) {
+      for (const aircraft of safeAircraftUpdates) {
+        newState.aircraft = {
+          ...newState.aircraft,
+          [aircraft.id]: aircraft,
+        };
+      }
+    }
+
+    // Remove aircraft
+    if (safeRemovedAircraftIds.length > 0) {
+      for (const id of safeRemovedAircraftIds) {
+        const { [id]: removed, ...rest } = newState.aircraft;
+        newState.aircraft = rest;
       }
     }
 
@@ -292,11 +327,12 @@ export const useGameStore = create<GameStore>((set, get) => ({
         targetMissileId,
         availableSilos: [],
         selectedSiloIds: new Set(),
+        existingInterceptors: [],
       },
     });
   },
 
-  setInterceptInfo: (targetMissileId, availableSilos) => {
+  setInterceptInfo: (targetMissileId, availableSilos, existingInterceptors) => {
     const current = get().manualIntercept;
     // Only update if this is for the current target
     if (current.targetMissileId === targetMissileId) {
@@ -304,6 +340,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
         manualIntercept: {
           ...current,
           availableSilos,
+          existingInterceptors,
         },
       });
     }
@@ -331,6 +368,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
         targetMissileId: null,
         availableSilos: [],
         selectedSiloIds: new Set(),
+        existingInterceptors: [],
       },
     });
   },

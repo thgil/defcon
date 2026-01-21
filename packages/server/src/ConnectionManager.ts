@@ -5,6 +5,7 @@ import {
   ServerMessage,
   serializeMessage,
   parseMessage,
+  HackType,
 } from '@defcon/shared';
 import { LobbyManager } from './lobby/LobbyManager';
 
@@ -166,6 +167,18 @@ export class ConnectionManager {
         }
         break;
 
+      case 'launch_aircraft':
+        if (connection.gameId) {
+          const game = this.lobbyManager.getGame(connection.gameId);
+          game?.handleLaunchAircraft(
+            connection.playerId!,
+            message.airfieldId,
+            message.aircraftType,
+            message.waypoints
+          );
+        }
+        break;
+
       case 'ping':
         this.send(connection, {
           type: 'pong',
@@ -214,6 +227,59 @@ export class ConnectionManager {
             message.targetMissileId,
             message.siloIds
           );
+        }
+        break;
+
+      case 'terminal_email':
+        if (connection.gameId && connection.playerId) {
+          const game = this.lobbyManager.getGame(connection.gameId);
+          game?.handleTerminalEmail(
+            connection.playerId,
+            message.toPlayerId,
+            message.subject,
+            message.body
+          );
+        }
+        break;
+
+      // Hacking messages
+      case 'hack_scan':
+        if (connection.gameId && connection.playerId) {
+          const game = this.lobbyManager.getGame(connection.gameId);
+          game?.handleHackScan(connection.playerId);
+        }
+        break;
+
+      case 'hack_start':
+        if (connection.gameId && connection.playerId) {
+          const game = this.lobbyManager.getGame(connection.gameId);
+          game?.handleHackStart(
+            connection.playerId,
+            message.targetId,
+            message.hackType,
+            message.proxyRoute
+          );
+        }
+        break;
+
+      case 'hack_disconnect':
+        if (connection.gameId && connection.playerId) {
+          const game = this.lobbyManager.getGame(connection.gameId);
+          game?.handleHackDisconnect(connection.playerId, message.hackId);
+        }
+        break;
+
+      case 'hack_purge':
+        if (connection.gameId && connection.playerId) {
+          const game = this.lobbyManager.getGame(connection.gameId);
+          game?.handleHackPurge(connection.playerId, message.targetId);
+        }
+        break;
+
+      case 'hack_trace':
+        if (connection.gameId && connection.playerId) {
+          const game = this.lobbyManager.getGame(connection.gameId);
+          game?.handleHackTrace(connection.playerId);
         }
         break;
     }

@@ -2,8 +2,9 @@ import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { ConnectionManager } from './ConnectionManager';
 import { LobbyManager } from './lobby/LobbyManager';
+import { initializeLandDetection } from './game/landDetection';
 
-const PORT = parseInt(process.env.PORT || '3002', 10);
+const PORT = parseInt(process.env.PORT || '4002', 10);
 const HOST = '0.0.0.0';
 
 // Create HTTP server for Fly.io compatibility
@@ -17,6 +18,9 @@ const server = createServer((req, res) => {
   res.writeHead(200);
   res.end('DEFCON WebSocket Server');
 });
+
+// Initialize land detection for building placement validation
+initializeLandDetection();
 
 const wss = new WebSocketServer({ server });
 const lobbyManager = new LobbyManager();

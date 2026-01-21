@@ -8,7 +8,19 @@ import type {
   Vector2,
   Building,
   Missile,
+  PhysicsMissile,
+  RailInterceptor,
+  GuidedInterceptor,
   Satellite,
+  AnyMissile,
+  Aircraft,
+  AircraftType,
+  GeoPosition,
+  HackType,
+  ActiveHack,
+  SystemCompromise,
+  DetectedBuilding,
+  IntrusionAlert,
 } from './types';
 
 // ============ CLIENT -> SERVER ============
@@ -23,13 +35,21 @@ export type ClientMessage =
   | PlaceBuildingMessage
   | LaunchMissileMessage
   | LaunchSatelliteMessage
+  | LaunchAircraftMessage
   | SetSiloModeMessage
   | PingMessage
   | DebugCommandMessage
   | EnableAIMessage
   | DisableAIMessage
   | RequestInterceptInfoMessage
-  | ManualInterceptMessage;
+  | ManualInterceptMessage
+  | TerminalEmailMessage
+  // Hacking messages
+  | HackScanMessage
+  | HackStartMessage
+  | HackDisconnectMessage
+  | HackPurgeMessage
+  | HackTraceMessage;
 
 export interface CreateLobbyMessage {
   type: 'create_lobby';
@@ -81,6 +101,13 @@ export interface LaunchSatelliteMessage {
   inclination: number;  // 0-90 degrees
 }
 
+export interface LaunchAircraftMessage {
+  type: 'launch_aircraft';
+  airfieldId: string;
+  aircraftType: AircraftType;
+  waypoints: GeoPosition[];
+}
+
 export interface SetSiloModeMessage {
   type: 'set_silo_mode';
   siloId: string;
@@ -121,6 +148,46 @@ export interface ManualInterceptMessage {
   siloIds: string[];
 }
 
+// Send email to another player via terminal
+export interface TerminalEmailMessage {
+  type: 'terminal_email';
+  toPlayerId: string;
+  subject: string;
+  body: string;
+}
+
+// ============ HACKING CLIENT MESSAGES ============
+
+// Scan for enemy buildings in radar/satellite range
+export interface HackScanMessage {
+  type: 'hack_scan';
+}
+
+// Start hacking a target building
+export interface HackStartMessage {
+  type: 'hack_start';
+  targetId: string;           // Building ID to hack
+  hackType: HackType;
+  proxyRoute?: string[];      // Building IDs to route through (optional)
+}
+
+// Disconnect from an active hack
+export interface HackDisconnectMessage {
+  type: 'hack_disconnect';
+  hackId: string;
+}
+
+// Purge detected intrusion from own building
+export interface HackPurgeMessage {
+  type: 'hack_purge';
+  targetId: string;           // Building ID to purge
+}
+
+// Request trace status (who is hacking me)
+export interface HackTraceMessage {
+  type: 'hack_trace';
+}
+
 // ============ SERVER -> CLIENT ============
 
 export type ServerMessage =
@@ -135,7 +202,17 @@ export type ServerMessage =
   | GameEndMessage
   | ErrorMessage
   | PongMessage
-  | InterceptInfoMessage;
+  | InterceptInfoMessage
+  | TerminalEmailReceivedMessage
+  // Hacking messages
+  | HackScanResultMessage
+  | HackProgressMessage
+  | HackCompleteMessage
+  | HackTracedMessage
+  | HackDisconnectedMessage
+  | SystemCompromisedMessage
+  | IntrusionAlertMessage
+  | IntrusionStatusMessage;
 
 export interface LobbyListMessage {
   type: 'lobby_list';
@@ -181,10 +258,12 @@ export interface GameDeltaMessage {
   timestamp: number;
   events: GameEvent[];
   buildingUpdates: Building[];
-  missileUpdates: Missile[];
+  missileUpdates: AnyMissile[];
   removedMissileIds: string[];
   satelliteUpdates: Satellite[];
   removedSatelliteIds: string[];
+  aircraftUpdates?: Aircraft[];
+  removedAircraftIds?: string[];
 }
 
 export interface PlayerJoinedMessage {
@@ -236,6 +315,84 @@ export interface InterceptInfoMessage {
     estimatedInterceptProgress: number;  // 0-1, where on the missile's path the intercept would occur
     ammoRemaining: number;
   }>;
+  existingInterceptors: Array<{
+    interceptorId: string;
+    sourceSiloName: string;
+    estimatedTimeToIntercept: number; // ms
+  }>;
+}
+
+// Email received from another player via terminal
+export interface TerminalEmailReceivedMessage {
+  type: 'terminal_email_received';
+  fromPlayerId: string;
+  fromPlayerName: string;
+  subject: string;
+  body: string;
+  timestamp: number;
+}
+
+// ============ HACKING SERVER MESSAGES ============
+
+// Result of scanning for enemy buildings
+export interface HackScanResultMessage {
+  type: 'hack_scan_result';
+  detectedBuildings: DetectedBuilding[];
+}
+
+// Progress update for an active hack
+export interface HackProgressMessage {
+  type: 'hack_progress';
+  hackId: string;
+  progress: number;         // 0-100
+  traceProgress: number;    // 0-100
+  status: 'connecting' | 'active';
+}
+
+// Hack completed successfully
+export interface HackCompleteMessage {
+  type: 'hack_complete';
+  hackId: string;
+  targetId: string;
+  hackType: HackType;
+  compromise: SystemCompromise;
+}
+
+// Player was traced during hack attempt
+export interface HackTracedMessage {
+  type: 'hack_traced';
+  hackId: string;
+  targetId: string;
+  revealedToEnemy: boolean;  // True if position revealed to target
+}
+
+// Hack was disconnected (by player or interrupted)
+export interface HackDisconnectedMessage {
+  type: 'hack_disconnected';
+  hackId: string;
+  reason: 'player' | 'building_destroyed' | 'connection_lost';
+}
+
+// A building has been compromised (sent to victim)
+export interface SystemCompromisedMessage {
+  type: 'system_compromised';
+  targetId: string;
+  hackType: HackType;
+  expiresAt: number;
+  attackerRevealed?: string;  // Attacker ID if traced
+}
+
+// Alert: someone is hacking your building
+export interface IntrusionAlertMessage {
+  type: 'intrusion_alert';
+  alert: IntrusionAlert;
+}
+
+// Response to trace request - current intrusions on your buildings
+export interface IntrusionStatusMessage {
+  type: 'intrusion_status';
+  activeIntrusions: IntrusionAlert[];
+  compromisedBuildings: SystemCompromise[];
 }
 
 // Helper to serialize messages

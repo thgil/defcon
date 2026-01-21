@@ -3,10 +3,12 @@ import EmailTab from './tabs/EmailTab';
 import InstallationsTab from './tabs/InstallationsTab';
 import CommandsTab from './tabs/CommandsTab';
 import OptionsTab from './tabs/OptionsTab';
+import NetworkTab from './tabs/NetworkTab';
 
 const TABS: { id: TerminalTab; label: string }[] = [
   { id: 'installations', label: 'INSTALLATIONS' },
   { id: 'email', label: 'EMAIL' },
+  { id: 'network', label: 'NETWORK' },
   { id: 'commands', label: 'COMMANDS' },
   { id: 'options', label: 'OPTIONS' },
 ];
@@ -37,6 +39,7 @@ export default function TerminalScreen() {
       <div className="terminal-content">
         {activeTab === 'installations' && <InstallationsTab />}
         {activeTab === 'email' && <EmailTab />}
+        {activeTab === 'network' && <NetworkTab />}
         {activeTab === 'commands' && <CommandsTab />}
         {activeTab === 'options' && <OptionsTab />}
       </div>

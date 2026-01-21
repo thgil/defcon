@@ -210,22 +210,34 @@ export class AIPlayer {
   }
 
   /**
-   * Switch all AI silos to ICBM mode
+   * Switch HALF of AI silos to ICBM mode, keeping the rest for air defense.
+   * Always keeps at least 2 silos in air_defense mode for intercepting incoming missiles.
    */
   private switchSilosToAttack(state: GameState): AIAction[] {
     const actions: AIAction[] = [];
 
+    // Collect all AI silos
+    const aiSilos: Silo[] = [];
     for (const building of Object.values(state.buildings)) {
       if (building.ownerId !== this.id) continue;
       if (building.type !== 'silo') continue;
+      aiSilos.push(building as Silo);
+    }
 
-      const silo = building as Silo;
+    // Keep at least 2 silos for defense, switch up to half to attack mode
+    const silosToDefend = Math.max(2, Math.ceil(aiSilos.length / 2));
+    const silosToAttack = aiSilos.length - silosToDefend;
+
+    let attackCount = 0;
+    for (const silo of aiSilos) {
+      if (attackCount >= silosToAttack) break;
       if (silo.mode !== 'icbm') {
         actions.push({
           type: 'set_silo_mode',
           siloId: silo.id,
           mode: 'icbm',
         });
+        attackCount++;
       }
     }
 

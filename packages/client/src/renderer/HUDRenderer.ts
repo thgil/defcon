@@ -1,4 +1,4 @@
-import type { GameState, Building, Silo, SatelliteLaunchFacility, DefconLevel, Player } from '@defcon/shared';
+import type { GameState, Building, Silo, SatelliteLaunchFacility, Airfield, DefconLevel, Player, AircraftType, GeoPosition } from '@defcon/shared';
 import type { GameAlert, ManualInterceptState, InterceptSiloInfo } from '../stores/gameStore';
 
 const DEFCON_COLORS: Record<DefconLevel, string> = {
@@ -98,6 +98,11 @@ export class HUDRenderer {
   private manualInterceptState: ManualInterceptState | null = null;
   private onToggleInterceptSilo: ((siloId: string) => void) | null = null;
   private onLaunchIntercept: (() => void) | null = null;
+
+  // Aircraft waypoint mode
+  private waypointMode: { airfieldId: string; aircraftType: AircraftType; waypoints: GeoPosition[] } | null = null;
+  private onLaunchAircraft: ((airfieldId: string, aircraftType: AircraftType, waypoints: GeoPosition[]) => void) | null = null;
+  private onEnterWaypointMode: ((airfieldId: string, aircraftType: AircraftType) => void) | null = null;
   private onCancelIntercept: (() => void) | null = null;
 
   // Timer interpolation state
@@ -191,6 +196,30 @@ export class HUDRenderer {
 
   setLayerVisibility(visibility: { coastlines: boolean; borders: boolean; airspaces: boolean }): void {
     this.layerVisibility = { ...visibility };
+  }
+
+  setAircraftCallbacks(
+    onLaunchAircraft: (airfieldId: string, aircraftType: AircraftType, waypoints: GeoPosition[]) => void
+  ): void {
+    this.onLaunchAircraft = onLaunchAircraft;
+  }
+
+  isInWaypointMode(): boolean {
+    return this.waypointMode !== null;
+  }
+
+  addWaypoint(geoPos: GeoPosition): void {
+    if (this.waypointMode) {
+      this.waypointMode.waypoints.push(geoPos);
+    }
+  }
+
+  getWaypointModeData(): { airfieldId: string; aircraftType: AircraftType; waypoints: GeoPosition[] } | null {
+    return this.waypointMode;
+  }
+
+  cancelWaypointMode(): void {
+    this.waypointMode = null;
   }
 
   updateState(
@@ -338,9 +367,12 @@ export class HUDRenderer {
 
     const panelWidth = 280;
     const siloCount = this.manualInterceptState.availableSilos.length;
-    const panelHeight = 120 + siloCount * 30;
-    const panelX = (width - panelWidth) / 2;
-    const panelY = (height - panelHeight) / 2;
+    const existingCount = this.manualInterceptState.existingInterceptors?.length || 0;
+    // Add height for existing interceptors section
+    const existingInterceptorsHeight = existingCount > 0 ? 24 + existingCount * 14 + 8 : 0;
+    const panelHeight = 120 + siloCount * 30 + existingInterceptorsHeight;
+    const panelX = 8;  // Left margin
+    const panelY = 260; // Below placement panel area
 
     // Background
     this.ctx.fillStyle = 'rgba(0, 0, 0, 0.9)';
@@ -360,13 +392,33 @@ export class HUDRenderer {
     this.ctx.fillStyle = '#888';
     this.ctx.fillText(`Target: ICBM`, panelX + panelWidth / 2, panelY + 44);
 
+    let currentY = panelY + 60;
+
+    // Show existing interceptors (yellow)
+    const existingInterceptors = this.manualInterceptState.existingInterceptors || [];
+    if (existingInterceptors.length > 0) {
+      this.ctx.fillStyle = '#ffff00';
+      this.ctx.font = FONT_SMALL;
+      this.ctx.textAlign = 'left';
+      this.ctx.fillText('INBOUND:', panelX + 8, currentY);
+      currentY += 16;
+
+      for (const interceptor of existingInterceptors) {
+        const eta = (interceptor.estimatedTimeToIntercept / 1000).toFixed(1);
+        this.ctx.fillText(`${interceptor.sourceSiloName} - ${eta}s`, panelX + 16, currentY);
+        currentY += 14;
+      }
+      currentY += 8;
+    }
+
     if (siloCount === 0) {
       // No silos available
       this.ctx.fillStyle = '#666';
-      this.ctx.fillText('No silos available', panelX + panelWidth / 2, panelY + 70);
+      this.ctx.textAlign = 'center';
+      this.ctx.fillText('No silos available', panelX + panelWidth / 2, currentY + 10);
     } else {
       // Draw silo checkboxes
-      let siloY = panelY + 60;
+      let siloY = currentY;
       for (const silo of this.manualInterceptState.availableSilos) {
         const isSelected = this.manualInterceptState.selectedSiloIds.has(silo.siloId);
 
@@ -650,10 +702,116 @@ export class HUDRenderer {
       this.ctx.fillText(`Range: ${this.gameState!.config.radarRange}`, panelX + 8, panelY + 40);
       this.ctx.fillText('Status: ACTIVE', panelX + 8, panelY + 56);
     } else if (building.type === 'airfield') {
+      const airfield = building as Airfield;
       this.ctx.font = FONT;
       this.ctx.fillStyle = '#888';
-      this.ctx.fillText('Fighters: 0', panelX + 8, panelY + 40);
-      this.ctx.fillText('Bombers: 0', panelX + 8, panelY + 56);
+      this.ctx.fillText(`Fighters: ${airfield.fighterCount}  Bombers: ${airfield.bomberCount}  AWACS: ${airfield.radarCount ?? 0}`, panelX + 8, panelY + 40);
+
+      // Only show launch controls after DEFCON 3
+      if (this.gameState!.defconLevel <= 3) {
+        // Check if in waypoint mode for this airfield
+        if (this.waypointMode && this.waypointMode.airfieldId === airfield.id) {
+          // Waypoint mode UI
+          this.ctx.fillStyle = '#00ffff';
+          this.ctx.fillText(`Waypoints: ${this.waypointMode.waypoints.length}`, panelX + 8, panelY + 72);
+          this.ctx.fillStyle = '#888';
+          this.ctx.fillText('Click map to add waypoints', panelX + 8, panelY + 88);
+
+          // Confirm and Cancel buttons
+          const buttonY = panelY + 96;
+          const canConfirm = this.waypointMode.waypoints.length > 0;
+
+          this.drawButton({
+            x: panelX + 8,
+            y: buttonY,
+            width: 80,
+            height: 20,
+            label: 'CONFIRM',
+            disabled: !canConfirm,
+            action: () => {
+              if (this.waypointMode && this.waypointMode.waypoints.length > 0 && this.onLaunchAircraft) {
+                this.onLaunchAircraft(
+                  this.waypointMode.airfieldId,
+                  this.waypointMode.aircraftType,
+                  this.waypointMode.waypoints
+                );
+                this.waypointMode = null;
+              }
+            },
+          });
+
+          this.drawButton({
+            x: panelX + 96,
+            y: buttonY,
+            width: 80,
+            height: 20,
+            label: 'CANCEL',
+            action: () => {
+              this.waypointMode = null;
+            },
+          });
+        } else {
+          // Launch buttons
+          const buttonY = panelY + 52;
+
+          this.drawButton({
+            x: panelX + 8,
+            y: buttonY,
+            width: 58,
+            height: 20,
+            label: 'FIGHTER',
+            disabled: airfield.fighterCount <= 0,
+            action: () => {
+              if (airfield.fighterCount > 0) {
+                this.waypointMode = {
+                  airfieldId: airfield.id,
+                  aircraftType: 'fighter',
+                  waypoints: [],
+                };
+              }
+            },
+          });
+
+          this.drawButton({
+            x: panelX + 70,
+            y: buttonY,
+            width: 58,
+            height: 20,
+            label: 'BOMBER',
+            disabled: airfield.bomberCount <= 0,
+            action: () => {
+              if (airfield.bomberCount > 0) {
+                this.waypointMode = {
+                  airfieldId: airfield.id,
+                  aircraftType: 'bomber',
+                  waypoints: [],
+                };
+              }
+            },
+          });
+
+          this.drawButton({
+            x: panelX + 132,
+            y: buttonY,
+            width: 52,
+            height: 20,
+            label: 'AWACS',
+            disabled: (airfield.radarCount ?? 0) <= 0,
+            action: () => {
+              if ((airfield.radarCount ?? 0) > 0) {
+                this.waypointMode = {
+                  airfieldId: airfield.id,
+                  aircraftType: 'radar',
+                  waypoints: [],
+                };
+              }
+            },
+          });
+        }
+      } else {
+        this.ctx.fillStyle = '#888';
+        this.ctx.fillText('Available at DEFCON 3', panelX + 8, panelY + 72);
+      }
     } else if (building.type === 'satellite_launch_facility') {
       const facility = building as SatelliteLaunchFacility;
 
@@ -1257,13 +1415,15 @@ export class HUDRenderer {
     // Bottom status bar
     if (y >= height - statusBarHeight) return true;
 
-    // Manual intercept panel (centered)
+    // Manual intercept panel (left side)
     if (this.manualInterceptState?.targetMissileId) {
       const interceptPanelWidth = 280;
       const siloCount = this.manualInterceptState.availableSilos.length;
-      const interceptPanelHeight = 120 + siloCount * 30;
-      const interceptPanelX = (width - interceptPanelWidth) / 2;
-      const interceptPanelY = (height - interceptPanelHeight) / 2;
+      const existingCount = this.manualInterceptState.existingInterceptors?.length || 0;
+      const existingInterceptorsHeight = existingCount > 0 ? 24 + existingCount * 14 + 8 : 0;
+      const interceptPanelHeight = 120 + siloCount * 30 + existingInterceptorsHeight;
+      const interceptPanelX = 8;  // Left margin
+      const interceptPanelY = 260; // Below placement panel area
       if (x >= interceptPanelX && x <= interceptPanelX + interceptPanelWidth &&
           y >= interceptPanelY && y <= interceptPanelY + interceptPanelHeight) return true;
     }

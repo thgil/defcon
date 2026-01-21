@@ -87,6 +87,7 @@ function createMinimalGameState(): GameState {
     buildings: {},
     missiles: {},
     satellites: {},
+    aircraft: {},
   };
 }
 

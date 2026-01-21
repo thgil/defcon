@@ -11,6 +11,10 @@ import {
   type Airfield,
   type SatelliteLaunchFacility,
   type SiloMode,
+  type HackType,
+  type DetectedBuilding,
+  DEFCON_HACKING_CONFIG,
+  HACK_RISK_LEVELS,
 } from '@defcon/shared';
 
 interface CommandResult {
@@ -37,6 +41,11 @@ export function useTerminalCommands() {
   const setActiveTab = useTerminalStore((s) => s.setActiveTab);
   const clearHistory = useTerminalStore((s) => s.clearHistory);
   const getUnreadCount = useTerminalStore((s) => s.getUnreadCount);
+  const detectedBuildings = useTerminalStore((s) => s.detectedBuildings);
+  const activeHack = useTerminalStore((s) => s.activeHack);
+  const setActiveHack = useTerminalStore((s) => s.setActiveHack);
+  const intrusionAlerts = useTerminalStore((s) => s.intrusionAlerts);
+  const compromisedBuildings = useTerminalStore((s) => s.compromisedBuildings);
 
   const gameState = useGameStore((s) => s.gameState);
   const playerId = useGameStore((s) => s.playerId);
@@ -44,6 +53,11 @@ export function useTerminalCommands() {
 
   const setSiloMode = useNetworkStore((s) => s.setSiloMode);
   const launchMissile = useNetworkStore((s) => s.launchMissile);
+  const hackScan = useNetworkStore((s) => s.hackScan);
+  const hackStart = useNetworkStore((s) => s.hackStart);
+  const hackDisconnect = useNetworkStore((s) => s.hackDisconnect);
+  const hackPurge = useNetworkStore((s) => s.hackPurge);
+  const hackTrace = useNetworkStore((s) => s.hackTrace);
 
   const getMyBuildings = useCallback(() => {
     if (!gameState || !playerId) return [];
@@ -102,6 +116,15 @@ export function useTerminalCommands() {
         '│                                                        │',
         '│ population        Show population statistics           │',
         '│ score             Show current scores                  │',
+        '├─────────────────────────────────────────────────────────┤',
+        '│ CYBER WARFARE (DEFCON 4+)                              │',
+        '├─────────────────────────────────────────────────────────┤',
+        '│ scan              Scan for enemy systems               │',
+        '│ hack <id> <type>  Initiate hack on target              │',
+        '│ disconnect        Abort current hack                   │',
+        '│ trace             Check for intrusions                 │',
+        '│ purge <id>        Remove intrusion from building       │',
+        '│ network           Open NETWORK topology view           │',
         '└─────────────────────────────────────────────────────────┘',
       ],
     }),
@@ -445,6 +468,318 @@ export function useTerminalCommands() {
       output.push('└───────────────────────────────────────────────────────┘');
 
       return { output };
+    },
+
+    // ============ HACKING COMMANDS ============
+
+    scan: () => {
+      if (!gameState) {
+        return { output: ['ERROR: No game state available'], isError: true };
+      }
+
+      const config = DEFCON_HACKING_CONFIG[gameState.defconLevel];
+      if (!config.scanEnabled) {
+        return {
+          output: [
+            'SCAN DISABLED',
+            `Scanning only available at DEFCON 4 or lower.`,
+            `Current: DEFCON ${gameState.defconLevel}`,
+          ],
+          isError: true,
+        };
+      }
+
+      hackScan();
+      setActiveTab('network');
+
+      return {
+        output: [
+          '┌─────────────────────────────────────────┐',
+          '│ INITIATING NETWORK SCAN...              │',
+          '├─────────────────────────────────────────┤',
+          '│ Scanning radar coverage zones...        │',
+          '│ Querying satellite reconnaissance...    │',
+          '│                                         │',
+          '│ Results will appear in NETWORK tab.    │',
+          '└─────────────────────────────────────────┘',
+        ],
+      };
+    },
+
+    hack: (args) => {
+      if (!gameState) {
+        return { output: ['ERROR: No game state available'], isError: true };
+      }
+
+      const config = DEFCON_HACKING_CONFIG[gameState.defconLevel];
+      if (!config.hackingEnabled) {
+        return {
+          output: [
+            'HACKING DISABLED',
+            `Hacking only available at DEFCON 3 or lower.`,
+            `Current: DEFCON ${gameState.defconLevel}`,
+          ],
+          isError: true,
+        };
+      }
+
+      if (activeHack) {
+        return {
+          output: [
+            'ERROR: Hack already in progress',
+            'Use "disconnect" to abort current hack first.',
+          ],
+          isError: true,
+        };
+      }
+
+      if (args.length < 2) {
+        return {
+          output: [
+            'Usage: hack <target-id> <type>',
+            '',
+            'Available hack types:',
+            '  blind_radar    - Blinds radar (shows nothing)',
+            '  spoof_radar    - Spoofs radar (false contacts)',
+            '  lock_silo      - Locks silo mode',
+            '  delay_silo     - Adds silo cooldown',
+            '  disable_satellite - Disables launch detection',
+            '  intercept_comms   - Intercepts enemy emails',
+            '',
+            'Example: hack RD-01 blind_radar',
+          ],
+          isError: true,
+        };
+      }
+
+      const targetCode = args[0].toUpperCase();
+      const hackType = args[1].toLowerCase() as HackType;
+
+      // Find target in detected buildings
+      const targetIndex = parseInt(targetCode.split('-')[1]) - 1;
+      const targetPrefix = targetCode.split('-')[0];
+
+      const typeMap: Record<string, string> = {
+        'SL': 'silo',
+        'RD': 'radar',
+        'AF': 'airfield',
+        'ST': 'satellite_launch_facility',
+      };
+
+      const targetType = typeMap[targetPrefix];
+      if (!targetType) {
+        return {
+          output: [`Unknown building type: ${targetPrefix}`],
+          isError: true,
+        };
+      }
+
+      const matchingTargets = detectedBuildings.filter((d) => d.type === targetType);
+      const target = matchingTargets[targetIndex];
+
+      if (!target) {
+        return {
+          output: [
+            `Target "${targetCode}" not found in detected buildings.`,
+            'Run "scan" first to detect enemy buildings.',
+          ],
+          isError: true,
+        };
+      }
+
+      // Validate hack type
+      const validTypes: HackType[] = ['blind_radar', 'spoof_radar', 'lock_silo', 'delay_silo', 'disable_satellite', 'intercept_comms', 'forge_alert'];
+      if (!validTypes.includes(hackType)) {
+        return {
+          output: [
+            `Unknown hack type: ${hackType}`,
+            'Valid types: blind_radar, spoof_radar, lock_silo, delay_silo, disable_satellite, intercept_comms',
+          ],
+          isError: true,
+        };
+      }
+
+      // Check if hack type is valid for target
+      if (!target.vulnerabilities?.includes(hackType)) {
+        return {
+          output: [
+            `${hackType} is not effective against ${targetType}.`,
+            `Valid attacks for ${targetType}: ${target.vulnerabilities?.join(', ') || 'none'}`,
+          ],
+          isError: true,
+        };
+      }
+
+      // Start hack
+      hackStart(target.id, hackType);
+
+      // Set local active hack state for UI
+      setActiveHack({
+        hackId: 'pending',
+        targetId: target.id,
+        targetName: targetCode,
+        hackType,
+        progress: 0,
+        traceProgress: 0,
+        status: 'connecting',
+      });
+
+      const risk = HACK_RISK_LEVELS[hackType];
+      const riskLabel = risk <= 0.7 ? 'LOW' : risk <= 1.0 ? 'MEDIUM' : risk <= 1.5 ? 'HIGH' : 'CRITICAL';
+
+      return {
+        output: [
+          '┌─────────────────────────────────────────┐',
+          '│ INITIATING HACK...                      │',
+          '├─────────────────────────────────────────┤',
+          `│ Target:     ${targetCode.padEnd(27)}│`,
+          `│ Attack:     ${hackType.padEnd(27)}│`,
+          `│ Risk:       ${riskLabel.padEnd(27)}│`,
+          '│                                         │',
+          '│ Connection established.                 │',
+          '│ Monitor NETWORK tab for progress.       │',
+          '│ Type "disconnect" to abort.             │',
+          '└─────────────────────────────────────────┘',
+        ],
+      };
+    },
+
+    disconnect: () => {
+      if (!activeHack) {
+        return {
+          output: ['No active hack to disconnect.'],
+          isError: true,
+        };
+      }
+
+      hackDisconnect(activeHack.hackId);
+      setActiveHack(null);
+
+      return {
+        output: [
+          '┌─────────────────────────────────────────┐',
+          '│ DISCONNECTING...                        │',
+          '├─────────────────────────────────────────┤',
+          '│ Connection terminated.                  │',
+          '│ Trace avoided.                          │',
+          '└─────────────────────────────────────────┘',
+        ],
+      };
+    },
+
+    trace: () => {
+      hackTrace();
+
+      const output: string[] = [
+        '┌─────────────────────────────────────────┐',
+        '│ INTRUSION DETECTION STATUS              │',
+        '├─────────────────────────────────────────┤',
+      ];
+
+      if (intrusionAlerts.length === 0) {
+        output.push('│ No active intrusions detected.          │');
+      } else {
+        for (const alert of intrusionAlerts) {
+          output.push(`│ ⚠ Building under attack!               │`);
+          output.push(`│   Trace: ${Math.floor(alert.traceProgress)}%                              │`);
+          if (alert.attackerRevealed) {
+            output.push(`│   Attacker: ${alert.attackerRevealed.slice(0, 20).padEnd(20)}│`);
+          }
+        }
+      }
+
+      output.push('├─────────────────────────────────────────┤');
+      output.push('│ COMPROMISED SYSTEMS                     │');
+      output.push('├─────────────────────────────────────────┤');
+
+      if (compromisedBuildings.length === 0) {
+        output.push('│ No compromised systems.                 │');
+      } else {
+        for (const comp of compromisedBuildings) {
+          const remaining = comp.expiresAt > 0
+            ? Math.max(0, Math.floor((comp.expiresAt - Date.now()) / 1000))
+            : 'PERMANENT';
+          output.push(`│ ${comp.targetId.slice(0, 15).padEnd(15)} ${String(comp.hackType).padEnd(12)} ${String(remaining).padStart(5)}s │`);
+        }
+      }
+
+      output.push('└─────────────────────────────────────────┘');
+
+      return { output };
+    },
+
+    purge: (args) => {
+      if (!args[0]) {
+        return {
+          output: [
+            'Usage: purge <building-id>',
+            'Removes detected intrusions from your building.',
+          ],
+          isError: true,
+        };
+      }
+
+      // Find building by code
+      const targetCode = args[0].toUpperCase();
+      const buildings = getMyBuildings();
+
+      const typeGroups: Record<string, Building[]> = {
+        silo: buildings.filter((b) => b.type === 'silo'),
+        radar: buildings.filter((b) => b.type === 'radar'),
+        airfield: buildings.filter((b) => b.type === 'airfield'),
+        satellite_launch_facility: buildings.filter((b) => b.type === 'satellite_launch_facility'),
+      };
+
+      const prefix = targetCode.split('-')[0];
+      const index = parseInt(targetCode.split('-')[1]) - 1;
+
+      const typeMap: Record<string, string> = {
+        'SL': 'silo',
+        'RD': 'radar',
+        'AF': 'airfield',
+        'ST': 'satellite_launch_facility',
+      };
+
+      const targetType = typeMap[prefix];
+      if (!targetType || !typeGroups[targetType] || !typeGroups[targetType][index]) {
+        return {
+          output: [`Building "${targetCode}" not found.`],
+          isError: true,
+        };
+      }
+
+      const building = typeGroups[targetType][index];
+
+      // Check if building is compromised
+      const compromise = compromisedBuildings.find((c) => c.targetId === building.id);
+      if (!compromise) {
+        return {
+          output: [`${targetCode} is not compromised.`],
+        };
+      }
+
+      hackPurge(building.id);
+
+      return {
+        output: [
+          '┌─────────────────────────────────────────┐',
+          '│ PURGING INTRUSION...                    │',
+          '├─────────────────────────────────────────┤',
+          `│ Target: ${targetCode.padEnd(31)}│`,
+          '│ Running counter-intrusion protocols... │',
+          '│ Resetting system access controls...     │',
+          '│                                         │',
+          '│ Intrusion removed.                      │',
+          '└─────────────────────────────────────────┘',
+        ],
+      };
+    },
+
+    network: () => {
+      setActiveTab('network');
+      return {
+        output: ['Switching to NETWORK tab...'],
+      };
     },
   };
 

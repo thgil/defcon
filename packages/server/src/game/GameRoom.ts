@@ -1,4 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
+import { isPointOnLand } from './landDetection';
 import {
   GameState,
   GameConfig,
@@ -12,6 +13,10 @@ import {
   SatelliteLaunchFacility,
   Satellite,
   Missile,
+  RailInterceptor,
+  GuidedInterceptor,
+  Aircraft,
+  AircraftType,
   DefconLevel,
   BuildingType,
   SiloMode,
@@ -19,25 +24,37 @@ import {
   GameEvent,
   PlayerColor,
   GeoPosition,
+  HackType,
   getBuildings,
   getTerritories,
   getMissiles,
   getSatellites,
+  getAircraft,
   TERRITORY_GEO_DATA,
   CITY_GEO_DATA,
   geoToPixel,
   pixelToGeo,
   greatCircleDistance,
+  geoInterpolate,
   pointInPolygon,
   isPhysicsMissile,
+  isRailInterceptor,
+  isGuidedInterceptor,
+  isInterceptor,
   PhysicsMissile,
 } from '@defcon/shared';
 import { Lobby, LobbyPlayer } from '../lobby/Lobby';
-import { ConnectionManager } from '../ConnectionManager';
+import { ConnectionManager, Connection } from '../ConnectionManager';
 import { MissileSimulator } from '../simulation/MissileSimulator';
 import { SatelliteSimulator, SATELLITE_CONFIG } from '../simulation/SatelliteSimulator';
-import { InterceptorPhysics } from '../simulation/InterceptorPhysics';
+import { RailInterceptorSimulator } from '../simulation/RailInterceptorSimulator';
+import { GuidedInterceptorSimulator } from '../simulation/GuidedInterceptorSimulator';
+import { AircraftSimulator } from '../simulation/AircraftSimulator';
 import { AIPlayer, AIAction } from './AIPlayer';
+import { HackingSystem } from './HackingSystem';
+
+// Feature flag: use guided interceptors (true) or rail interceptors (false)
+const USE_GUIDED_INTERCEPTORS = true;
 
 const TICK_RATE = 20; // 20 Hz
 const TICK_INTERVAL = 1000 / TICK_RATE;
@@ -128,7 +145,10 @@ export class GameRoom {
   private connectionManager: ConnectionManager;
   private missileSimulator: MissileSimulator;
   private satelliteSimulator: SatelliteSimulator;
-  private interceptorPhysics: InterceptorPhysics;
+  private railInterceptorSimulator: RailInterceptorSimulator;
+  private guidedInterceptorSimulator: GuidedInterceptorSimulator;
+  private aircraftSimulator: AircraftSimulator;
+  private hackingSystem: HackingSystem;
   private aiPlayer: AIPlayer | null = null;
 
   private tickInterval: NodeJS.Timeout | null = null;
@@ -142,7 +162,10 @@ export class GameRoom {
     this.connectionManager = connectionManager;
     this.missileSimulator = new MissileSimulator(this.config.missileSpeed);
     this.satelliteSimulator = new SatelliteSimulator();
-    this.interceptorPhysics = new InterceptorPhysics();
+    this.railInterceptorSimulator = new RailInterceptorSimulator();
+    this.guidedInterceptorSimulator = new GuidedInterceptorSimulator();
+    this.aircraftSimulator = new AircraftSimulator();
+    this.hackingSystem = new HackingSystem();
 
     this.state = this.initializeGameState(lobby.getPlayers());
   }
@@ -230,6 +253,7 @@ export class GameRoom {
       buildings,
       missiles: {},
       satellites: {},
+      aircraft: {},
     };
   }
 
@@ -273,16 +297,21 @@ export class GameRoom {
     );
     this.pendingEvents.push(...missileEvents);
 
-    // Update physics-based interceptors
-    for (const missile of getMissiles(this.state)) {
-      if (isPhysicsMissile(missile)) {
-        const physicsEvents = this.interceptorPhysics.update(
-          missile as PhysicsMissile,
-          this.state,
-          TICK_INTERVAL / 1000
-        );
-        this.pendingEvents.push(...physicsEvents);
-      }
+    // Update interceptors based on feature flag
+    if (USE_GUIDED_INTERCEPTORS) {
+      // Update guided interceptors (proportional navigation)
+      const guidedInterceptorEvents = this.guidedInterceptorSimulator.update(
+        this.state,
+        TICK_INTERVAL / 1000
+      );
+      this.pendingEvents.push(...guidedInterceptorEvents);
+    } else {
+      // Update rail-based interceptors (pre-calculated paths)
+      const railInterceptorEvents = this.railInterceptorSimulator.update(
+        this.state,
+        TICK_INTERVAL / 1000
+      );
+      this.pendingEvents.push(...railInterceptorEvents);
     }
 
     // Update satellites
@@ -293,11 +322,22 @@ export class GameRoom {
     );
     this.pendingEvents.push(...satelliteEvents);
 
+    // Update aircraft
+    const aircraftEvents = this.aircraftSimulator.update(
+      this.state,
+      TICK_INTERVAL / 1000
+    );
+    this.pendingEvents.push(...aircraftEvents);
+
     // Update AI player
     if (this.aiPlayer) {
       const aiActions = this.aiPlayer.update(this.state, now);
       this.executeAIActions(aiActions);
     }
+
+    // Update hacking system
+    const hackingResult = this.hackingSystem.update(this.state, TICK_INTERVAL / 1000);
+    this.processHackingResults(hackingResult);
 
     // Check for interceptions
     const interceptionEvents = this.checkInterceptions();
@@ -371,8 +411,8 @@ export class GameRoom {
     // Track which missiles already have interceptors targeting them
     const missilesBeingTargeted = new Set<string>();
     for (const missile of getMissiles(this.state)) {
-      if (missile.type === 'interceptor' && missile.targetId) {
-        missilesBeingTargeted.add(missile.targetId);
+      if (isInterceptor(missile) && (missile as any).targetId) {
+        missilesBeingTargeted.add((missile as any).targetId);
       }
     }
 
@@ -381,32 +421,34 @@ export class GameRoom {
     // Check each incoming missile
     for (const missile of getMissiles(this.state)) {
       if (missile.detonated || missile.intercepted) continue;
-      if (missile.type === 'interceptor') continue;
+      if (isInterceptor(missile)) continue;
 
-      // Don't launch multiple interceptors at the same missile
+      // Don't launch multiple interceptors at the same missile (auto-fire)
       if (missilesBeingTargeted.has(missile.id)) continue;
 
       // Don't launch if missile is too close (won't have time to intercept)
-      if (missile.progress > 0.75) continue;
+      const icbmMissile = missile as Missile;
+      if (icbmMissile.progress > 0.75) continue;
 
       // Collect all valid silos that can engage this missile, with their scores
-      const candidateSilos: Array<{ silo: Silo; score: number; radar: Radar }> = [];
+      const candidateSilos: Array<{ silo: Silo; score: number; radarIds: string[] }> = [];
 
       for (const silo of airDefenseSilos) {
         // Only intercept missiles heading toward this player's territory
-        const targetTerritory = this.getTerritoryAt(missile.targetPosition);
+        const targetTerritory = this.getTerritoryAt(icbmMissile.targetPosition);
         if (!targetTerritory || targetTerritory.ownerId !== silo.ownerId) continue;
 
-        // RADAR REQUIREMENT: Check if ANY radar belonging to this player can see the missile
-        const detectingRadar = this.findDetectingRadar(missile, silo.ownerId);
-        if (!detectingRadar) continue; // No radar can see it - cannot engage
+        // RADAR REQUIREMENT: Find all radars that can see the missile
+        const trackingRadarIds = this.findAllTrackingRadars(icbmMissile, silo.ownerId);
+        if (trackingRadarIds.length === 0) continue;
+
 
         // Check cooldown
         if (now - silo.lastFireTime < silo.fireCooldown) continue;
 
         // Score this silo based on geometry
-        const score = this.scoreSiloForIntercept(silo, missile);
-        candidateSilos.push({ silo, score, radar: detectingRadar });
+        const score = this.scoreSiloForIntercept(silo, icbmMissile);
+        candidateSilos.push({ silo, score, radarIds: trackingRadarIds });
       }
 
       // No valid silos for this missile
@@ -416,22 +458,37 @@ export class GameRoom {
       candidateSilos.sort((a, b) => b.score - a.score);
       const best = candidateSilos[0];
       const silo = best.silo;
-      const detectingRadar = best.radar;
 
-      // Launch an interceptor missile with radar tracking info
-      const interceptor = this.missileSimulator.launchInterceptor(
-        silo,
-        missile,
-        silo.ownerId,
-        detectingRadar.id
-      );
+      // Launch interceptor based on feature flag
+      let interceptor: RailInterceptor | GuidedInterceptor | null;
+
+      if (USE_GUIDED_INTERCEPTORS) {
+        interceptor = this.guidedInterceptorSimulator.launchInterceptor(
+          silo,
+          icbmMissile,
+          silo.ownerId,
+          best.radarIds
+        );
+      } else {
+        interceptor = this.railInterceptorSimulator.launchInterceptor(
+          silo,
+          icbmMissile,
+          silo.ownerId,
+          best.radarIds
+        );
+      }
+
+      if (!interceptor) {
+        // Could not calculate valid intercept - skip this missile
+        continue;
+      }
 
       this.state.missiles[interceptor.id] = interceptor;
       silo.airDefenseAmmo--;
       silo.lastFireTime = now;
 
       // Track that this missile is now being targeted
-      missilesBeingTargeted.add(missile.id);
+      missilesBeingTargeted.add(icbmMissile.id);
 
       events.push({
         type: 'missile_launch',
@@ -439,7 +496,9 @@ export class GameRoom {
         missileId: interceptor.id,
         playerId: silo.ownerId,
         sourcePosition: silo.position,
-        targetPosition: interceptor.targetPosition || silo.position,
+        targetPosition: interceptor.geoTargetPosition
+          ? geoToPixel(interceptor.geoTargetPosition, MAP_WIDTH, MAP_HEIGHT)
+          : silo.position,
       });
     }
 
@@ -551,8 +610,8 @@ export class GameRoom {
       const angularDistanceDegrees = angularDistanceRadians * (180 / Math.PI);
 
       // Radar range is configured in game config (default ~300 units which is ~27 degrees)
-      // Convert radar range to degrees (roughly 11 degrees per 100 units)
-      const radarRangeDegrees = (radar.range / 100) * 11;
+      // Convert radar range to degrees (9 degrees per 100 units - slightly smaller than fog of war visual)
+      const radarRangeDegrees = (radar.range / 100) * 9;
 
       if (angularDistanceDegrees <= radarRangeDegrees) {
         return radar;
@@ -560,6 +619,46 @@ export class GameRoom {
     }
 
     return null;
+  }
+
+  /**
+   * Find all radars that can track the given missile.
+   * Used for multi-radar bonus calculation in interceptors.
+   * Returns array of radar IDs that can see the missile.
+   *
+   * IMPORTANT: Requires actual radar contact with the missile's CURRENT position
+   * before allowing interceptor launch. This ensures realistic gameplay where
+   * missiles must be detected before they can be engaged.
+   */
+  private findAllTrackingRadars(missile: Missile, ownerId: string): string[] {
+    const radars = getBuildings(this.state).filter(
+      (b): b is Radar =>
+        b.type === 'radar' &&
+        !b.destroyed &&
+        b.active &&
+        b.ownerId === ownerId
+    );
+
+    if (radars.length === 0) return [];
+
+    // Use the missile's CURRENT position - must have actual radar contact
+    const currentGeo = missile.geoCurrentPosition || pixelToGeoLocal(missile.currentPosition);
+
+    const trackingRadarIds: string[] = [];
+
+    for (const radar of radars) {
+      const radarGeo = radar.geoPosition || pixelToGeoLocal(radar.position);
+
+      const angularDistanceRadians = greatCircleDistance(radarGeo, currentGeo);
+      const angularDistanceDegrees = angularDistanceRadians * (180 / Math.PI);
+      const radarRangeDegrees = (radar.range / 100) * 9;
+
+      if (angularDistanceDegrees <= radarRangeDegrees) {
+        trackingRadarIds.push(radar.id);
+      }
+    }
+
+    return trackingRadarIds;
   }
 
   /**
@@ -675,8 +774,9 @@ export class GameRoom {
   private sendDeltaUpdate(): void {
     const hasMissiles = Object.keys(this.state.missiles).length > 0;
     const hasSatellites = Object.keys(this.state.satellites).length > 0;
+    const hasAircraft = Object.keys(this.state.aircraft).length > 0;
 
-    if (this.pendingEvents.length === 0 && !hasMissiles && !hasSatellites) {
+    if (this.pendingEvents.length === 0 && !hasMissiles && !hasSatellites && !hasAircraft) {
       return;
     }
 
@@ -708,6 +808,21 @@ export class GameRoom {
     // Remove destroyed satellites from state
     for (const id of removedSatelliteIds) {
       delete this.state.satellites[id];
+    }
+
+    // Collect aircraft updates
+    const aircraftUpdates = Object.values(this.state.aircraft).filter(
+      (a) => a.status === 'flying'
+    );
+
+    // Collect removed aircraft (grounded or destroyed)
+    const removedAircraftIds = Object.values(this.state.aircraft)
+      .filter((a) => a.status === 'grounded' || a.status === 'destroyed')
+      .map((a) => a.id);
+
+    // Remove grounded/destroyed aircraft from state
+    for (const id of removedAircraftIds) {
+      delete this.state.aircraft[id];
     }
 
     // Collect building updates from events
@@ -754,6 +869,8 @@ export class GameRoom {
       removedMissileIds,
       satelliteUpdates,
       removedSatelliteIds,
+      aircraftUpdates,
+      removedAircraftIds,
     };
 
     if (this.pendingEvents.some(e => e.type === 'mode_change')) {
@@ -799,6 +916,10 @@ export class GameRoom {
 
     // Check if position is in player's territory
     if (!this.isPointInTerritory(position, territory)) return;
+
+    // Check if position is on land (not ocean)
+    const geoPos = pixelToGeoLocal(position);
+    if (!isPointOnLand(geoPos)) return;
 
     // Check building limits
     const playerBuildings = Object.values(this.state.buildings).filter(
@@ -865,6 +986,7 @@ export class GameRoom {
           geoPosition,
           fighterCount: 5,
           bomberCount: 2,
+          radarCount: 1,
         };
         break;
 
@@ -951,6 +1073,12 @@ export class GameRoom {
       return;
     }
 
+    // Check if silo mode is locked by hacking
+    if (this.isSiloModeLocked(siloId)) {
+      console.log(`[DEBUG] Mode change blocked: silo ${siloId} is hacked (mode locked)`);
+      return;
+    }
+
     // Mode switch has a cooldown
     const now = Date.now();
     if (now < silo.modeSwitchCooldown) {
@@ -1007,6 +1135,53 @@ export class GameRoom {
 
     // Add event
     this.pendingEvents.push(result.event);
+  }
+
+  handleLaunchAircraft(
+    playerId: string,
+    airfieldId: string,
+    aircraftType: AircraftType,
+    waypoints: GeoPosition[]
+  ): void {
+    // Can launch aircraft at DEFCON 3 or lower (during combat)
+    if (this.state.defconLevel > 3) {
+      console.log('[AIRCRAFT] Launch failed: DEFCON too high');
+      return;
+    }
+
+    const airfield = this.state.buildings[airfieldId] as Airfield | undefined;
+    if (!airfield || airfield.type !== 'airfield' || airfield.ownerId !== playerId) {
+      console.log('[AIRCRAFT] Launch failed: airfield validation failed');
+      return;
+    }
+    if (airfield.destroyed) {
+      console.log('[AIRCRAFT] Launch failed: airfield destroyed');
+      return;
+    }
+
+    // Use the aircraft simulator to launch
+    const aircraft = this.aircraftSimulator.launchAircraft(
+      airfield,
+      aircraftType,
+      waypoints,
+      playerId
+    );
+
+    if (!aircraft) return;
+
+    // Add aircraft to state
+    this.state.aircraft[aircraft.id] = aircraft;
+
+    // Decrement aircraft count
+    if (aircraftType === 'fighter') {
+      airfield.fighterCount--;
+    } else if (aircraftType === 'radar') {
+      airfield.radarCount = (airfield.radarCount ?? 1) - 1;
+    } else {
+      airfield.bomberCount--;
+    }
+
+    console.log(`[AIRCRAFT] ${playerId} launched ${aircraftType} from ${airfieldId}`);
   }
 
   handleDebugCommand(command: string, value?: number, targetRegion?: string): void {
@@ -1389,12 +1564,13 @@ export class GameRoom {
     targetMissileId: string
   ): void {
     const missile = this.state.missiles[targetMissileId] as Missile | undefined;
-    if (!missile || missile.detonated || missile.intercepted || missile.type === 'interceptor') {
+    if (!missile || missile.detonated || missile.intercepted || isInterceptor(missile)) {
       // Invalid target - send empty response
       this.connectionManager.send(connection as any, {
         type: 'intercept_info',
         targetMissileId,
         availableSilos: [],
+        existingInterceptors: [],
       });
       return;
     }
@@ -1422,12 +1598,14 @@ export class GameRoom {
       // Check cooldown
       if (now - silo.lastFireTime < silo.fireCooldown) continue;
 
-      // Check if radar can see the missile
-      const detectingRadar = this.findDetectingRadar(missile, playerId);
-      if (!detectingRadar) continue;
+      // Find all radars that can see the missile
+      const trackingRadarIds = this.findAllTrackingRadars(missile, playerId);
+      if (trackingRadarIds.length === 0) continue;
 
-      // Calculate hit probability based on geometry
-      const hitProbability = this.calculateHitProbability(silo, missile);
+      // Calculate hit probability using the appropriate interceptor simulator
+      const hitProbability = USE_GUIDED_INTERCEPTORS
+        ? this.guidedInterceptorSimulator.estimateHitProbability(silo, missile, trackingRadarIds.length)
+        : this.railInterceptorSimulator.estimateHitProbability(silo, missile, trackingRadarIds.length);
 
       // Estimate where the intercept would occur
       const interceptProgress = this.estimateInterceptProgress(silo, missile);
@@ -1448,10 +1626,31 @@ export class GameRoom {
     // Sort by hit probability (best first)
     availableSilos.sort((a, b) => b.hitProbability - a.hitProbability);
 
+    // Find interceptors already targeting this missile
+    const existingInterceptors = getMissiles(this.state)
+      .filter(m => isInterceptor(m) && (m as any).targetId === targetMissileId && !m.detonated && !m.intercepted)
+      .map(m => {
+        const sourceSilo = this.state.buildings[m.sourceId] as Silo | undefined;
+        const territory = sourceSilo ? this.state.territories[sourceSilo.territoryId] : null;
+        // Estimate time to intercept based on rail interceptor's remaining flight time
+        let estimatedTimeToIntercept = 5000;  // Default
+        if (isRailInterceptor(m)) {
+          const railInterceptor = m as RailInterceptor;
+          const remainingProgress = 1 - railInterceptor.progress;
+          estimatedTimeToIntercept = remainingProgress * railInterceptor.rail.flightDuration;
+        }
+        return {
+          interceptorId: m.id,
+          sourceSiloName: territory ? `${territory.name} Silo` : 'Silo',
+          estimatedTimeToIntercept,
+        };
+      });
+
     this.connectionManager.send(connection as any, {
       type: 'intercept_info',
       targetMissileId,
       availableSilos,
+      existingInterceptors,
     });
   }
 
@@ -1464,7 +1663,7 @@ export class GameRoom {
     siloIds: string[]
   ): void {
     const missile = this.state.missiles[targetMissileId] as Missile | undefined;
-    if (!missile || missile.detonated || missile.intercepted || missile.type === 'interceptor') {
+    if (!missile || missile.detonated || missile.intercepted || isInterceptor(missile)) {
       return; // Invalid target
     }
 
@@ -1478,17 +1677,33 @@ export class GameRoom {
       // Check cooldown
       if (now - silo.lastFireTime < silo.fireCooldown) continue;
 
-      // Check if radar can see the missile
-      const detectingRadar = this.findDetectingRadar(missile, playerId);
-      if (!detectingRadar) continue;
+      // Find all radars that can see the missile
+      const trackingRadarIds = this.findAllTrackingRadars(missile, playerId);
+      if (trackingRadarIds.length === 0) continue;
 
-      // Launch interceptor
-      const interceptor = this.missileSimulator.launchInterceptor(
-        silo,
-        missile,
-        playerId,
-        detectingRadar.id
-      );
+      // Launch interceptor based on feature flag
+      let interceptor: RailInterceptor | GuidedInterceptor | null;
+
+      if (USE_GUIDED_INTERCEPTORS) {
+        interceptor = this.guidedInterceptorSimulator.launchInterceptor(
+          silo,
+          missile,
+          playerId,
+          trackingRadarIds
+        );
+      } else {
+        interceptor = this.railInterceptorSimulator.launchInterceptor(
+          silo,
+          missile,
+          playerId,
+          trackingRadarIds
+        );
+      }
+
+      if (!interceptor) {
+        console.log(`[MANUAL INTERCEPT] Could not calculate intercept from silo ${siloId}`);
+        continue;
+      }
 
       this.state.missiles[interceptor.id] = interceptor;
       silo.airDefenseAmmo--;
@@ -1500,10 +1715,13 @@ export class GameRoom {
         missileId: interceptor.id,
         playerId,
         sourcePosition: silo.position,
-        targetPosition: interceptor.targetPosition || silo.position,
+        targetPosition: interceptor.geoTargetPosition
+          ? geoToPixel(interceptor.geoTargetPosition, MAP_WIDTH, MAP_HEIGHT)
+          : silo.position,
       });
 
-      console.log(`[MANUAL INTERCEPT] Player ${playerId} launched interceptor from silo ${siloId} at ICBM ${targetMissileId}`);
+      const interceptorType = USE_GUIDED_INTERCEPTORS ? 'guided' : 'rail';
+      console.log(`[MANUAL INTERCEPT] Player ${playerId} launched ${interceptorType} interceptor from silo ${siloId} at ICBM ${targetMissileId}`);
     }
   }
 
@@ -1547,5 +1765,266 @@ export class GameRoom {
     const interceptProgress = Math.min(0.95, missile.progress + missileToTarget * 0.5);
 
     return interceptProgress;
+  }
+
+  /**
+   * Handle terminal email from one player to another
+   */
+  handleTerminalEmail(
+    fromPlayerId: string,
+    toPlayerId: string,
+    subject: string,
+    body: string
+  ): void {
+    const fromPlayer = this.state.players[fromPlayerId];
+    const toPlayer = this.state.players[toPlayerId];
+
+    if (!fromPlayer || !toPlayer) {
+      console.log(`[EMAIL] Invalid sender or recipient`);
+      return;
+    }
+
+    // Find the recipient's connection
+    const lobbyPlayer = this.lobby.getPlayers().find(p => p.id === toPlayerId);
+    if (!lobbyPlayer) {
+      console.log(`[EMAIL] Recipient ${toPlayerId} not found in lobby`);
+      return;
+    }
+
+    const connection = this.connectionManager.getConnection(lobbyPlayer.connectionId);
+    if (!connection) {
+      console.log(`[EMAIL] Recipient ${toPlayerId} not connected`);
+      return;
+    }
+
+    // Send email to recipient
+    this.connectionManager.send(connection, {
+      type: 'terminal_email_received',
+      fromPlayerId,
+      fromPlayerName: fromPlayer.name,
+      subject,
+      body,
+      timestamp: Date.now(),
+    });
+
+    console.log(`[EMAIL] ${fromPlayer.name} -> ${toPlayer.name}: ${subject}`);
+  }
+
+  // ============ HACKING SYSTEM METHODS ============
+
+  /**
+   * Process results from hacking system update
+   */
+  private processHackingResults(result: import('./HackingSystem').HackTickResult): void {
+    // Send progress updates to attackers
+    for (const update of result.progressUpdates) {
+      const hack = this.hackingSystem.getHack(update.hackId);
+      if (!hack) continue;
+
+      const attackerConnection = this.getPlayerConnection(hack.attackerId);
+      if (attackerConnection) {
+        this.connectionManager.send(attackerConnection, {
+          type: 'hack_progress',
+          hackId: update.hackId,
+          progress: update.progress,
+          traceProgress: update.traceProgress,
+          status: hack.status as 'connecting' | 'active',
+        });
+      }
+    }
+
+    // Handle completed hacks
+    for (const { hack, compromise } of result.completedHacks) {
+      // Notify attacker of success
+      const attackerConnection = this.getPlayerConnection(hack.attackerId);
+      if (attackerConnection) {
+        this.connectionManager.send(attackerConnection, {
+          type: 'hack_complete',
+          hackId: hack.id,
+          targetId: hack.targetId,
+          hackType: hack.hackType,
+          compromise,
+        });
+      }
+
+      // Notify victim of compromise
+      const victimConnection = this.getPlayerConnection(hack.targetOwnerId);
+      if (victimConnection) {
+        this.connectionManager.send(victimConnection, {
+          type: 'system_compromised',
+          targetId: hack.targetId,
+          hackType: hack.hackType,
+          expiresAt: compromise.expiresAt,
+        });
+      }
+
+      console.log(`[HACK] ${hack.attackerId} successfully hacked ${hack.targetId} with ${hack.hackType}`);
+    }
+
+    // Handle traced hacks
+    for (const hack of result.tracedHacks) {
+      // Notify attacker they were caught
+      const attackerConnection = this.getPlayerConnection(hack.attackerId);
+      if (attackerConnection) {
+        this.connectionManager.send(attackerConnection, {
+          type: 'hack_traced',
+          hackId: hack.id,
+          targetId: hack.targetId,
+          revealedToEnemy: true,
+        });
+      }
+
+      // Notify victim with attacker info
+      const victimConnection = this.getPlayerConnection(hack.targetOwnerId);
+      if (victimConnection) {
+        const attacker = this.state.players[hack.attackerId];
+        this.connectionManager.send(victimConnection, {
+          type: 'intrusion_alert',
+          alert: {
+            id: hack.id,
+            targetId: hack.targetId,
+            detectedAt: hack.startTime,
+            traceProgress: 100,
+            attackerRevealed: hack.attackerId,
+          },
+        });
+      }
+
+      console.log(`[HACK] ${hack.attackerId} was traced while hacking ${hack.targetId}`);
+    }
+  }
+
+  /**
+   * Get connection for a player
+   */
+  private getPlayerConnection(playerId: string): Connection | null {
+    const lobbyPlayer = this.lobby.getPlayers().find((p) => p.id === playerId);
+    if (!lobbyPlayer) return null;
+    return this.connectionManager.getConnection(lobbyPlayer.connectionId) || null;
+  }
+
+  /**
+   * Handle scan request from player
+   */
+  handleHackScan(playerId: string): void {
+    const detectedBuildings = this.hackingSystem.scanForBuildings(this.state, playerId);
+
+    const connection = this.getPlayerConnection(playerId);
+    if (connection) {
+      this.connectionManager.send(connection, {
+        type: 'hack_scan_result',
+        detectedBuildings,
+      });
+    }
+
+    console.log(`[HACK] ${playerId} scanned, found ${detectedBuildings.length} enemy buildings`);
+  }
+
+  /**
+   * Handle hack start request from player
+   */
+  handleHackStart(
+    playerId: string,
+    targetId: string,
+    hackType: HackType,
+    proxyRoute?: string[]
+  ): void {
+    const result = this.hackingSystem.startHack(
+      this.state,
+      playerId,
+      targetId,
+      hackType,
+      proxyRoute
+    );
+
+    const connection = this.getPlayerConnection(playerId);
+    if (!connection) return;
+
+    if (result.success && result.hack) {
+      // Send initial progress update
+      this.connectionManager.send(connection, {
+        type: 'hack_progress',
+        hackId: result.hack.id,
+        progress: 0,
+        traceProgress: 0,
+        status: 'connecting',
+      });
+
+      console.log(`[HACK] ${playerId} started ${hackType} hack on ${targetId}`);
+    } else {
+      // Send error
+      this.connectionManager.send(connection, {
+        type: 'error',
+        code: 'hack_failed',
+        message: result.error || 'Hack failed',
+      });
+    }
+  }
+
+  /**
+   * Handle hack disconnect request from player
+   */
+  handleHackDisconnect(playerId: string, hackId: string): void {
+    const success = this.hackingSystem.disconnectHack(hackId, playerId);
+
+    const connection = this.getPlayerConnection(playerId);
+    if (connection && success) {
+      this.connectionManager.send(connection, {
+        type: 'hack_disconnected',
+        hackId,
+        reason: 'player',
+      });
+    }
+
+    console.log(`[HACK] ${playerId} disconnected from hack ${hackId}`);
+  }
+
+  /**
+   * Handle purge request from player
+   */
+  handleHackPurge(playerId: string, targetId: string): void {
+    const success = this.hackingSystem.purgeCompromise(targetId, playerId);
+
+    if (success) {
+      console.log(`[HACK] ${playerId} purged compromise from ${targetId}`);
+    }
+  }
+
+  /**
+   * Handle trace request from player - returns current intrusion status
+   */
+  handleHackTrace(playerId: string): void {
+    const connection = this.getPlayerConnection(playerId);
+    if (!connection) return;
+
+    const alerts = this.hackingSystem.getIntrusionAlerts(playerId);
+    const compromises = this.hackingSystem.getCompromisesForPlayer(playerId);
+
+    this.connectionManager.send(connection, {
+      type: 'intrusion_status',
+      activeIntrusions: alerts,
+      compromisedBuildings: compromises,
+    });
+  }
+
+  /**
+   * Check if a radar is blinded by hacking
+   */
+  isRadarBlinded(radarId: string): boolean {
+    return this.hackingSystem.isCompromised(radarId, 'blind_radar');
+  }
+
+  /**
+   * Check if a silo mode is locked by hacking
+   */
+  isSiloModeLocked(siloId: string): boolean {
+    return this.hackingSystem.isCompromised(siloId, 'lock_silo');
+  }
+
+  /**
+   * Get hacking system for external access
+   */
+  getHackingSystem(): HackingSystem {
+    return this.hackingSystem;
   }
 }

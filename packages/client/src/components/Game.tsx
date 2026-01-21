@@ -1,9 +1,11 @@
 import { useRef, useEffect, useCallback } from 'react';
 import { useGameStore } from '../stores/gameStore';
 import { useNetworkStore } from '../stores/networkStore';
+import { useTerminalStore } from '../stores/terminalStore';
 import { GlobeRenderer } from '../renderer/GlobeRenderer';
-import { type Vector2, type Silo, type SiloMode, type GeoPosition, type Building, geoToPixel } from '@defcon/shared';
+import { type Vector2, type Silo, type SiloMode, type GeoPosition, type Building, type AircraftType, geoToPixel } from '@defcon/shared';
 import type { ManualInterceptState } from '../stores/gameStore';
+import Terminal from './Terminal/Terminal';
 
 // Map dimensions for converting geo to pixel (must match server)
 const MAP_WIDTH = 1000;
@@ -24,6 +26,7 @@ export default function Game() {
   const sendDebugCommand = useNetworkStore((s) => s.sendDebugCommand);
   const enableAI = useNetworkStore((s) => s.enableAI);
   const disableAI = useNetworkStore((s) => s.disableAI);
+  const launchAircraft = useNetworkStore((s) => s.launchAircraft);
   const gameEnded = useGameStore((s) => s.gameEnded);
 
   // Manual intercept
@@ -34,18 +37,32 @@ export default function Game() {
   const clearInterceptSelection = useGameStore((s) => s.clearInterceptSelection);
   const manualInterceptState = useGameStore((s) => s.manualIntercept);
 
-  // Debug panel keyboard toggle
+  // Terminal toggle
+  const toggleTerminal = useTerminalStore((s) => s.toggle);
+  const isTerminalOpen = useTerminalStore((s) => s.isOpen);
+
+  // Debug panel and terminal keyboard toggle
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // Ignore if typing in an input
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+        return;
+      }
+
       if (e.key === 'd' || e.key === 'D') {
         if (rendererRef.current) {
           rendererRef.current.toggleDebugPanel();
         }
       }
+      // Toggle terminal with backtick key
+      if (e.key === '`') {
+        e.preventDefault();
+        toggleTerminal();
+      }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
+  }, [toggleTerminal]);
 
   // Convert geo position to pixel position for server
   const geoToPixelPosition = useCallback((geo: GeoPosition): Vector2 => {
@@ -81,17 +98,39 @@ export default function Game() {
 
   // Handle building click
   const handleBuildingClick = useCallback(
-    (building: Building) => {
-      const playerId = useGameStore.getState().playerId;
-      if (building.ownerId === playerId) {
+    (building: Building | null) => {
+      const state = useGameStore.getState();
+
+      // Handle deselection (null building)
+      if (!building) {
+        selectBuilding(null);
+        if (rendererRef.current) {
+          rendererRef.current.setSelectedBuilding(null);
+        }
+        return;
+      }
+
+      if (building.ownerId === state.playerId) {
+        // Select own buildings
         selectBuilding(building);
         // Update renderer's selected building
         if (rendererRef.current) {
           rendererRef.current.setSelectedBuilding(building);
         }
+      } else if (state.gameState?.defconLevel === 1) {
+        // Enemy building - try to target it with selected silo
+        const selectedBuilding = state.selectedBuilding;
+        if (selectedBuilding?.type === 'silo') {
+          const silo = selectedBuilding as Silo;
+          if (silo.mode === 'icbm' && silo.missileCount > 0) {
+            // Launch missile at enemy building position
+            const position = geoToPixel(building.geoPosition || { lat: 0, lng: 0 }, MAP_WIDTH, MAP_HEIGHT);
+            launchMissile(silo.id, position);
+          }
+        }
       }
     },
-    [selectBuilding]
+    [selectBuilding, launchMissile]
   );
 
   // Handle mode change from HUD
@@ -119,6 +158,14 @@ export default function Game() {
       launchSatellite(facilityId, inclination);
     },
     [launchSatellite]
+  );
+
+  // Handle aircraft launch from HUD
+  const handleLaunchAircraft = useCallback(
+    (airfieldId: string, aircraftType: AircraftType, waypoints: GeoPosition[]) => {
+      launchAircraft(airfieldId, aircraftType, waypoints);
+    },
+    [launchAircraft]
   );
 
   // Handle enemy ICBM click - open manual intercept panel
@@ -166,6 +213,7 @@ export default function Game() {
     renderer.setOnModeChange(handleModeChange);
     renderer.setOnPlacementMode(handlePlacementModeChange);
     renderer.setOnLaunchSatellite(handleLaunchSatellite);
+    renderer.setOnLaunchAircraft(handleLaunchAircraft);
     renderer.setOnEnemyICBMClick(handleEnemyICBMClick);
 
     // Set up manual intercept HUD callbacks
@@ -205,7 +253,7 @@ export default function Game() {
       unsubscribe();
       renderer.destroy();
     };
-  }, [handleGlobeClick, handleBuildingClick, handleModeChange, handlePlacementModeChange, handleLaunchSatellite, sendDebugCommand, enableAI, disableAI, handleEnemyICBMClick, handleToggleInterceptSilo, handleLaunchIntercept, handleCancelIntercept]);
+  }, [handleGlobeClick, handleBuildingClick, handleModeChange, handlePlacementModeChange, handleLaunchSatellite, handleLaunchAircraft, sendDebugCommand, enableAI, disableAI, handleEnemyICBMClick, handleToggleInterceptSilo, handleLaunchIntercept, handleCancelIntercept]);
 
   // Handle right click to cancel
   const handleContextMenu = useCallback(
@@ -256,6 +304,7 @@ export default function Game() {
         onContextMenu={handleContextMenu}
       />
       {gameEnded && <GameEndOverlay />}
+      <Terminal />
     </div>
   );
 }

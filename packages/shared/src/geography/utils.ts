@@ -290,6 +290,52 @@ function ballisticAltitude(t: number): number {
 }
 
 /**
+ * Compute an asymmetric ballistic altitude profile for realistic ICBM trajectories.
+ *
+ * Creates a curve that:
+ * - Rises steeply during boost phase (steep climb angle)
+ * - Flattens at apex during midcourse
+ * - Descends at a shallow 20-30° angle during reentry
+ *
+ * The asymmetry is achieved by using sin^reentrySharpness where:
+ * - reentrySharpness < 1 gives shallower reentry (more time at high altitude)
+ * - reentrySharpness = 1 gives symmetric sin curve
+ * - reentrySharpness > 1 gives steeper reentry
+ *
+ * Default reentrySharpness of 0.6 gives a realistic shallow reentry angle (~25°)
+ *
+ * @param t Progress along trajectory (0-1)
+ * @param reentrySharpness Controls descent angle (0.5-1.0, default 0.6)
+ * @returns Normalized altitude (0-1)
+ */
+export function getBallisticAltitude(t: number, reentrySharpness: number = 0.6): number {
+  const progress = Math.max(0, Math.min(1, t));
+
+  // Use sin^n curve where n < 1 gives flatter top and shallower descent
+  // At t=0.9 with n=0.6: sin(0.9π)^0.6 ≈ 0.52 (52% of max altitude)
+  // This gives a shallow reentry angle compared to parabola
+  const sinCurve = Math.sin(progress * Math.PI);
+
+  // Guard against negative values from numerical precision
+  if (sinCurve <= 0) return 0;
+
+  return Math.pow(sinCurve, reentrySharpness);
+}
+
+/**
+ * Get altitude at a specific progress for an ICBM trajectory.
+ * Uses the asymmetric ballistic profile for realistic reentry angles.
+ *
+ * @param progress Flight progress (0-1)
+ * @param apexHeight Maximum altitude at midcourse
+ * @param reentrySharpness Controls reentry angle (default 0.6 for ~25° reentry)
+ * @returns Altitude in globe units
+ */
+export function getIcbmAltitude(progress: number, apexHeight: number, reentrySharpness: number = 0.6): number {
+  return apexHeight * getBallisticAltitude(progress, reentrySharpness);
+}
+
+/**
  * Ground progress - use linear (constant speed) for smooth motion.
  * The visual effect of "slow launch" comes from the steep altitude climb,
  * not from actually slowing the ground speed. This avoids velocity
@@ -366,8 +412,9 @@ export function getMissilePosition3D(
     altitudeVariation = 0.95 + seededRandom(seed + 2) * 0.1; // 0.95 to 1.05
   }
 
-  // Get smooth altitude from ballistic curve (returns 0-1+ range)
-  const altitudeFactor = ballisticAltitude(t);
+  // Get smooth altitude from asymmetric ballistic curve (shallow reentry)
+  // Uses reentrySharpness=0.6 for realistic 20-30° reentry angle
+  const altitudeFactor = getBallisticAltitude(t, 0.6);
   const altitude = maxAltitude * altitudeVariation * altitudeFactor;
 
   // Move position outward from sphere center by altitude
@@ -575,6 +622,132 @@ export function satellitesCanCommunicate(
   const angularDistance = greatCircleDistance(sat1Pos, sat2Pos);
   const distanceDegrees = angularDistance * (180 / Math.PI);
   return distanceDegrees <= maxRangeDegrees;
+}
+
+/**
+ * Get 3D position along interceptor arc (similar to ICBM but with adjustable end altitude).
+ * Used for rail-based interceptors that follow pre-calculated ballistic paths.
+ *
+ * @param startGeo Launch position
+ * @param endGeo Target/intercept position
+ * @param progress 0-1 along the flight path
+ * @param apexHeight Maximum altitude at the peak of the arc
+ * @param endAltitude Altitude at the end point (intercept altitude)
+ * @param sphereRadius Globe radius
+ * @returns 3D position {x, y, z}
+ */
+export function getInterceptorPosition3D(
+  startGeo: GeoCoordinate,
+  endGeo: GeoCoordinate,
+  progress: number,
+  apexHeight: number,
+  endAltitude: number,
+  sphereRadius: number
+): { x: number; y: number; z: number } {
+  // Clamp progress
+  const t = Math.max(0, Math.min(1, progress));
+
+  // Get ground position along great circle
+  const groundGeo = geoInterpolate(startGeo, endGeo, t);
+  const groundPos = geoToSphere(groundGeo, sphereRadius);
+
+  // Safety check for NaN
+  if (isNaN(groundPos.x) || isNaN(groundPos.y) || isNaN(groundPos.z)) {
+    const startPos = geoToSphere(startGeo, sphereRadius);
+    return startPos;
+  }
+
+  // Calculate altitude using modified parabola that ends at endAltitude instead of 0
+  // Standard parabola: h(t) = 4 * apex * t * (1-t) goes 0 -> apex -> 0
+  // Modified: we want 0 -> apex -> endAltitude
+  // Use: h(t) = a*t^2 + b*t + c where c=0, h(0.5)=apex, h(1)=endAltitude
+  // This gives: a = -4*apex + 4*endAltitude, b = 4*apex - 3*endAltitude
+
+  const standardArc = 4 * apexHeight * t * (1 - t);  // Standard 0->apex->0
+  const endContribution = t * endAltitude;  // Linear interpolation to end altitude
+  const altitude = standardArc + endContribution;
+
+  // Move position outward from sphere center by altitude
+  const len = Math.sqrt(groundPos.x * groundPos.x + groundPos.y * groundPos.y + groundPos.z * groundPos.z);
+
+  // Safety check for zero length
+  if (len < 0.001) {
+    return geoToSphere(startGeo, sphereRadius + altitude);
+  }
+
+  const scale = (sphereRadius + altitude) / len;
+
+  return {
+    x: groundPos.x * scale,
+    y: groundPos.y * scale,
+    z: groundPos.z * scale,
+  };
+}
+
+/**
+ * Get altitude along interceptor arc at given progress.
+ * Used to calculate where on an ICBM's path the interceptor will meet it.
+ */
+export function getInterceptorAltitude(
+  progress: number,
+  apexHeight: number,
+  endAltitude: number
+): number {
+  const t = Math.max(0, Math.min(1, progress));
+  const standardArc = 4 * apexHeight * t * (1 - t);
+  const endContribution = t * endAltitude;
+  return standardArc + endContribution;
+}
+
+/**
+ * Get the direction vector of an interceptor at current position.
+ * Uses backward difference near the end to avoid zero-length vectors.
+ */
+export function getInterceptorDirection3D(
+  startGeo: GeoCoordinate,
+  endGeo: GeoCoordinate,
+  progress: number,
+  apexHeight: number,
+  endAltitude: number,
+  sphereRadius: number
+): { x: number; y: number; z: number } {
+  const delta = 0.01;
+
+  // When near end, look backwards to compute direction
+  let prevProgress: number;
+  let currProgress: number;
+
+  if (progress >= 0.99) {
+    // Near end: use backward difference
+    prevProgress = progress - delta;
+    currProgress = progress;
+  } else {
+    // Normal: use forward difference
+    prevProgress = progress;
+    currProgress = progress + delta;
+  }
+
+  const prevPos = getInterceptorPosition3D(startGeo, endGeo, prevProgress, apexHeight, endAltitude, sphereRadius);
+  const currPos = getInterceptorPosition3D(startGeo, endGeo, currProgress, apexHeight, endAltitude, sphereRadius);
+
+  const dx = currPos.x - prevPos.x;
+  const dy = currPos.y - prevPos.y;
+  const dz = currPos.z - prevPos.z;
+
+  const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  if (len < 0.0001) {
+    // Fallback: point toward end position from start
+    const startPos = getInterceptorPosition3D(startGeo, endGeo, 0, apexHeight, endAltitude, sphereRadius);
+    const endPos = getInterceptorPosition3D(startGeo, endGeo, 1, apexHeight, endAltitude, sphereRadius);
+    const fdx = endPos.x - startPos.x;
+    const fdy = endPos.y - startPos.y;
+    const fdz = endPos.z - startPos.z;
+    const flen = Math.sqrt(fdx * fdx + fdy * fdy + fdz * fdz);
+    if (flen < 0.0001) return { x: 0, y: 1, z: 0 };
+    return { x: fdx / flen, y: fdy / flen, z: fdz / flen };
+  }
+
+  return { x: dx / len, y: dy / len, z: dz / len };
 }
 
 /**

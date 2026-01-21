@@ -1,6 +1,13 @@
 import { create } from 'zustand';
+import type {
+  HackType,
+  ActiveHack,
+  SystemCompromise,
+  DetectedBuilding,
+  IntrusionAlert,
+} from '@defcon/shared';
 
-export type TerminalTab = 'email' | 'installations' | 'commands' | 'options';
+export type TerminalTab = 'email' | 'installations' | 'commands' | 'options' | 'network';
 
 export type TerminalTheme = 'defcon' | 'uplink' | 'amber' | 'white' | 'matrix';
 
@@ -33,6 +40,17 @@ export interface CommandHistoryEntry {
   isError?: boolean;
 }
 
+// Active hack state for UI
+export interface ActiveHackState {
+  hackId: string;
+  targetId: string;
+  targetName: string;
+  hackType: HackType;
+  progress: number;
+  traceProgress: number;
+  status: 'connecting' | 'active';
+}
+
 interface TerminalState {
   // UI State
   isOpen: boolean;
@@ -52,6 +70,12 @@ interface TerminalState {
   lastAIEventTime: number;
   glitchActive: boolean;
   glitchIntensity: number;  // 0-1
+
+  // Hacking
+  detectedBuildings: DetectedBuilding[];
+  activeHack: ActiveHackState | null;
+  compromisedBuildings: SystemCompromise[];
+  intrusionAlerts: IntrusionAlert[];
 
   // Actions
   toggle: () => void;
@@ -79,6 +103,16 @@ interface TerminalState {
   increasePresence: (amount: number) => void;
   setGlitch: (active: boolean, intensity?: number) => void;
   triggerAIEvent: () => void;
+
+  // Hacking actions
+  setDetectedBuildings: (buildings: DetectedBuilding[]) => void;
+  setActiveHack: (hack: ActiveHackState | null) => void;
+  updateHackProgress: (hackId: string, progress: number, traceProgress: number, status: 'connecting' | 'active') => void;
+  setCompromisedBuildings: (compromises: SystemCompromise[]) => void;
+  addCompromise: (compromise: SystemCompromise) => void;
+  setIntrusionAlerts: (alerts: IntrusionAlert[]) => void;
+  addIntrusionAlert: (alert: IntrusionAlert) => void;
+  removeIntrusionAlert: (targetId: string) => void;
 }
 
 let emailIdCounter = 0;
@@ -101,6 +135,12 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
   lastAIEventTime: 0,
   glitchActive: false,
   glitchIntensity: 0,
+
+  // Hacking state
+  detectedBuildings: [],
+  activeHack: null,
+  compromisedBuildings: [],
+  intrusionAlerts: [],
 
   // UI Actions
   toggle: () => set((state) => {
@@ -181,5 +221,56 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
 
   triggerAIEvent: () => {
     set({ lastAIEventTime: Date.now() });
+  },
+
+  // Hacking actions
+  setDetectedBuildings: (buildings) => {
+    set({ detectedBuildings: buildings });
+  },
+
+  setActiveHack: (hack) => {
+    set({ activeHack: hack });
+  },
+
+  updateHackProgress: (hackId, progress, traceProgress, status) => {
+    set((state) => {
+      if (state.activeHack && state.activeHack.hackId === hackId) {
+        return {
+          activeHack: {
+            ...state.activeHack,
+            progress,
+            traceProgress,
+            status,
+          },
+        };
+      }
+      return state;
+    });
+  },
+
+  setCompromisedBuildings: (compromises) => {
+    set({ compromisedBuildings: compromises });
+  },
+
+  addCompromise: (compromise) => {
+    set((state) => ({
+      compromisedBuildings: [...state.compromisedBuildings, compromise],
+    }));
+  },
+
+  setIntrusionAlerts: (alerts) => {
+    set({ intrusionAlerts: alerts });
+  },
+
+  addIntrusionAlert: (alert) => {
+    set((state) => ({
+      intrusionAlerts: [...state.intrusionAlerts, alert],
+    }));
+  },
+
+  removeIntrusionAlert: (targetId) => {
+    set((state) => ({
+      intrusionAlerts: state.intrusionAlerts.filter((a) => a.targetId !== targetId),
+    }));
   },
 }));

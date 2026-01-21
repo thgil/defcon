@@ -3,6 +3,7 @@ import { useTerminalStore, TERMINAL_THEMES } from '../../stores/terminalStore';
 import { useEvilAI } from '../../hooks/useEvilAI';
 import { useSystemEmails } from '../../hooks/useSystemEmails';
 import TerminalScreen from './TerminalScreen';
+import HackingOverlay from './HackingOverlay';
 import './Terminal.css';
 
 export default function Terminal() {
@@ -139,6 +140,9 @@ export default function Terminal() {
           style={{ opacity: glitchIntensity * 0.5 }}
         />
       )}
+
+      {/* Hacking overlay */}
+      <HackingOverlay />
     </div>
   );
 }

@@ -15,6 +15,7 @@ import {
   geoInterpolate,
   greatCircleDistance,
   isPhysicsMissile,
+  isRailInterceptor,
   geoToCartesian,
   vec3Normalize,
   Vector3,
@@ -24,7 +25,7 @@ import {
 const MAP_WIDTH = 1000;
 const MAP_HEIGHT = 700;
 
-// Globe radius (must match client and InterceptorPhysics)
+// Globe radius (must match client)
 const GLOBE_RADIUS = 100;
 
 // Interceptor speed multiplier (faster than ICBMs, but not too fast)
@@ -134,7 +135,7 @@ export class MissileSimulator {
 
     // Flight duration based on distance with a reasonable minimum for short range
     // Minimum 6 seconds ensures short-range missiles are still visible
-    const flightDuration = Math.max(6000, (distance / this.missileSpeed) * 1000);
+    const flightDuration = Math.max(8000, (distance / this.missileSpeed) * 1000);
 
     console.log(`[MISSILE] distance=${distance.toFixed(1)}, duration=${(flightDuration/1000).toFixed(1)}s, speed=${(distance / (flightDuration/1000)).toFixed(2)} units/s`);
 
@@ -150,7 +151,7 @@ export class MissileSimulator {
       launchTime: Date.now(),
       flightDuration,
       progress: 0,
-      apexHeight: Math.min(distance * 0.3, 200),
+      apexHeight: Math.min(distance * 0.2, 60),
       intercepted: false,
       detonated: false,
       // Geographic data for 3D globe
@@ -163,43 +164,54 @@ export class MissileSimulator {
   update(state: GameState, deltaSeconds: number): GameEvent[] {
     const events: GameEvent[] = [];
 
-    // Physics missiles (new interceptors) are updated by InterceptorPhysics
+    // Physics missiles are updated by their own simulator
+    // Rail interceptors are updated by RailInterceptorSimulator
     // This method only handles legacy ICBMs
 
-    // Update all ICBM positions (skip physics missiles)
+    // Update all ICBM positions (skip interceptors)
     for (const missile of Object.values(state.missiles)) {
       if (missile.detonated || missile.intercepted) continue;
 
-      // Skip physics-based missiles - they're updated by InterceptorPhysics
+      // Skip physics-based missiles - they're updated by their own simulator
       if (isPhysicsMissile(missile)) continue;
 
+      // Skip rail interceptors - they're updated by RailInterceptorSimulator
+      if (isRailInterceptor(missile)) continue;
+
+      // Cast to Missile type (we've eliminated other types)
+      const icbm = missile as Missile;
+
       // Update progress
-      const progressDelta = (deltaSeconds * 1000) / missile.flightDuration;
-      missile.progress = Math.min(1, missile.progress + progressDelta);
+      const progressDelta = (deltaSeconds * 1000) / icbm.flightDuration;
+      icbm.progress = Math.min(1, icbm.progress + progressDelta);
 
       // Calculate current position along arc (2D)
-      missile.currentPosition = this.calculateArcPosition(missile);
+      icbm.currentPosition = this.calculateArcPosition(icbm);
 
       // Update geo position along great circle path (3D)
-      if (missile.geoLaunchPosition && missile.geoTargetPosition) {
-        missile.geoCurrentPosition = geoInterpolate(
-          missile.geoLaunchPosition,
-          missile.geoTargetPosition,
-          missile.progress
+      if (icbm.geoLaunchPosition && icbm.geoTargetPosition) {
+        icbm.geoCurrentPosition = geoInterpolate(
+          icbm.geoLaunchPosition,
+          icbm.geoTargetPosition,
+          icbm.progress
         );
       }
     }
 
-    // Check for ICBM impacts (skip physics missiles)
+    // Check for ICBM impacts (skip interceptors)
     for (const missile of Object.values(state.missiles)) {
       if (missile.detonated || missile.intercepted) continue;
 
       // Skip physics-based missiles
       if (isPhysicsMissile(missile)) continue;
 
-      if (missile.progress >= 1) {
+      // Skip rail interceptors
+      if (isRailInterceptor(missile)) continue;
+
+      const icbm = missile as Missile;
+      if (icbm.progress >= 1) {
         // ICBM impact
-        const impactEvents = this.handleImpact(missile, state);
+        const impactEvents = this.handleImpact(icbm, state);
         events.push(...impactEvents);
       }
     }
@@ -312,10 +324,8 @@ export class MissileSimulator {
   }
 
   private calculateDamage(distance: number, radius: number, population: number): number {
-    // Damage falls off with distance squared (inverse square law)
-    const falloff = 1 - Math.pow(distance / radius, 2);
-    const baseDamage = population * 0.5; // 50% casualties at ground zero
-    return Math.floor(baseDamage * Math.max(0, falloff));
+    // Flat 50% damage to any city within blast radius
+    return Math.floor(population * 0.5);
   }
 
   private calculateBuildingDamage(distance: number, radius: number): number {
