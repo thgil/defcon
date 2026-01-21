@@ -19,6 +19,11 @@ import {
   type Satellite,
   type SatelliteLaunchFacility,
   type Airfield,
+  type HackingNode,
+  type HackingConnection,
+  type HackingRoute,
+  type NetworkHackTrace,
+  type HackingNetworkState,
   geoToSphere,
   sphereToGeo,
   getMissilePosition3D,
@@ -43,6 +48,8 @@ import {
   isGuidedInterceptor,
   isInterceptor as isInterceptorType,
   GLOBAL_MISSILE_SPEED_MULTIPLIER,
+  createConnectionId,
+  getRouteSegmentProgress,
 } from '@defcon/shared';
 import { HUDRenderer } from './HUDRenderer';
 
@@ -66,6 +73,13 @@ const COLORS = {
   satelliteOrbit: 0x4466aa,
   satelliteVision: 0x2244aa,
   communicationLink: 0x00ff88,
+  // Hacking network colors
+  hackingNode: 0x00ffff,
+  hackingNodeGlow: 0x00aaff,
+  hackingConnection: 0x004466,
+  hackingConnectionActive: 0x00aaff,
+  hackingTrace: 0x00ff88,
+  hackingTraceGlow: 0x00ffaa,
 };
 
 const GLOBE_RADIUS = 100;
@@ -77,6 +91,12 @@ const SATELLITE_ORBITAL_ALTITUDE = 120;  // Globe units above surface (above int
 const SATELLITE_VISION_RANGE_DEGREES = 12;
 const SATELLITE_RADAR_COMM_RANGE = 90;  // Range to communicate with radar (degrees) - line of sight from orbit
 const SATELLITE_SAT_COMM_RANGE = 90;    // Range for satellite-to-satellite relay (degrees)
+
+// Hacking network configuration
+const HACKING_CONNECTION_HEIGHT = 15;   // Height above globe for connection arcs
+const HACKING_NODE_PULSE_SPEED = 2;     // Pulse animation speed
+const HACKING_TRACE_SEGMENTS = 64;      // Number of segments for curved paths
+const HACKING_TRACE_HEAD_LENGTH = 0.08; // Length of the trace head (0-1)
 
 // Calculate appropriate max altitude based on great-circle distance
 function calculateMissileAltitude(startGeo: GeoPosition, endGeo: GeoPosition): number {
@@ -139,6 +159,7 @@ export class GlobeRenderer {
   private coastlineGroup: THREE.Group;
   private borderGroup: THREE.Group;
   private airspaceGroup: THREE.Group;
+  private hackingNetworkGroup: THREE.Group;
 
   // View toggles state
   private viewToggles = {
@@ -149,6 +170,7 @@ export class GlobeRenderer {
     coastlines: true,
     borders: true,
     airspaces: false,
+    network: false,
   };
 
   // Object maps for efficient updates
@@ -173,6 +195,19 @@ export class GlobeRenderer {
     visionCircle: THREE.Line; // Vision coverage circle on surface
     commLinks: THREE.Line[];  // Communication relay lines
   }>();
+
+  // Hacking network visualization state
+  private hackingNetworkState: HackingNetworkState | null = null;
+  private hackingNodeMarkers = new Map<string, THREE.Group>();
+  private hackingConnectionLines = new Map<string, THREE.Line>();
+  private hackingActiveTraces = new Map<string, {
+    traceHead: THREE.Mesh;
+    traceLine: THREE.Line;
+    tracePoints: THREE.Vector3[];  // Pre-calculated curve points
+    glowLine: THREE.Line;
+  }>();
+  private hackingAnimationTime = 0;
+
   private territoryMeshes = new Map<string, THREE.Mesh>();
   private radarCoverageBeams = new Map<string, THREE.Group>();
   private radarSweepLines = new Map<string, { line: THREE.Line; center: THREE.Vector3; outward: THREE.Vector3 }>();
@@ -366,6 +401,8 @@ export class GlobeRenderer {
     this.borderGroup = new THREE.Group();
     this.airspaceGroup = new THREE.Group();
     this.airspaceGroup.visible = this.viewToggles.airspaces;
+    this.hackingNetworkGroup = new THREE.Group();
+    this.hackingNetworkGroup.visible = this.viewToggles.network;
 
     this.placementPreviewGroup = new THREE.Group();
     this.commChainGroup = new THREE.Group();
@@ -389,6 +426,7 @@ export class GlobeRenderer {
     this.scene.add(this.interceptPredictionGroup);
     this.scene.add(this.satCommGroup);
     this.scene.add(this.aircraftGroup);
+    this.scene.add(this.hackingNetworkGroup);
 
     // Create starfield background
     this.createStarfield();
@@ -6754,6 +6792,9 @@ export class GlobeRenderer {
       // Update fading missiles (post-detonation effects)
       this.updateFadingMissiles();
 
+      // Animate hacking network
+      this.animateHackingNetwork(deltaTime);
+
       // Apply view toggle visibility
       this.applyViewToggles();
 
@@ -6873,15 +6914,460 @@ export class GlobeRenderer {
       objects.trail.visible = this.viewToggles.trails;
       // Head is always visible
     }
+
+    // Apply hacking network visibility
+    this.hackingNetworkGroup.visible = this.viewToggles.network;
   }
 
   // Public setter for view toggles
-  setViewToggle(toggle: 'radar' | 'grid' | 'labels' | 'trails', value: boolean): void {
+  setViewToggle(toggle: 'radar' | 'grid' | 'labels' | 'trails' | 'network', value: boolean): void {
     this.viewToggles[toggle] = value;
   }
 
-  getViewToggles(): { radar: boolean; grid: boolean; labels: boolean; trails: boolean } {
+  getViewToggles(): { radar: boolean; grid: boolean; labels: boolean; trails: boolean; network: boolean } {
     return { ...this.viewToggles };
+  }
+
+  // ============================================================================
+  // Hacking Network Visualization
+  // ============================================================================
+
+  /**
+   * Set the hacking network state from the store
+   */
+  setHackingNetworkState(state: HackingNetworkState): void {
+    const previousState = this.hackingNetworkState;
+    this.hackingNetworkState = state;
+
+    // Update visibility from state
+    this.viewToggles.network = state.networkVisible;
+    this.hackingNetworkGroup.visible = state.networkVisible;
+
+    // Only rebuild if state changed significantly
+    if (!previousState ||
+        Object.keys(state.nodes).length !== Object.keys(previousState.nodes).length ||
+        Object.keys(state.connections).length !== Object.keys(previousState.connections).length) {
+      this.rebuildHackingNetwork();
+    }
+
+    // Update active traces
+    this.updateHackingTraces();
+  }
+
+  /**
+   * Toggle hacking network visibility
+   */
+  toggleHackingNetwork(): void {
+    this.viewToggles.network = !this.viewToggles.network;
+    this.hackingNetworkGroup.visible = this.viewToggles.network;
+  }
+
+  /**
+   * Rebuild the entire hacking network visualization
+   */
+  private rebuildHackingNetwork(): void {
+    if (!this.hackingNetworkState) return;
+
+    // Clear existing objects
+    this.clearHackingNetwork();
+
+    // Create node markers
+    for (const node of Object.values(this.hackingNetworkState.nodes)) {
+      const marker = this.createHackingNodeMarker(node);
+      this.hackingNodeMarkers.set(node.id, marker);
+      this.hackingNetworkGroup.add(marker);
+    }
+
+    // Create connection lines
+    for (const connection of Object.values(this.hackingNetworkState.connections)) {
+      const fromNode = this.hackingNetworkState.nodes[connection.fromNodeId];
+      const toNode = this.hackingNetworkState.nodes[connection.toNodeId];
+
+      if (fromNode && toNode) {
+        const line = this.createHackingConnectionLine(fromNode, toNode, connection);
+        this.hackingConnectionLines.set(connection.id, line);
+        this.hackingNetworkGroup.add(line);
+      }
+    }
+  }
+
+  /**
+   * Clear all hacking network visualization objects
+   */
+  private clearHackingNetwork(): void {
+    // Clear node markers
+    for (const marker of this.hackingNodeMarkers.values()) {
+      this.hackingNetworkGroup.remove(marker);
+      this.disposeGroup(marker);
+    }
+    this.hackingNodeMarkers.clear();
+
+    // Clear connection lines
+    for (const line of this.hackingConnectionLines.values()) {
+      this.hackingNetworkGroup.remove(line);
+      (line.geometry as THREE.BufferGeometry).dispose();
+      (line.material as THREE.Material).dispose();
+    }
+    this.hackingConnectionLines.clear();
+
+    // Clear active traces
+    this.clearHackingTraces();
+  }
+
+  /**
+   * Clear all active hack trace visualizations
+   */
+  private clearHackingTraces(): void {
+    for (const trace of this.hackingActiveTraces.values()) {
+      this.hackingNetworkGroup.remove(trace.traceHead);
+      this.hackingNetworkGroup.remove(trace.traceLine);
+      this.hackingNetworkGroup.remove(trace.glowLine);
+      (trace.traceHead.geometry as THREE.BufferGeometry).dispose();
+      (trace.traceHead.material as THREE.Material).dispose();
+      (trace.traceLine.geometry as THREE.BufferGeometry).dispose();
+      (trace.traceLine.material as THREE.Material).dispose();
+      (trace.glowLine.geometry as THREE.BufferGeometry).dispose();
+      (trace.glowLine.material as THREE.Material).dispose();
+    }
+    this.hackingActiveTraces.clear();
+  }
+
+  /**
+   * Create a marker for a hacking node
+   */
+  private createHackingNodeMarker(node: HackingNode): THREE.Group {
+    const group = new THREE.Group();
+    const pos = geoToSphere(node.position, GLOBE_RADIUS + 1);
+
+    // Outer glow ring
+    const glowGeometry = new THREE.RingGeometry(1.5, 2.5, 16);
+    const glowMaterial = new THREE.MeshBasicMaterial({
+      color: COLORS.hackingNodeGlow,
+      transparent: true,
+      opacity: 0.4,
+      side: THREE.DoubleSide,
+    });
+    const glowRing = new THREE.Mesh(glowGeometry, glowMaterial);
+    glowRing.name = 'glow';
+
+    // Inner core
+    const coreGeometry = new THREE.CircleGeometry(1.2, 16);
+    const coreMaterial = new THREE.MeshBasicMaterial({
+      color: COLORS.hackingNode,
+      transparent: true,
+      opacity: 0.8,
+      side: THREE.DoubleSide,
+    });
+    const core = new THREE.Mesh(coreGeometry, coreMaterial);
+    core.name = 'core';
+
+    // Center point
+    const centerGeometry = new THREE.CircleGeometry(0.5, 8);
+    const centerMaterial = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.9,
+      side: THREE.DoubleSide,
+    });
+    const center = new THREE.Mesh(centerGeometry, centerMaterial);
+
+    group.add(glowRing);
+    group.add(core);
+    group.add(center);
+
+    // Position the group
+    group.position.set(pos.x, pos.y, pos.z);
+
+    // Orient to face outward from globe center
+    group.lookAt(0, 0, 0);
+    group.rotateX(Math.PI); // Flip to face away from center
+
+    // Store node data for later use
+    group.userData = { node };
+
+    return group;
+  }
+
+  /**
+   * Create a curved connection line between two nodes
+   * Uses a quadratic bezier curve that arcs above the globe surface
+   */
+  private createHackingConnectionLine(
+    fromNode: HackingNode,
+    toNode: HackingNode,
+    connection: HackingConnection
+  ): THREE.Line {
+    const points = this.calculateCurvedPath(fromNode.position, toNode.position);
+
+    const geometry = new THREE.BufferGeometry().setFromPoints(points);
+    const material = new THREE.LineBasicMaterial({
+      color: COLORS.hackingConnection,
+      transparent: true,
+      opacity: connection.encrypted ? 0.3 : 0.5,
+      linewidth: connection.bandwidth * 2,
+    });
+
+    const line = new THREE.Line(geometry, material);
+    line.userData = { connection, fromNode, toNode };
+
+    return line;
+  }
+
+  /**
+   * Calculate curved path points between two geographic positions
+   * Creates a great-circle arc that rises above the globe surface
+   */
+  private calculateCurvedPath(from: GeoPosition, to: GeoPosition): THREE.Vector3[] {
+    const points: THREE.Vector3[] = [];
+    const segments = HACKING_TRACE_SEGMENTS;
+
+    // Calculate great-circle distance to determine arc height
+    const distance = greatCircleDistance(from, to);
+    const distanceDegrees = distance * (180 / Math.PI);
+
+    // Arc height scales with distance (more distance = higher arc)
+    const maxHeight = HACKING_CONNECTION_HEIGHT * Math.min(1, distanceDegrees / 90);
+
+    for (let i = 0; i <= segments; i++) {
+      const t = i / segments;
+
+      // Get position along great-circle path
+      const geoPos = geoInterpolate(from, to, t);
+
+      // Calculate height above surface using a parabolic curve
+      // Height is 0 at endpoints and max at midpoint
+      const heightFactor = 4 * t * (1 - t); // Parabola: max at t=0.5
+      const height = maxHeight * heightFactor;
+
+      // Convert to 3D position with additional height
+      const pos = geoToSphere(geoPos, GLOBE_RADIUS + 2 + height);
+      points.push(new THREE.Vector3(pos.x, pos.y, pos.z));
+    }
+
+    return points;
+  }
+
+  /**
+   * Update all active hack traces
+   */
+  private updateHackingTraces(): void {
+    if (!this.hackingNetworkState) return;
+
+    const currentHackIds = new Set(Object.keys(this.hackingNetworkState.activeHacks));
+    const existingTraceIds = new Set(this.hackingActiveTraces.keys());
+
+    // Create traces for new hacks
+    for (const hack of Object.values(this.hackingNetworkState.activeHacks)) {
+      if (!this.hackingActiveTraces.has(hack.id)) {
+        const trace = this.createHackingTrace(hack);
+        if (trace) {
+          this.hackingActiveTraces.set(hack.id, trace);
+        }
+      }
+    }
+
+    // Remove traces for completed/removed hacks
+    for (const id of existingTraceIds) {
+      if (!currentHackIds.has(id)) {
+        const trace = this.hackingActiveTraces.get(id);
+        if (trace) {
+          this.hackingNetworkGroup.remove(trace.traceHead);
+          this.hackingNetworkGroup.remove(trace.traceLine);
+          this.hackingNetworkGroup.remove(trace.glowLine);
+          (trace.traceHead.geometry as THREE.BufferGeometry).dispose();
+          (trace.traceHead.material as THREE.Material).dispose();
+          (trace.traceLine.geometry as THREE.BufferGeometry).dispose();
+          (trace.traceLine.material as THREE.Material).dispose();
+          (trace.glowLine.geometry as THREE.BufferGeometry).dispose();
+          (trace.glowLine.material as THREE.Material).dispose();
+          this.hackingActiveTraces.delete(id);
+        }
+      }
+    }
+  }
+
+  /**
+   * Create visualization for an active hack trace
+   */
+  private createHackingTrace(hack: NetworkHackTrace): {
+    traceHead: THREE.Mesh;
+    traceLine: THREE.Line;
+    tracePoints: THREE.Vector3[];
+    glowLine: THREE.Line;
+  } | null {
+    if (!this.hackingNetworkState || hack.route.nodeIds.length < 2) return null;
+
+    // Calculate the full path through all nodes in the route
+    const allPoints: THREE.Vector3[] = [];
+
+    for (let i = 0; i < hack.route.nodeIds.length - 1; i++) {
+      const fromNode = this.hackingNetworkState.nodes[hack.route.nodeIds[i]];
+      const toNode = this.hackingNetworkState.nodes[hack.route.nodeIds[i + 1]];
+
+      if (!fromNode || !toNode) continue;
+
+      const segmentPoints = this.calculateCurvedPath(fromNode.position, toNode.position);
+
+      // Avoid duplicating the endpoint (which is the start of the next segment)
+      if (i > 0) {
+        segmentPoints.shift();
+      }
+
+      allPoints.push(...segmentPoints);
+    }
+
+    if (allPoints.length < 2) return null;
+
+    // Parse the hack color
+    const color = new THREE.Color(hack.color);
+
+    // Create trace head (glowing sphere)
+    const headGeometry = new THREE.SphereGeometry(2, 16, 16);
+    const headMaterial = new THREE.MeshBasicMaterial({
+      color: color,
+      transparent: true,
+      opacity: 1.0,
+    });
+    const traceHead = new THREE.Mesh(headGeometry, headMaterial);
+
+    // Create the trace line (shows the path traveled)
+    const traceGeometry = new THREE.BufferGeometry();
+    const traceMaterial = new THREE.LineBasicMaterial({
+      color: color,
+      transparent: true,
+      opacity: 0.9,
+      linewidth: 2,
+    });
+    const traceLine = new THREE.Line(traceGeometry, traceMaterial);
+
+    // Create glow line (wider, more transparent)
+    const glowGeometry = new THREE.BufferGeometry();
+    const glowMaterial = new THREE.LineBasicMaterial({
+      color: color,
+      transparent: true,
+      opacity: 0.3,
+      linewidth: 4,
+    });
+    const glowLine = new THREE.Line(glowGeometry, glowMaterial);
+
+    this.hackingNetworkGroup.add(traceHead);
+    this.hackingNetworkGroup.add(traceLine);
+    this.hackingNetworkGroup.add(glowLine);
+
+    return {
+      traceHead,
+      traceLine,
+      tracePoints: allPoints,
+      glowLine,
+    };
+  }
+
+  /**
+   * Animate hacking network (called each frame)
+   */
+  private animateHackingNetwork(deltaTime: number): void {
+    if (!this.hackingNetworkState || !this.viewToggles.network) return;
+
+    this.hackingAnimationTime += deltaTime;
+
+    // Animate node pulses
+    const pulseValue = (Math.sin(this.hackingAnimationTime * HACKING_NODE_PULSE_SPEED) + 1) / 2;
+
+    for (const marker of this.hackingNodeMarkers.values()) {
+      const glow = marker.getObjectByName('glow') as THREE.Mesh;
+      const core = marker.getObjectByName('core') as THREE.Mesh;
+
+      if (glow && glow.material instanceof THREE.MeshBasicMaterial) {
+        glow.material.opacity = 0.2 + pulseValue * 0.4;
+        glow.scale.setScalar(1 + pulseValue * 0.3);
+      }
+
+      if (core && core.material instanceof THREE.MeshBasicMaterial) {
+        core.material.opacity = 0.6 + pulseValue * 0.3;
+      }
+    }
+
+    // Animate active traces
+    for (const [hackId, trace] of this.hackingActiveTraces) {
+      const hack = this.hackingNetworkState.activeHacks[hackId];
+      if (!hack) continue;
+
+      const progress = hack.progress;
+      const points = trace.tracePoints;
+      const totalPoints = points.length;
+
+      if (totalPoints < 2) continue;
+
+      // Calculate head position
+      const headIndex = Math.floor(progress * (totalPoints - 1));
+      const headT = (progress * (totalPoints - 1)) - headIndex;
+
+      let headPos: THREE.Vector3;
+      if (headIndex >= totalPoints - 1) {
+        headPos = points[totalPoints - 1].clone();
+      } else {
+        headPos = points[headIndex].clone().lerp(points[headIndex + 1], headT);
+      }
+
+      trace.traceHead.position.copy(headPos);
+
+      // Add pulsing glow to head
+      const headPulse = 1 + Math.sin(this.hackingAnimationTime * 8) * 0.2;
+      trace.traceHead.scale.setScalar(headPulse);
+
+      // Update trace line to show path traveled
+      const traceEndIndex = Math.ceil(progress * (totalPoints - 1));
+      const traceStartIndex = Math.max(0, traceEndIndex - Math.floor(totalPoints * HACKING_TRACE_HEAD_LENGTH));
+
+      const tracePoints = points.slice(traceStartIndex, traceEndIndex + 1);
+      if (tracePoints.length >= 2) {
+        (trace.traceLine.geometry as THREE.BufferGeometry).setFromPoints(tracePoints);
+        (trace.glowLine.geometry as THREE.BufferGeometry).setFromPoints(tracePoints);
+      }
+
+      // Fade out completed traces
+      if (hack.status === 'complete') {
+        const headMat = trace.traceHead.material as THREE.MeshBasicMaterial;
+        const traceMat = trace.traceLine.material as THREE.LineBasicMaterial;
+        const glowMat = trace.glowLine.material as THREE.LineBasicMaterial;
+
+        headMat.opacity = Math.max(0, headMat.opacity - deltaTime * 0.5);
+        traceMat.opacity = Math.max(0, traceMat.opacity - deltaTime * 0.5);
+        glowMat.opacity = Math.max(0, glowMat.opacity - deltaTime * 0.5);
+      }
+    }
+
+    // Animate connection lines for active hacks (make them brighter)
+    const activeNodeIds = new Set<string>();
+    for (const hack of Object.values(this.hackingNetworkState.activeHacks)) {
+      if (hack.status === 'active' || hack.status === 'routing') {
+        for (const nodeId of hack.route.nodeIds) {
+          activeNodeIds.add(nodeId);
+        }
+      }
+    }
+
+    // Highlight connections that are part of active routes
+    for (const [connId, line] of this.hackingConnectionLines) {
+      const conn = line.userData.connection as HackingConnection;
+      const isActive = activeNodeIds.has(conn.fromNodeId) && activeNodeIds.has(conn.toNodeId);
+
+      const material = line.material as THREE.LineBasicMaterial;
+      if (isActive) {
+        material.color.setHex(COLORS.hackingConnectionActive);
+        material.opacity = 0.7 + pulseValue * 0.3;
+      } else {
+        material.color.setHex(COLORS.hackingConnection);
+        material.opacity = conn.encrypted ? 0.3 : 0.5;
+      }
+    }
+  }
+
+  /**
+   * Update hacking network each frame (called from render loop)
+   */
+  updateHackingNetworkAnimation(deltaTime: number): void {
+    this.animateHackingNetwork(deltaTime);
   }
 
   // Public method to focus camera on a specific location
