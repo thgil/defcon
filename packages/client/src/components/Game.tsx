@@ -3,6 +3,7 @@ import { useGameStore } from '../stores/gameStore';
 import { useNetworkStore } from '../stores/networkStore';
 import { useTerminalStore } from '../stores/terminalStore';
 import { useHackingStore } from '../stores/hackingStore';
+import { useBackgroundMusic } from '../hooks/useBackgroundMusic';
 import { GlobeRenderer } from '../renderer/GlobeRenderer';
 import { type Vector2, type Silo, type SiloMode, type GeoPosition, type Building, type AircraftType, geoToPixel } from '@defcon/shared';
 import type { ManualInterceptState } from '../stores/gameStore';
@@ -55,6 +56,9 @@ export default function Game() {
   const startDemoHack = useHackingStore((s) => s.startDemoHack);
   const updateHackProgress = useHackingStore((s) => s.updateHackProgress);
   const getNetworkHackTracesArray = useHackingStore((s) => s.getNetworkHackTracesArray);
+
+  // Background music
+  useBackgroundMusic();
 
   // Initialize hacking network on mount
   useEffect(() => {
