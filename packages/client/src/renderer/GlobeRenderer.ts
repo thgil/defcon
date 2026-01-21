@@ -2049,6 +2049,17 @@ export class GlobeRenderer {
     switch (building.type) {
       case 'silo': {
         const silo = building as Silo;
+        // Invisible hitbox sphere for easier clicking (matches missile hitbox size)
+        const hitboxGeom = new THREE.SphereGeometry(2.5, 8, 8);
+        const hitboxMat = new THREE.MeshBasicMaterial({
+          transparent: true,
+          opacity: 0,
+          depthWrite: false,
+          colorWrite: false,
+        });
+        const hitbox = new THREE.Mesh(hitboxGeom, hitboxMat);
+        group.add(hitbox);
+
         // Triangle outline for silo
         const points = [
           new THREE.Vector3(0, 1.5, 0),
@@ -2184,7 +2195,14 @@ export class GlobeRenderer {
 
         // Show explosion effect (only once per missile)
         if (!this.shownExplosions.has(missile.id)) {
-          this.showExplosionAt(explosionGeo);
+          if (missile.intercepted) {
+            // Intercepted: show cyan intercept explosion (small, quick)
+            const pos3d = geoToSphere(explosionGeo, GLOBE_RADIUS + 3);
+            this.createInterceptExplosion(pos3d);
+          } else {
+            // Detonated: show nuclear explosion (large, orange)
+            this.showExplosionAt(explosionGeo);
+          }
           this.shownExplosions.add(missile.id);
         }
 
@@ -3170,8 +3188,8 @@ export class GlobeRenderer {
     // Visual scale
     const scale = isInterceptor ? 0.156 : 0.3125;
 
-    // Invisible hitbox for easier clicking (keeps original clickable area)
-    const hitboxSize = isInterceptor ? 2.8 : 4.2;
+    // Invisible hitbox for easier clicking (reduced from original to fix silo selection)
+    const hitboxSize = isInterceptor ? 2.8 : 2.0;
     const hitboxGeom = new THREE.SphereGeometry(hitboxSize, 8, 8);
     const hitboxMat = new THREE.MeshBasicMaterial({
       transparent: true,
@@ -5005,6 +5023,85 @@ export class GlobeRenderer {
   }
 
   /**
+   * Create a small cyan explosion for successful interceptor hits.
+   * This is distinct from nuclear detonations (orange) and ground impacts (orange/brown).
+   */
+  private createInterceptExplosion(pos3d: { x: number; y: number; z: number }): void {
+    const explosionGroup = new THREE.Group();
+    explosionGroup.position.set(pos3d.x, pos3d.y, pos3d.z);
+    this.effectGroup.add(explosionGroup);
+
+    // Small cyan/white flash
+    const flashGeom = new THREE.SphereGeometry(1.0, 8, 8);
+    const flashMat = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 1,
+    });
+    const flash = new THREE.Mesh(flashGeom, flashMat);
+    explosionGroup.add(flash);
+
+    // Cyan core
+    const coreGeom = new THREE.SphereGeometry(0.6, 8, 8);
+    const coreMat = new THREE.MeshBasicMaterial({
+      color: 0x00ffff,
+      transparent: true,
+      opacity: 1,
+    });
+    const core = new THREE.Mesh(coreGeom, coreMat);
+    explosionGroup.add(core);
+
+    // Expanding cyan ring
+    const ringGeom = new THREE.RingGeometry(0.3, 1.0, 16);
+    const ringMat = new THREE.MeshBasicMaterial({
+      color: 0x00ddff,
+      transparent: true,
+      opacity: 0.8,
+      side: THREE.DoubleSide,
+    });
+    const ring = new THREE.Mesh(ringGeom, ringMat);
+    // Orient ring perpendicular to surface normal
+    const normal = new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z).normalize();
+    ring.lookAt(normal.clone().add(new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z)));
+    explosionGroup.add(ring);
+
+    // Animate - quick 0.3s effect (~20 frames at 60fps)
+    let frame = 0;
+    const maxFrames = 20;
+
+    const animate = () => {
+      frame++;
+      const progress = frame / maxFrames;
+
+      // Flash fades quickly
+      flashMat.opacity = Math.max(0, 1 - progress * 3);
+      flash.scale.setScalar(1 + progress * 2);
+
+      // Core fades and grows
+      coreMat.opacity = Math.max(0, 1 - progress * 1.5);
+      core.scale.setScalar(1 + progress * 1.5);
+
+      // Ring expands and fades
+      ring.scale.setScalar(1 + progress * 4);
+      ringMat.opacity = Math.max(0, 0.8 - progress);
+
+      if (frame < maxFrames) {
+        requestAnimationFrame(animate);
+      } else {
+        // Cleanup
+        this.effectGroup.remove(explosionGroup);
+        flashGeom.dispose();
+        flashMat.dispose();
+        coreGeom.dispose();
+        coreMat.dispose();
+        ringGeom.dispose();
+        ringMat.dispose();
+      }
+    };
+    animate();
+  }
+
+  /**
    * Update fading missiles - missiles that have detonated/been intercepted
    * and are now fading out with their trails shrinking to the impact point
    */
@@ -6109,12 +6206,47 @@ export class GlobeRenderer {
       return;
     }
 
-    // Check for missile clicks first (they're in flight, most interesting)
+    // Check for missile and building clicks together to resolve conflicts by distance
     const missileIntersects = this.raycaster.intersectObjects(
       this.missileGroup.children,
       true
     );
+    const buildingIntersects = this.raycaster.intersectObjects(
+      this.buildingGroup.children,
+      true
+    );
 
+    // Get closest intersect distances
+    const missileDistance = missileIntersects.length > 0 ? missileIntersects[0].distance : Infinity;
+    const buildingDistance = buildingIntersects.length > 0 ? buildingIntersects[0].distance : Infinity;
+
+    // Process building click if building is closer (or no missile hit)
+    if (buildingIntersects.length > 0 && buildingDistance <= missileDistance) {
+      let obj = buildingIntersects[0].object;
+      // Walk up to find the group with building data
+      while (obj && !obj.userData?.building && obj.parent) {
+        obj = obj.parent as THREE.Object3D;
+      }
+      if (obj?.userData?.building) {
+        const building = obj.userData.building as Building;
+        // Stop any missile tracking
+        this.trackedMissileId = null;
+        // Clear satellite selection
+        this.selectedSatelliteId = null;
+        // Clear aircraft selection
+        this.selectedAircraftId = null;
+        // Center camera on the building
+        const geoPos = building.geoPosition || this.pixelToGeoFallback(building.position);
+        this.centerCameraOnGeo(geoPos);
+        // Also trigger the building click callback if set
+        if (this.onBuildingClickCallback) {
+          this.onBuildingClickCallback(building);
+        }
+        return;
+      }
+    }
+
+    // Process missile click if missile is closer (or no building hit)
     if (missileIntersects.length > 0) {
       let obj = missileIntersects[0].object;
       // Walk up to find the parent with missile ID
@@ -6216,37 +6348,6 @@ export class GlobeRenderer {
       }
       // Clicked on satellite orbit/vision/link but not body - don't fall through to clear selection
       return;
-    }
-
-    // Check for building clicks (silos, radars, airfields)
-    const buildingIntersects = this.raycaster.intersectObjects(
-      this.buildingGroup.children,
-      true
-    );
-
-    if (buildingIntersects.length > 0) {
-      let obj = buildingIntersects[0].object;
-      // Walk up to find the group with building data
-      while (obj && !obj.userData?.building && obj.parent) {
-        obj = obj.parent as THREE.Object3D;
-      }
-      if (obj?.userData?.building) {
-        const building = obj.userData.building as Building;
-        // Stop any missile tracking
-        this.trackedMissileId = null;
-        // Clear satellite selection
-        this.selectedSatelliteId = null;
-        // Clear aircraft selection
-        this.selectedAircraftId = null;
-        // Center camera on the building
-        const geoPos = building.geoPosition || this.pixelToGeoFallback(building.position);
-        this.centerCameraOnGeo(geoPos);
-        // Also trigger the building click callback if set
-        if (this.onBuildingClickCallback) {
-          this.onBuildingClickCallback(building);
-        }
-        return;
-      }
     }
 
     // Check for city clicks

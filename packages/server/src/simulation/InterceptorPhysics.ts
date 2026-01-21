@@ -31,8 +31,8 @@ const GLOBE_RADIUS = 100;
 // Physics configuration (thrust and speed scaled by global multiplier)
 export const INTERCEPTOR_PHYSICS_CONFIG = {
   // Thrust and propulsion (scaled by global multiplier)
-  maxThrust: 5.0 * GLOBAL_MISSILE_SPEED_MULTIPLIER,   // Units/sec^2 acceleration
-  maxFuel: 8,              // Seconds of burn time
+  maxThrust: 3.0 * GLOBAL_MISSILE_SPEED_MULTIPLIER,   // Units/sec^2 acceleration (reduced for slower missiles)
+  maxFuel: 48,             // Seconds of burn time (6x original for much longer powered flight)
 
   // Flight phases (in seconds from launch)
   boostDuration: 2.0,      // Seconds of vertical boost
@@ -42,17 +42,17 @@ export const INTERCEPTOR_PHYSICS_CONFIG = {
   terminalRange: 3.0,      // Seconds before estimated intercept to enter terminal phase
 
   // Steering
-  maxTurnRate: 45,         // Degrees/second max steering rate (increased from 30)
+  maxTurnRate: 60,         // Degrees/second max steering rate (increased for better guidance)
 
   // Gravity (toward globe center)
   gravity: 0.015,          // Acceleration toward globe center (units/sec^2)
 
   // Interception
-  interceptRadius: 5.0,    // Units - proximity for interception check (increased for reliability)
-  hitProbability: 0.85,    // Base probability of successful intercept
+  interceptRadius: 0.5,    // Units - proximity for interception check (~32km)
+  hitProbability: 0.90,    // Base probability of successful intercept (compensate for harder targeting)
 
   // Speed limits (scaled by global multiplier)
-  maxSpeed: 8.0 * GLOBAL_MISSILE_SPEED_MULTIPLIER,    // Maximum velocity magnitude (units/sec)
+  maxSpeed: 4.0 * GLOBAL_MISSILE_SPEED_MULTIPLIER,    // Maximum velocity magnitude (units/sec) - 50% slower
 
   // Lifetime limits (prevent missiles flying forever) - scaled inversely for slower missiles
   maxFlightTime: 30 / GLOBAL_MISSILE_SPEED_MULTIPLIER,  // Maximum total flight time in seconds
@@ -270,7 +270,7 @@ export class InterceptorPhysics {
 
     // Iterative solver: find time T where interceptor reaches target's position at T
     let t = 0;
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 8; i++) {
       const futureTargetPos = vec3Add(targetPos, vec3Scale(targetVel, t));
       const dist = vec3Distance(futureTargetPos, interceptor.position);
       t = dist / Math.max(speed, 0.1);
@@ -337,8 +337,9 @@ export class InterceptorPhysics {
   private applyThrust(missile: PhysicsMissile, desiredHeading: Vector3, dt: number): void {
     const config = INTERCEPTOR_PHYSICS_CONFIG;
 
-    // Calculate max turn angle this frame
-    const maxTurnAngle = (config.maxTurnRate * Math.PI / 180) * dt;
+    // Higher turn rate in terminal phase for aggressive final guidance
+    const turnRateMultiplier = missile.phase === 'terminal' ? 1.5 : 1.0;
+    const maxTurnAngle = (config.maxTurnRate * turnRateMultiplier * Math.PI / 180) * dt;
 
     // Rotate heading toward desired heading (limited by turn rate)
     missile.heading = vec3RotateToward(missile.heading, desiredHeading, maxTurnAngle);
@@ -352,10 +353,23 @@ export class InterceptorPhysics {
 
   /**
    * Apply gravity (toward globe center)
+   * Gravity gradually increases during coast phase to eventually bring down missed interceptors
    */
   private applyGravity(missile: PhysicsMissile, dt: number): void {
     const down = vec3Scale(getUpVector(missile.position), -1);
-    const gravityAccel = vec3Scale(down, INTERCEPTOR_PHYSICS_CONFIG.gravity);
+
+    let gravityStrength = INTERCEPTOR_PHYSICS_CONFIG.gravity;
+
+    // In coast phase, gradually increase gravity over time
+    // This allows the missile to coast for a while before falling
+    if (missile.phase === 'coast' && missile.flameoutTime) {
+      const coastTime = (Date.now() - missile.flameoutTime) / 1000;
+      // Ramp up gravity: 1x at 0s, 2x at 5s, 5x at 10s, max 10x
+      const gravityMultiplier = Math.min(10, 1 + coastTime * 0.4);
+      gravityStrength *= gravityMultiplier;
+    }
+
+    const gravityAccel = vec3Scale(down, gravityStrength);
     missile.velocity = vec3Add(missile.velocity, vec3Scale(gravityAccel, dt));
   }
 
