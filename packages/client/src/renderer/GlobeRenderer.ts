@@ -8,6 +8,8 @@ import {
   type PhysicsMissile,
   type RailInterceptor,
   type GuidedInterceptor,
+  type Aircraft,
+  type AircraftType,
   type City,
   type Territory,
   type GeoPosition,
@@ -16,6 +18,7 @@ import {
   type Radar,
   type Satellite,
   type SatelliteLaunchFacility,
+  type Airfield,
   geoToSphere,
   sphereToGeo,
   getMissilePosition3D,
@@ -29,6 +32,7 @@ import {
   getBuildings,
   getMissiles,
   getSatellites,
+  getAircraft,
   getSatellitePosition3D,
   getSatelliteGroundPosition,
   SatelliteOrbitalParams,
@@ -209,6 +213,17 @@ export class GlobeRenderer {
   private missileRadarStatus = new Map<string, boolean>(); // Track radar coverage for LOS markers
   private icbmMarkerProgress = new Map<string, Set<string>>(); // Track which ICBM markers have been added
 
+  // Dropped booster stages (visual effect at BECO)
+  private droppedBoosters = new Map<string, {
+    mesh: THREE.Group;
+    trail: THREE.Line;
+    startGeo: GeoPosition;
+    endGeo: GeoPosition;
+    maxAltitude: number;
+    startTime: number;
+    duration: number;  // How long the arc takes (ms)
+  }>();
+
   // Fading missiles after detonation/interception
   private fadingMissiles = new Map<string, {
     objects: {
@@ -253,7 +268,7 @@ export class GlobeRenderer {
 
   // Click callback
   private onClickCallback: ((geoPosition: GeoPosition) => void) | null = null;
-  private onBuildingClickCallback: ((building: Building) => void) | null = null;
+  private onBuildingClickCallback: ((building: Building | null) => void) | null = null;
   private onEnemyICBMClickCallback: ((missileId: string) => void) | null = null;
   private onModeChangeCallback: ((siloId: string, mode: SiloMode) => void) | null = null;
   private onPlacementModeCallback: ((type: string | null) => void) | null = null;
@@ -280,6 +295,18 @@ export class GlobeRenderer {
   private commChainLines: THREE.Line[] = [];
   private commChainPackets: THREE.Mesh[] = [];
   private packetAnimationTime: number = 0;
+
+  // Satellite-Radar communication links (shown when satellite or radar is selected)
+  private satCommGroup: THREE.Group;
+  private satCommLines: THREE.Line[] = [];
+
+  // Aircraft rendering
+  private aircraftGroup: THREE.Group;
+  private aircraftObjects = new Map<string, {
+    mesh: THREE.Group;
+    waypointLine?: THREE.Line;
+  }>();
+  private selectedAircraftId: string | null = null;
 
   // Intercept prediction visualization (shown when interceptor is tracked)
   private interceptPredictionGroup: THREE.Group;
@@ -343,6 +370,8 @@ export class GlobeRenderer {
     this.placementPreviewGroup = new THREE.Group();
     this.commChainGroup = new THREE.Group();
     this.interceptPredictionGroup = new THREE.Group();
+    this.satCommGroup = new THREE.Group();
+    this.aircraftGroup = new THREE.Group();
 
     this.scene.add(this.territoryGroup);
     this.scene.add(this.coastlineGroup);
@@ -358,6 +387,8 @@ export class GlobeRenderer {
     this.scene.add(this.placementPreviewGroup);
     this.scene.add(this.commChainGroup);
     this.scene.add(this.interceptPredictionGroup);
+    this.scene.add(this.satCommGroup);
+    this.scene.add(this.aircraftGroup);
 
     // Create starfield background
     this.createStarfield();
@@ -471,7 +502,7 @@ export class GlobeRenderer {
     this.onEnemyICBMClickCallback = callback;
   }
 
-  setOnBuildingClick(callback: (building: Building) => void): void {
+  setOnBuildingClick(callback: (building: Building | null) => void): void {
     this.onBuildingClickCallback = callback;
   }
 
@@ -485,6 +516,10 @@ export class GlobeRenderer {
 
   setOnLaunchSatellite(callback: (facilityId: string, inclination: number) => void): void {
     this.onLaunchSatelliteCallback = callback;
+  }
+
+  setOnLaunchAircraft(callback: (airfieldId: string, aircraftType: AircraftType, waypoints: GeoPosition[]) => void): void {
+    this.hudRenderer.setAircraftCallbacks(callback);
   }
 
   setSelectedSatellite(satellite: Satellite | null): void {
@@ -854,7 +889,7 @@ export class GlobeRenderer {
   private updateFogOfWar(): void {
     if (!this.fogOfWarMaterial || !this.gameState) return;
 
-    // Collect radar positions
+    // Collect radar positions (ground stations)
     const radarPositions: THREE.Vector3[] = [];
     for (const building of getBuildings(this.gameState)) {
       if (building.type !== 'radar' || building.destroyed) continue;
@@ -865,6 +900,19 @@ export class GlobeRenderer {
       radarPositions.push(new THREE.Vector3(pos.x, pos.y, pos.z));
 
       if (radarPositions.length >= 8) break;
+    }
+
+    // Add AWACS aircraft radar coverage
+    if (radarPositions.length < 8) {
+      for (const aircraft of getAircraft(this.gameState)) {
+        if (aircraft.ownerId !== this.playerId) continue;
+        if (aircraft.type !== 'radar' || aircraft.status !== 'flying') continue;
+
+        const pos = geoToSphere(aircraft.geoPosition, GLOBE_RADIUS);
+        radarPositions.push(new THREE.Vector3(pos.x, pos.y, pos.z));
+
+        if (radarPositions.length >= 8) break;
+      }
     }
 
     // Store actual count before padding
@@ -1228,6 +1276,8 @@ export class GlobeRenderer {
     this.updateMissiles();
     this.updateMissileMarkerVisibility();
     this.updateSatellites();
+    this.updateSatelliteCommLinks();
+    this.updateAircraft();
   }
 
   // Only show stage markers (MECO, BECO, APO, etc.) and trail for the tracked missile
@@ -1292,10 +1342,17 @@ export class GlobeRenderer {
     if (!this.gameState || !this.playerId) return [];
 
     const positions: GeoPosition[] = [];
+    // Ground radar stations
     for (const building of getBuildings(this.gameState)) {
       if (building.ownerId === this.playerId && building.type === 'radar' && !building.destroyed) {
         const geoPos = building.geoPosition || this.pixelToGeoFallback(building.position);
         positions.push(geoPos);
+      }
+    }
+    // AWACS aircraft (radar type aircraft that are flying)
+    for (const aircraft of getAircraft(this.gameState)) {
+      if (aircraft.ownerId === this.playerId && aircraft.type === 'radar' && aircraft.status === 'flying') {
+        positions.push(aircraft.geoPosition);
       }
     }
     return positions;
@@ -1444,6 +1501,43 @@ export class GlobeRenderer {
     return angularDistanceRadians * (180 / Math.PI);
   }
 
+  // Catmull-Rom spline interpolation for GeoPositions
+  private catmullRomGeoInterpolate(controlPoints: GeoPosition[], progress: number): GeoPosition {
+    if (controlPoints.length < 2) {
+      return controlPoints[0] || { lat: 0, lng: 0 };
+    }
+
+    // Clamp progress
+    progress = Math.max(0, Math.min(1, progress));
+
+    // Number of segments
+    const numSegments = controlPoints.length - 1;
+
+    // Find which segment we're in
+    const scaledProgress = progress * numSegments;
+    const segmentIndex = Math.min(Math.floor(scaledProgress), numSegments - 1);
+    const t = scaledProgress - segmentIndex;
+
+    // Get the 4 control points for Catmull-Rom (with clamping at ends)
+    const p0 = controlPoints[Math.max(0, segmentIndex - 1)];
+    const p1 = controlPoints[segmentIndex];
+    const p2 = controlPoints[Math.min(controlPoints.length - 1, segmentIndex + 1)];
+    const p3 = controlPoints[Math.min(controlPoints.length - 1, segmentIndex + 2)];
+
+    // Catmull-Rom basis functions
+    const t2 = t * t;
+    const t3 = t2 * t;
+    const b0 = -0.5 * t3 + t2 - 0.5 * t;
+    const b1 = 1.5 * t3 - 2.5 * t2 + 1;
+    const b2 = -1.5 * t3 + 2 * t2 + 0.5 * t;
+    const b3 = 0.5 * t3 - 0.5 * t2;
+
+    return {
+      lat: b0 * p0.lat + b1 * p1.lat + b2 * p2.lat + b3 * p3.lat,
+      lng: b0 * p0.lng + b1 * p1.lng + b2 * p2.lng + b3 * p3.lng,
+    };
+  }
+
   private updateRadarCoverage(): void {
     if (!this.gameState) return;
 
@@ -1464,6 +1558,27 @@ export class GlobeRenderer {
       const beam = this.createRadarBeam(geoPos, building.id);
       this.radarCoverageGroup.add(beam);
       this.radarCoverageBeams.set(building.id, beam);
+    }
+
+    // Create/update coverage beams for player's AWACS aircraft
+    for (const aircraft of getAircraft(this.gameState)) {
+      if (aircraft.type !== 'radar' || aircraft.status !== 'flying') continue;
+      if (aircraft.ownerId !== this.playerId) continue;
+
+      const awacsId = `awacs_${aircraft.id}`;
+      existingRadarIds.delete(awacsId);
+
+      // AWACS moves, so always recreate the beam at current position
+      const existingBeam = this.radarCoverageBeams.get(awacsId);
+      if (existingBeam) {
+        this.radarCoverageGroup.remove(existingBeam);
+        this.disposeGroup(existingBeam);
+        this.radarSweepLines.delete(awacsId);
+      }
+
+      const beam = this.createRadarBeam(aircraft.geoPosition, awacsId);
+      this.radarCoverageGroup.add(beam);
+      this.radarCoverageBeams.set(awacsId, beam);
     }
 
     // Remove beams for radars that no longer exist
@@ -1726,10 +1841,12 @@ export class GlobeRenderer {
           marker.name = 'marker';
           group.add(marker);
 
-          // Create text label
-          const label = this.createTextSprite(cityData.name, color);
+          // Create text label (mesh lies flat on surface)
+          const label = this.createTextMesh(cityData.name, color);
           label.name = 'label';
-          label.position.set(0, size + 1.5, 0); // Position above the marker
+          label.position.set(0, size + 1, 0); // Position above the marker
+          // label.rotation.x = -Math.PI / 2; // Lay flat on surface
+          label.rotation.z = Math.PI; // Face readable direction
           group.add(label);
 
           this.cityGroup.add(group);
@@ -1796,11 +1913,47 @@ export class GlobeRenderer {
     return sprite;
   }
 
+  // Creates a text mesh that lies flat on the surface (normal to globe)
+  private createTextMesh(text: string, color: number): THREE.Mesh {
+    const canvas = document.createElement('canvas');
+    const context = canvas.getContext('2d')!;
+
+    // Set canvas size
+    canvas.width = 256;
+    canvas.height = 64;
+
+    // Draw text
+    context.font = 'bold 24px "Courier New", monospace';
+    context.fillStyle = '#' + color.toString(16).padStart(6, '0');
+    context.textAlign = 'center';
+    context.textBaseline = 'middle';
+    context.fillText(text, canvas.width / 2, canvas.height / 2);
+
+    // Create texture and plane mesh
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.needsUpdate = true;
+
+    const material = new THREE.MeshBasicMaterial({
+      map: texture,
+      transparent: true,
+      depthTest: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+
+    const geometry = new THREE.PlaneGeometry(8, 2);
+    const mesh = new THREE.Mesh(geometry, material);
+
+    return mesh;
+  }
+
   private disposeCityGroup(group: THREE.Group): void {
     group.traverse((child) => {
       if (child instanceof THREE.Mesh) {
         child.geometry.dispose();
-        (child.material as THREE.Material).dispose();
+        const mat = child.material as THREE.MeshBasicMaterial;
+        mat.map?.dispose();
+        mat.dispose();
       } else if (child instanceof THREE.Sprite) {
         (child.material as THREE.SpriteMaterial).map?.dispose();
         child.material.dispose();
@@ -1852,6 +2005,30 @@ export class GlobeRenderer {
 
       // Update building data for click handling
       marker.userData.building = building;
+
+      // Handle selection ring
+      const isSelected = this.selectedBuilding?.id === building.id;
+      let ring = marker.getObjectByName('selectionRing') as THREE.Mesh | undefined;
+
+      if (isSelected && !ring) {
+        // Create selection ring
+        const ringGeom = new THREE.RingGeometry(2.5, 3, 32);
+        const ringMat = new THREE.MeshBasicMaterial({
+          color: 0x00ffff,
+          transparent: true,
+          opacity: 0.7,
+          side: THREE.DoubleSide,
+        });
+        ring = new THREE.Mesh(ringGeom, ringMat);
+        ring.name = 'selectionRing';
+        ring.position.z = 0.1; // Slightly in front of the marker
+        marker.add(ring);
+      } else if (!isSelected && ring) {
+        // Remove selection ring
+        marker.remove(ring);
+        ring.geometry.dispose();
+        (ring.material as THREE.Material).dispose();
+      }
     }
 
     // Remove destroyed/removed buildings
@@ -1953,10 +2130,11 @@ export class GlobeRenderer {
       }
     }
 
-    // Add label below the building
+    // Add label above the building
     const labelText = this.getBuildingLabel(building.type);
-    const label = this.createTextSprite(labelText, color);
-    label.position.y = -3; // Position below the marker
+    const label = this.createTextMesh(labelText, color);
+    label.position.set(0, 4, 0); // Position above the marker
+    label.rotation.z = Math.PI; // Face readable direction
     group.add(label);
 
     return group;
@@ -2687,6 +2865,53 @@ export class GlobeRenderer {
           const becoVec = new THREE.Vector3(becoPos.x, becoPos.y, becoPos.z);
           this.addStageMarker(missile.id, becoVec, 'BECO', 0xff8800);
           markerSet.add('BECO');
+
+          // Create dropped booster visual at BECO
+          if (!this.droppedBoosters.has(missile.id)) {
+            const boosterColor = missile.ownerId === this.playerId ? 0x113388 : 0x881100;
+            const booster = this.createDroppedBooster(boosterColor);
+            booster.position.copy(becoVec);
+
+            // Calculate booster arc trajectory
+            // Start: BECO position (in geo coordinates)
+            const becoGeo = sphereToGeo(becoVec, GLOBE_RADIUS + maxAltitude * 0.2 * 4 * (1 - 0.2));
+            // End: A point ~30% along the original path (booster falls forward a bit)
+            const boosterEndGeo = geoInterpolate(startGeo, targetGeo, 0.30);
+            // Max altitude: current altitude at BECO (lower arc than main missile)
+            const becoAltitude = maxAltitude * 4 * 0.20 * (1 - 0.20);  // Parabolic altitude at 20%
+            const boosterMaxAlt = becoAltitude * 0.6;  // Slightly lower arc
+            const boosterDuration = 6000;  // 6 seconds to fall
+
+            // Create trail for booster (fainter than missile trail)
+            const trailGeom = new THREE.BufferGeometry();
+            const trailMat = new THREE.LineBasicMaterial({
+              color: boosterColor,
+              transparent: true,
+              opacity: 0.2,
+            });
+            const trail = new THREE.Line(trailGeom, trailMat);
+            this.missileGroup.add(trail);
+
+            this.droppedBoosters.set(missile.id, {
+              mesh: booster,
+              trail,
+              startGeo: becoGeo,
+              endGeo: boosterEndGeo,
+              maxAltitude: boosterMaxAlt,
+              startTime: Date.now(),
+              duration: boosterDuration,
+            });
+            this.missileGroup.add(booster);
+
+            // Hide booster parts on the original missile (tail, fins, exhaust)
+            const boosterTail = objects.head.getObjectByName('boosterTail');
+            if (boosterTail) boosterTail.visible = false;
+            for (let i = 0; i < 4; i++) {
+              const fin = objects.head.getObjectByName(`boosterFin${i}`);
+              if (fin) fin.visible = false;
+            }
+            // Exhaust is already handled by updateMissileExhaust (turns off at 20%)
+          }
         }
 
         // Apogee marker when we pass 50% progress (peak altitude)
@@ -2758,6 +2983,93 @@ export class GlobeRenderer {
           positions[i * 3 + 2] = trailPoints[i].z;
         }
         trailGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      }
+    }
+
+    // Update dropped boosters - they follow their own arc trajectory
+    for (const [missileId, booster] of this.droppedBoosters) {
+      const elapsed = Date.now() - booster.startTime;
+      const progress = Math.min(1.0, elapsed / booster.duration);
+
+      if (progress >= 1.0) {
+        // Booster has landed - remove it
+        this.missileGroup.remove(booster.mesh);
+        this.missileGroup.remove(booster.trail);
+        this.disposeGroup(booster.mesh);
+        booster.trail.geometry.dispose();
+        (booster.trail.material as THREE.Material).dispose();
+        this.droppedBoosters.delete(missileId);
+        continue;
+      }
+
+      // Calculate position along arc (same system as missiles)
+      const pos3d = getMissilePosition3D(
+        booster.startGeo,
+        booster.endGeo,
+        progress,
+        booster.maxAltitude,
+        GLOBE_RADIUS,
+        booster.duration
+      );
+      booster.mesh.position.set(pos3d.x, pos3d.y, pos3d.z);
+
+      // Orient booster along trajectory (calculate tangent)
+      if (progress < 0.99) {
+        const nextPos = getMissilePosition3D(
+          booster.startGeo,
+          booster.endGeo,
+          Math.min(1.0, progress + 0.02),
+          booster.maxAltitude,
+          GLOBE_RADIUS,
+          booster.duration
+        );
+        const direction = new THREE.Vector3(
+          nextPos.x - pos3d.x,
+          nextPos.y - pos3d.y,
+          nextPos.z - pos3d.z
+        ).normalize();
+        // Point the booster along its trajectory
+        const targetPos = new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z).add(direction);
+        booster.mesh.lookAt(targetPos);
+      }
+
+      // Tumble rotation for visual effect (added on top of orientation)
+      booster.mesh.rotateZ(0.03);
+
+      // Update trail (shows path traveled)
+      const trailPoints: THREE.Vector3[] = [];
+      const trailSteps = Math.max(5, Math.floor(30 * progress));
+      for (let i = 0; i <= trailSteps; i++) {
+        const t = (i / trailSteps) * progress;
+        const trailPos = getMissilePosition3D(
+          booster.startGeo,
+          booster.endGeo,
+          t,
+          booster.maxAltitude,
+          GLOBE_RADIUS,
+          booster.duration
+        );
+        trailPoints.push(new THREE.Vector3(trailPos.x, trailPos.y, trailPos.z));
+      }
+      const positions = new Float32Array(trailPoints.length * 3);
+      for (let i = 0; i < trailPoints.length; i++) {
+        positions[i * 3] = trailPoints[i].x;
+        positions[i * 3 + 1] = trailPoints[i].y;
+        positions[i * 3 + 2] = trailPoints[i].z;
+      }
+      booster.trail.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+      // Fade out in the last 30% of flight
+      const fadeStart = 0.7;
+      if (progress > fadeStart) {
+        const fadeProgress = (progress - fadeStart) / (1.0 - fadeStart);
+        const opacity = 1 - fadeProgress;
+        booster.mesh.traverse((child) => {
+          if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshBasicMaterial) {
+            child.material.opacity = opacity;
+          }
+        });
+        (booster.trail.material as THREE.LineBasicMaterial).opacity = 0.2 * opacity;
       }
     }
 
@@ -2833,6 +3145,17 @@ export class GlobeRenderer {
       this.shownExplosions.delete(id);
       this.groundImpactMissiles.delete(id);
 
+      // Clean up dropped booster if exists
+      const booster = this.droppedBoosters.get(id);
+      if (booster) {
+        this.missileGroup.remove(booster.mesh);
+        this.missileGroup.remove(booster.trail);
+        this.disposeGroup(booster.mesh);
+        booster.trail.geometry.dispose();
+        (booster.trail.material as THREE.Material).dispose();
+        this.droppedBoosters.delete(id);
+      }
+
       // Note: Stage markers cleaned up when fading missile is fully disposed
       // If not going through fading state, clean up immediately
       if (!this.fadingMissiles.has(id)) {
@@ -2903,19 +3226,21 @@ export class GlobeRenderer {
     body.position.z = 0;
     group.add(body);
 
-    // Tail section (tapered)
+    // Tail section (tapered) - part of booster stage that separates at BECO
     const tailGeom = new THREE.CylinderGeometry(1.0 * scale, 0.6 * scale, 2 * scale, 8);
     const tailMat = new THREE.MeshBasicMaterial({ color: secondaryColor });
     const tail = new THREE.Mesh(tailGeom, tailMat);
+    tail.name = 'boosterTail';
     tail.rotation.x = Math.PI / 2;
     tail.position.z = -3.5 * scale;
     group.add(tail);
 
-    // Fins (4 stabilizers)
+    // Fins (4 stabilizers) - part of booster stage that separates at BECO
     const finGeom = new THREE.BoxGeometry(0.15 * scale, 2.5 * scale, 1.5 * scale);
     const finMat = new THREE.MeshBasicMaterial({ color: primaryColor });
     for (let i = 0; i < 4; i++) {
       const fin = new THREE.Mesh(finGeom, finMat);
+      fin.name = `boosterFin${i}`;
       const angle = (i * Math.PI) / 2;
       fin.position.set(
         Math.cos(angle) * 1.2 * scale,
@@ -2951,6 +3276,43 @@ export class GlobeRenderer {
     glow.rotation.x = -Math.PI / 2;
     glow.position.z = -6 * scale;
     group.add(glow);
+
+    return group;
+  }
+
+  /**
+   * Create a visual for a dropped booster stage (separates at BECO).
+   * This is the rear portion of the ICBM that falls back to Earth.
+   */
+  private createDroppedBooster(color: number): THREE.Group {
+    const group = new THREE.Group();
+    const scale = 0.3125;  // Match ICBM scale
+
+    // Tail section (the booster stage)
+    const tailGeom = new THREE.CylinderGeometry(1.0 * scale, 0.6 * scale, 2 * scale, 8);
+    const tailMat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 1.0 });
+    const tail = new THREE.Mesh(tailGeom, tailMat);
+    tail.rotation.x = Math.PI / 2;
+    group.add(tail);
+
+    // Fins (4 stabilizers)
+    const finGeom = new THREE.BoxGeometry(0.15 * scale, 2.5 * scale, 1.5 * scale);
+    const finMat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 1.0 });
+    for (let i = 0; i < 4; i++) {
+      const fin = new THREE.Mesh(finGeom, finMat);
+      const angle = (i * Math.PI) / 2;
+      fin.position.set(Math.cos(angle) * 1.2 * scale, Math.sin(angle) * 1.2 * scale, 0);
+      fin.rotation.z = angle;
+      group.add(fin);
+    }
+
+    // Dead engine nozzle
+    const nozzleGeom = new THREE.ConeGeometry(0.4 * scale, 0.8 * scale, 8);
+    const nozzleMat = new THREE.MeshBasicMaterial({ color: 0x333333, transparent: true, opacity: 1.0 });
+    const nozzle = new THREE.Mesh(nozzleGeom, nozzleMat);
+    nozzle.rotation.x = -Math.PI / 2;
+    nozzle.position.z = -1.2 * scale;
+    group.add(nozzle);
 
     return group;
   }
@@ -3601,6 +3963,114 @@ export class GlobeRenderer {
       }
     }
     this.commChainPackets = [];
+  }
+
+  /**
+   * Update satellite-radar communication links.
+   * Shows dashed cyan lines between selected satellite and nearby radars,
+   * or between selected radar and nearby satellites.
+   */
+  private updateSatelliteCommLinks(): void {
+    // Clear existing links
+    this.clearSatelliteCommLinks();
+
+    if (!this.gameState || !this.playerId) return;
+
+    // Check if a satellite is selected
+    const selectedSatellite = this.selectedSatelliteId
+      ? getSatellites(this.gameState).find(s => s.id === this.selectedSatelliteId)
+      : null;
+
+    // Check if a radar is selected
+    const selectedRadar = this.selectedBuilding?.type === 'radar' ? this.selectedBuilding as Radar : null;
+
+    // Only show links when satellite or radar is selected
+    if (!selectedSatellite && !selectedRadar) return;
+
+    // Get all radars owned by the player
+    const playerRadars = getBuildings(this.gameState)
+      .filter((b): b is Radar => b.type === 'radar' && !b.destroyed && b.ownerId === this.playerId);
+
+    // Get all satellites owned by the player
+    const playerSatellites = getSatellites(this.gameState)
+      .filter(s => !s.destroyed && s.ownerId === this.playerId);
+
+    // Range limit in degrees (30 degrees for satellite-radar comm)
+    const SAT_RADAR_COMM_RANGE_DEGREES = 30;
+
+    if (selectedSatellite) {
+      // Show lines from selected satellite to all nearby radars
+      const satGeo = selectedSatellite.geoPosition;
+      if (!satGeo) return;
+
+      for (const radar of playerRadars) {
+        const radarGeo = radar.geoPosition || this.pixelToGeoFallback(radar.position);
+        const angularDistRad = greatCircleDistance(satGeo, radarGeo);
+        const angularDistDeg = angularDistRad * (180 / Math.PI);
+
+        if (angularDistDeg <= SAT_RADAR_COMM_RANGE_DEGREES) {
+          this.createSatCommLine(satGeo, radarGeo);
+        }
+      }
+    } else if (selectedRadar) {
+      // Show lines from selected radar to all nearby satellites
+      const radarGeo = selectedRadar.geoPosition || this.pixelToGeoFallback(selectedRadar.position);
+
+      for (const satellite of playerSatellites) {
+        const satGeo = satellite.geoPosition;
+        if (!satGeo) continue;
+
+        const angularDistRad = greatCircleDistance(radarGeo, satGeo);
+        const angularDistDeg = angularDistRad * (180 / Math.PI);
+
+        if (angularDistDeg <= SAT_RADAR_COMM_RANGE_DEGREES) {
+          this.createSatCommLine(satGeo, radarGeo);
+        }
+      }
+    }
+  }
+
+  /**
+   * Create a single satellite-radar communication line.
+   */
+  private createSatCommLine(satGeo: GeoPosition, radarGeo: GeoPosition): void {
+    // Get 3D positions - satellite at orbital altitude, radar near surface
+    const satPos = geoToSphere(satGeo, GLOBE_RADIUS + SATELLITE_ORBITAL_ALTITUDE);
+    const radarPos = geoToSphere(radarGeo, GLOBE_RADIUS + 3);
+
+    const startVec = new THREE.Vector3(satPos.x, satPos.y, satPos.z);
+    const endVec = new THREE.Vector3(radarPos.x, radarPos.y, radarPos.z);
+
+    // Create curved line that arcs above the globe
+    const curvePoints = this.createArcedLine(startVec, endVec, 24);
+
+    const lineGeom = new THREE.BufferGeometry().setFromPoints(curvePoints);
+    const lineMat = new THREE.LineDashedMaterial({
+      color: 0x00ffff, // Cyan
+      dashSize: 4,
+      gapSize: 2,
+      transparent: true,
+      opacity: 0.7,
+    });
+    const line = new THREE.Line(lineGeom, lineMat);
+    line.computeLineDistances();
+
+    this.satCommGroup.add(line);
+    this.satCommLines.push(line);
+  }
+
+  /**
+   * Clear satellite-radar communication links.
+   */
+  private clearSatelliteCommLinks(): void {
+    for (const line of this.satCommLines) {
+      this.satCommGroup.remove(line);
+      line.geometry.dispose();
+      if (line.material instanceof THREE.Material) {
+        line.material.dispose();
+      }
+    }
+    this.satCommLines = [];
   }
 
   /**
@@ -4394,8 +4864,8 @@ export class GlobeRenderer {
     explosionGroup.position.set(pos3d.x, pos3d.y, pos3d.z);
     this.effectGroup.add(explosionGroup);
 
-    // Initial bright flash (smaller, white, fades quickly)
-    const flashGeom = new THREE.SphereGeometry(2.5, 16, 16);
+    // Initial bright flash (larger, white, fades quickly)
+    const flashGeom = new THREE.SphereGeometry(4, 16, 16);
     const flashMat = new THREE.MeshBasicMaterial({
       color: 0xffffff,
       transparent: true,
@@ -4405,12 +4875,12 @@ export class GlobeRenderer {
     const flash = new THREE.Mesh(flashGeom, flashMat);
     explosionGroup.add(flash);
 
-    // Core fireball (orange/red, grows then fades)
-    const fireballGeom = new THREE.SphereGeometry(0.8, 16, 16);
+    // Core fireball (brighter orange, grows then fades)
+    const fireballGeom = new THREE.SphereGeometry(1.2, 16, 16);
     const fireballMat = new THREE.MeshBasicMaterial({
-      color: 0xff4400,
+      color: 0xff6600,
       transparent: true,
-      opacity: 0.9,
+      opacity: 1.0,
       depthTest: true, // Render on top of globe
     });
     const fireball = new THREE.Mesh(fireballGeom, fireballMat);
@@ -5121,6 +5591,242 @@ export class GlobeRenderer {
     }
   }
 
+  /**
+   * Update aircraft positions and rendering.
+   */
+  private updateAircraft(): void {
+    if (!this.gameState) return;
+
+    const existingIds = new Set(this.aircraftObjects.keys());
+
+    for (const aircraft of getAircraft(this.gameState)) {
+      if (aircraft.status !== 'flying') continue;
+
+      existingIds.delete(aircraft.id);
+
+      const isMine = aircraft.ownerId === this.playerId;
+
+      // Position at aircraft altitude
+      const pos3d = geoToSphere(aircraft.geoPosition, GLOBE_RADIUS + aircraft.altitude);
+
+      let objects = this.aircraftObjects.get(aircraft.id);
+
+      if (!objects) {
+        // Create new aircraft mesh
+        const mesh = this.createAircraftMesh(aircraft.type, isMine);
+        mesh.scale.setScalar(0.8);
+        mesh.userData = { type: 'aircraft', id: aircraft.id, aircraft };
+        this.aircraftGroup.add(mesh);
+        objects = { mesh };
+        this.aircraftObjects.set(aircraft.id, objects);
+      }
+
+      // Update position
+      objects.mesh.position.set(pos3d.x, pos3d.y, pos3d.z);
+
+      // Make aircraft face outward from globe center, then rotate to heading
+      const outward = new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z).normalize();
+      objects.mesh.lookAt(0, 0, 0);
+      objects.mesh.rotateX(Math.PI);
+
+      // Rotate to heading (0 = north, 90 = east)
+      const headingRad = (aircraft.heading * Math.PI) / 180;
+      objects.mesh.rotateZ(headingRad + Math.PI / 2);
+
+      // Update aircraft data for click handling
+      objects.mesh.userData.aircraft = aircraft;
+
+      // Show waypoint path when aircraft is selected
+      const isSelected = this.selectedAircraftId === aircraft.id;
+      if (isSelected && isMine && !objects.waypointLine) {
+        // Build control points for spline: current position -> remaining waypoints -> airfield
+        const controlPoints: GeoPosition[] = [aircraft.geoPosition];
+
+        for (let i = aircraft.currentWaypointIndex; i < aircraft.waypoints.length; i++) {
+          controlPoints.push(aircraft.waypoints[i]);
+        }
+
+        // Add return to airfield
+        const airfield = this.gameState.buildings[aircraft.airfieldId] as Airfield | undefined;
+        if (airfield?.geoPosition) {
+          controlPoints.push(airfield.geoPosition);
+        }
+
+        if (controlPoints.length > 1) {
+          // Generate spline path with many sample points
+          const pathPoints: THREE.Vector3[] = [];
+          const numSamples = controlPoints.length * 20; // 20 samples per segment
+
+          for (let i = 0; i <= numSamples; i++) {
+            const t = i / numSamples;
+            const geoPos = this.catmullRomGeoInterpolate(controlPoints, t);
+            const pos = geoToSphere(geoPos, GLOBE_RADIUS + aircraft.altitude);
+            pathPoints.push(new THREE.Vector3(pos.x, pos.y, pos.z));
+          }
+
+          const lineGeom = new THREE.BufferGeometry().setFromPoints(pathPoints);
+          const lineMat = new THREE.LineDashedMaterial({
+            color: isMine ? 0x00ff88 : 0xff4444,
+            dashSize: 3,
+            gapSize: 2,
+            transparent: true,
+            opacity: 0.6,
+          });
+          objects.waypointLine = new THREE.Line(lineGeom, lineMat);
+          objects.waypointLine.computeLineDistances();
+          this.aircraftGroup.add(objects.waypointLine);
+        }
+      } else if (!isSelected && objects.waypointLine) {
+        // Remove waypoint line
+        this.aircraftGroup.remove(objects.waypointLine);
+        objects.waypointLine.geometry.dispose();
+        (objects.waypointLine.material as THREE.Material).dispose();
+        objects.waypointLine = undefined;
+      }
+    }
+
+    // Remove departed/destroyed aircraft
+    for (const id of existingIds) {
+      const objects = this.aircraftObjects.get(id);
+      if (objects) {
+        this.aircraftGroup.remove(objects.mesh);
+        this.disposeGroup(objects.mesh);
+        if (objects.waypointLine) {
+          this.aircraftGroup.remove(objects.waypointLine);
+          objects.waypointLine.geometry.dispose();
+          (objects.waypointLine.material as THREE.Material).dispose();
+        }
+        this.aircraftObjects.delete(id);
+      }
+    }
+  }
+
+  /**
+   * Create an aircraft mesh based on type.
+   */
+  private createAircraftMesh(type: string, isMine: boolean): THREE.Group {
+    const group = new THREE.Group();
+    const color = isMine ? COLORS.friendly : COLORS.enemy;
+
+    if (type === 'fighter') {
+      // Small triangle for fighter
+      const points = [
+        new THREE.Vector3(0, 1.5, 0),    // Nose
+        new THREE.Vector3(-0.8, -0.5, 0), // Left wing
+        new THREE.Vector3(0, -0.2, 0),    // Tail notch
+        new THREE.Vector3(0.8, -0.5, 0),  // Right wing
+        new THREE.Vector3(0, 1.5, 0),     // Back to nose
+      ];
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const material = new THREE.LineBasicMaterial({ color });
+      const outline = new THREE.Line(geometry, material);
+      group.add(outline);
+
+      // Fill
+      const fillGeom = new THREE.BufferGeometry();
+      const vertices = new Float32Array([
+        0, 1.5, 0.05,
+        -0.8, -0.5, 0.05,
+        0.8, -0.5, 0.05,
+      ]);
+      fillGeom.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+      const fillMat = new THREE.MeshBasicMaterial({
+        color,
+        transparent: true,
+        opacity: 0.3,
+        side: THREE.DoubleSide,
+      });
+      const fill = new THREE.Mesh(fillGeom, fillMat);
+      group.add(fill);
+    } else if (type === 'bomber') {
+      // Larger shape for bomber
+      const points = [
+        new THREE.Vector3(0, 2, 0),       // Nose
+        new THREE.Vector3(-1.5, 0, 0),    // Left wing tip
+        new THREE.Vector3(-0.5, -0.5, 0), // Left tail
+        new THREE.Vector3(0, -0.3, 0),    // Tail center
+        new THREE.Vector3(0.5, -0.5, 0),  // Right tail
+        new THREE.Vector3(1.5, 0, 0),     // Right wing tip
+        new THREE.Vector3(0, 2, 0),       // Back to nose
+      ];
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const material = new THREE.LineBasicMaterial({ color });
+      const outline = new THREE.Line(geometry, material);
+      group.add(outline);
+
+      // Fill
+      const fillGeom = new THREE.BufferGeometry();
+      const vertices = new Float32Array([
+        // Triangle 1: nose to wings
+        0, 2, 0.05,
+        -1.5, 0, 0.05,
+        1.5, 0, 0.05,
+        // Triangle 2: wings to tail
+        -1.5, 0, 0.05,
+        0, -0.3, 0.05,
+        1.5, 0, 0.05,
+      ]);
+      fillGeom.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+      const fillMat = new THREE.MeshBasicMaterial({
+        color,
+        transparent: true,
+        opacity: 0.3,
+        side: THREE.DoubleSide,
+      });
+      const fill = new THREE.Mesh(fillGeom, fillMat);
+      group.add(fill);
+    } else if (type === 'radar') {
+      // AWACS/Radar plane - distinctive disc-on-top shape
+      const points = [
+        new THREE.Vector3(0, 2.5, 0),       // Nose
+        new THREE.Vector3(-2, 0, 0),        // Left wing tip
+        new THREE.Vector3(-0.5, -0.8, 0),   // Left tail
+        new THREE.Vector3(0, -0.5, 0),      // Tail center
+        new THREE.Vector3(0.5, -0.8, 0),    // Right tail
+        new THREE.Vector3(2, 0, 0),         // Right wing tip
+        new THREE.Vector3(0, 2.5, 0),       // Back to nose
+      ];
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const material = new THREE.LineBasicMaterial({ color });
+      const outline = new THREE.Line(geometry, material);
+      group.add(outline);
+
+      // Radar disc on top
+      const discGeom = new THREE.RingGeometry(0.4, 0.8, 16);
+      const discMat = new THREE.MeshBasicMaterial({
+        color,
+        transparent: true,
+        opacity: 0.5,
+        side: THREE.DoubleSide,
+      });
+      const disc = new THREE.Mesh(discGeom, discMat);
+      disc.position.set(0, 0.5, 0.2);
+      group.add(disc);
+
+      // Fill body
+      const fillGeom = new THREE.BufferGeometry();
+      const vertices = new Float32Array([
+        0, 2.5, 0.05,
+        -2, 0, 0.05,
+        2, 0, 0.05,
+        -2, 0, 0.05,
+        0, -0.5, 0.05,
+        2, 0, 0.05,
+      ]);
+      fillGeom.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
+      const fillMat = new THREE.MeshBasicMaterial({
+        color,
+        transparent: true,
+        opacity: 0.3,
+        side: THREE.DoubleSide,
+      });
+      const fill = new THREE.Mesh(fillGeom, fillMat);
+      group.add(fill);
+    }
+
+    return group;
+  }
+
   // Check if a position is within satellite coverage (for fog of war)
   private getPlayerSatelliteVisionPositions(): GeoPosition[] {
     if (!this.gameState || !this.playerId) return [];
@@ -5392,6 +6098,17 @@ export class GlobeRenderer {
       return;
     }
 
+    // In waypoint mode, add waypoints when clicking on the globe
+    if (this.hudRenderer.isInWaypointMode()) {
+      const globeIntersects = this.raycaster.intersectObject(this.globe);
+      if (globeIntersects.length > 0) {
+        const point = globeIntersects[0].point;
+        const geoPos = this.spherePointToGeo(point);
+        this.hudRenderer.addWaypoint(geoPos);
+      }
+      return;
+    }
+
     // Check for missile clicks first (they're in flight, most interesting)
     const missileIntersects = this.raycaster.intersectObjects(
       this.missileGroup.children,
@@ -5427,6 +6144,7 @@ export class GlobeRenderer {
               // Track the missile - camera will smoothly follow via controls.target.lerp
               this.trackedMissileId = missileId;
               this.selectedSatelliteId = null;
+              this.selectedAircraftId = null;
               this.selectedBuilding = null;
               this.selectedCityInfo = null;
             }
@@ -5434,6 +6152,37 @@ export class GlobeRenderer {
           return;
         }
       }
+    }
+
+    // Check for aircraft clicks
+    const aircraftIntersects = this.raycaster.intersectObjects(
+      this.aircraftGroup.children,
+      true
+    );
+
+    if (aircraftIntersects.length > 0) {
+      let obj = aircraftIntersects[0].object;
+      // Walk up to find the group with aircraft data
+      while (obj && !obj.userData?.aircraft && obj.parent) {
+        obj = obj.parent as THREE.Object3D;
+      }
+      if (obj?.userData?.aircraft) {
+        const aircraft = obj.userData.aircraft as Aircraft;
+        // Only allow selecting player's own aircraft
+        if (aircraft.ownerId === this.playerId) {
+          this.trackedMissileId = null;
+          this.selectedBuilding = null;
+          this.selectedCityInfo = null;
+          this.selectedSatelliteId = null;
+          this.selectedAircraftId = aircraft.id;
+          // Update HUD
+          if (this.gameState) {
+            this.hudRenderer.updateState(this.gameState, this.playerId, null, this.placementMode);
+          }
+          return;
+        }
+      }
+      return;
     }
 
     // Check for satellite clicks
@@ -5456,6 +6205,7 @@ export class GlobeRenderer {
           this.trackedMissileId = null;
           this.selectedBuilding = null;
           this.selectedCityInfo = null;
+          this.selectedAircraftId = null;
           this.selectedSatelliteId = satellite.id;
           // Update HUD
           if (this.gameState) {
@@ -5486,6 +6236,8 @@ export class GlobeRenderer {
         this.trackedMissileId = null;
         // Clear satellite selection
         this.selectedSatelliteId = null;
+        // Clear aircraft selection
+        this.selectedAircraftId = null;
         // Center camera on the building
         const geoPos = building.geoPosition || this.pixelToGeoFallback(building.position);
         this.centerCameraOnGeo(geoPos);
@@ -5568,6 +6320,16 @@ export class GlobeRenderer {
     this.selectedSatelliteId = null;
     this.selectedBuilding = null;
     this.selectedCityInfo = null;
+
+    // Notify callback that building was deselected
+    if (this.onBuildingClickCallback) {
+      this.onBuildingClickCallback(null);
+    }
+
+    // Update HUD with null selected building
+    if (this.gameState) {
+      this.hudRenderer.updateState(this.gameState, this.playerId, null, this.placementMode);
+    }
 
     // Check for globe clicks
     const globeIntersects = this.raycaster.intersectObject(this.globe);
@@ -5802,10 +6564,35 @@ export class GlobeRenderer {
         }
       }
 
+      // Update camera to follow selected aircraft
+      if (this.selectedAircraftId && this.gameState && !this.cameraAnimating) {
+        const selectedAircraft = getAircraft(this.gameState).find(a => a.id === this.selectedAircraftId);
+        if (selectedAircraft && selectedAircraft.status === 'flying') {
+          const aircraftPos = geoToSphere(selectedAircraft.geoPosition, GLOBE_RADIUS + selectedAircraft.altitude);
+          const aircraftVec = new THREE.Vector3(aircraftPos.x, aircraftPos.y, aircraftPos.z);
+
+          // Skip target movement while stabilizing after animation
+          if (this.cameraAnimationStabilizeFrames === 0) {
+            // Calculate current offset from target to camera (preserves user's rotation)
+            const cameraOffset = this.camera.position.clone().sub(this.controls.target);
+
+            // Lerp target toward aircraft position
+            this.controls.target.lerp(aircraftVec, 0.25);
+
+            // Move camera position to maintain same offset from new target position
+            this.camera.position.copy(this.controls.target).add(cameraOffset);
+          }
+        } else {
+          // Aircraft landed or destroyed, clear selection
+          this.selectedAircraftId = null;
+          this.controls.target.lerp(new THREE.Vector3(0, 0, 0), 0.05);
+        }
+      }
+
       // Skip all orbit controls updates during camera animation
       if (!this.cameraAnimating) {
         // Return orbit target to globe center when nothing is being tracked
-        const isTrackingAnything = this.trackedMissileId || this.selectedSatelliteId;
+        const isTrackingAnything = this.trackedMissileId || this.selectedSatelliteId || this.selectedAircraftId;
         if (!isTrackingAnything && !this.controls.target.equals(new THREE.Vector3(0, 0, 0))) {
           // Smoothly return to origin (globe center)
           this.controls.target.lerp(new THREE.Vector3(0, 0, 0), 0.05);
@@ -5854,6 +6641,9 @@ export class GlobeRenderer {
       // Update game objects
       this.updateGameObjects();
 
+      // Animate building selection ring
+      this.animateSelectionRing(time);
+
       // Update communication chain visualization (for tracked interceptor)
       this.updateCommunicationChain(deltaTime);
 
@@ -5882,6 +6672,29 @@ export class GlobeRenderer {
       this.animationFrame = requestAnimationFrame(render);
     };
     this.animationFrame = requestAnimationFrame(render);
+  }
+
+  /**
+   * Animate the pulsing selection ring on the selected building.
+   */
+  private animateSelectionRing(time: number): void {
+    if (!this.selectedBuilding) return;
+
+    const marker = this.buildingMarkers.get(this.selectedBuilding.id);
+    if (!marker) return;
+
+    const ring = marker.getObjectByName('selectionRing') as THREE.Mesh | undefined;
+    if (!ring) return;
+
+    // Pulse scale between 0.9 and 1.1
+    const pulseSpeed = 3; // Pulses per second
+    const scale = 1 + 0.1 * Math.sin(time * pulseSpeed);
+    ring.scale.setScalar(scale);
+
+    // Also pulse opacity slightly
+    if (ring.material instanceof THREE.MeshBasicMaterial) {
+      ring.material.opacity = 0.5 + 0.3 * Math.sin(time * pulseSpeed);
+    }
   }
 
   private animateRadarSweeps(): void {
