@@ -677,6 +677,89 @@
   color: var(--terminal-primary);
 }
 
+/* Audio Options */
+.audio-options {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.audio-option {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.audio-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 100px;
+  cursor: pointer;
+}
+
+.audio-label input[type="checkbox"] {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--terminal-primary);
+  background: transparent;
+  cursor: pointer;
+  position: relative;
+}
+
+.audio-label input[type="checkbox"]:checked::after {
+  content: '✓';
+  position: absolute;
+  top: -2px;
+  left: 1px;
+  color: var(--terminal-primary);
+  font-size: 12px;
+}
+
+.volume-slider {
+  flex: 1;
+  height: 4px;
+  appearance: none;
+  background: var(--terminal-secondary);
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.volume-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  background: var(--terminal-primary);
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.volume-slider::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  background: var(--terminal-primary);
+  border: none;
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.volume-slider:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.volume-slider:disabled::-webkit-slider-thumb {
+  cursor: not-allowed;
+}
+
+.volume-value {
+  min-width: 40px;
+  text-align: right;
+  color: var(--terminal-secondary);
+  font-size: 11px;
+}
+
 /* ============ NETWORK TAB ============ */
 
 .network-tab {

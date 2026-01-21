@@ -1,4 +1,5 @@
-import { useEffect, useRef, useCallback, useState } from 'react';
+import { useEffect, useRef, useCallback } from 'react';
+import { useAudioStore } from '../stores/audioStore';
 
 const MUSIC_TRACKS = [
   '/assets/music/cyberpunk.mp3',
@@ -8,24 +9,27 @@ const MUSIC_TRACKS = [
 
 const MIN_DELAY = 5000;  // 5 seconds
 const MAX_DELAY = 30000; // 30 seconds
-const DEFAULT_VOLUME = 0.3;
-
-interface MusicState {
-  isPlaying: boolean;
-  currentTrack: string | null;
-  volume: number;
-}
+const FADE_DURATION = 2000; // 2 seconds fade in/out
+const FADE_OUT_BEFORE_END = 3000; // Start fade out 3 seconds before track ends
 
 export function useBackgroundMusic() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const timeoutRef = useRef<number | null>(null);
-  const [state, setState] = useState<MusicState>({
-    isPlaying: false,
-    currentTrack: null,
-    volume: DEFAULT_VOLUME,
-  });
+  const fadeIntervalRef = useRef<number | null>(null);
   const lastTrackRef = useRef<string | null>(null);
-  const isEnabledRef = useRef(true);
+  const targetVolumeRef = useRef(0);
+
+  const musicVolume = useAudioStore((s) => s.musicVolume);
+  const musicEnabled = useAudioStore((s) => s.musicEnabled);
+
+  // Update target volume when store changes
+  useEffect(() => {
+    targetVolumeRef.current = musicVolume;
+    // If not fading, apply volume immediately
+    if (audioRef.current && !fadeIntervalRef.current) {
+      audioRef.current.volume = musicVolume;
+    }
+  }, [musicVolume]);
 
   // Pick a random track (avoiding the last one if possible)
   const pickRandomTrack = useCallback(() => {
@@ -42,11 +46,74 @@ export function useBackgroundMusic() {
     return MIN_DELAY + Math.random() * (MAX_DELAY - MIN_DELAY);
   }, []);
 
-  // Play a specific track
+  // Fade in effect
+  const fadeIn = useCallback((audio: HTMLAudioElement, targetVolume: number, duration: number) => {
+    if (fadeIntervalRef.current) {
+      clearInterval(fadeIntervalRef.current);
+    }
+
+    audio.volume = 0;
+    const startTime = Date.now();
+
+    fadeIntervalRef.current = window.setInterval(() => {
+      const elapsed = Date.now() - startTime;
+      const progress = Math.min(1, elapsed / duration);
+      audio.volume = progress * targetVolume;
+
+      if (progress >= 1) {
+        if (fadeIntervalRef.current) {
+          clearInterval(fadeIntervalRef.current);
+          fadeIntervalRef.current = null;
+        }
+      }
+    }, 50);
+  }, []);
+
+  // Fade out effect
+  const fadeOut = useCallback((audio: HTMLAudioElement, duration: number): Promise<void> => {
+    return new Promise((resolve) => {
+      if (fadeIntervalRef.current) {
+        clearInterval(fadeIntervalRef.current);
+      }
+
+      const startVolume = audio.volume;
+      const startTime = Date.now();
+
+      fadeIntervalRef.current = window.setInterval(() => {
+        const elapsed = Date.now() - startTime;
+        const progress = Math.min(1, elapsed / duration);
+        audio.volume = startVolume * (1 - progress);
+
+        if (progress >= 1) {
+          if (fadeIntervalRef.current) {
+            clearInterval(fadeIntervalRef.current);
+            fadeIntervalRef.current = null;
+          }
+          resolve();
+        }
+      }, 50);
+    });
+  }, []);
+
+  // Schedule next track after delay
+  const scheduleNextTrack = useCallback(() => {
+    if (!musicEnabled) return;
+
+    const delay = getRandomDelay();
+    console.log(`Next track in ${(delay / 1000).toFixed(1)}s`);
+
+    timeoutRef.current = window.setTimeout(() => {
+      if (musicEnabled) {
+        const track = pickRandomTrack();
+        playTrack(track);
+      }
+    }, delay);
+  }, [getRandomDelay, pickRandomTrack, musicEnabled]);
+
+  // Play a specific track with fade in
   const playTrack = useCallback((trackUrl: string) => {
     if (!audioRef.current) {
       audioRef.current = new Audio();
-      audioRef.current.volume = state.volume;
     }
 
     const audio = audioRef.current;
@@ -54,50 +121,57 @@ export function useBackgroundMusic() {
     lastTrackRef.current = trackUrl;
 
     audio.play().then(() => {
-      setState(s => ({ ...s, isPlaying: true, currentTrack: trackUrl }));
+      // Fade in
+      fadeIn(audio, targetVolumeRef.current, FADE_DURATION);
     }).catch(err => {
-      // Auto-play blocked - user needs to interact first
       console.log('Music autoplay blocked, waiting for user interaction');
     });
-  }, [state.volume]);
+  }, [fadeIn]);
 
-  // Schedule next track after delay
-  const scheduleNextTrack = useCallback(() => {
-    if (!isEnabledRef.current) return;
-
-    const delay = getRandomDelay();
-    console.log(`Next track in ${(delay / 1000).toFixed(1)}s`);
-
-    timeoutRef.current = window.setTimeout(() => {
-      if (isEnabledRef.current) {
-        const track = pickRandomTrack();
-        playTrack(track);
-      }
-    }, delay);
-  }, [getRandomDelay, pickRandomTrack, playTrack]);
-
-  // Handle track ending
+  // Handle timeupdate for fade out before end
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
 
+    let fadeOutTriggered = false;
+
+    const handleTimeUpdate = () => {
+      if (!audio.duration || fadeOutTriggered) return;
+
+      const timeRemaining = audio.duration - audio.currentTime;
+      if (timeRemaining <= FADE_OUT_BEFORE_END / 1000 && timeRemaining > 0) {
+        fadeOutTriggered = true;
+        fadeOut(audio, timeRemaining * 1000);
+      }
+    };
+
     const handleEnded = () => {
-      setState(s => ({ ...s, isPlaying: false, currentTrack: null }));
+      fadeOutTriggered = false;
       scheduleNextTrack();
     };
 
+    const handlePlay = () => {
+      fadeOutTriggered = false;
+    };
+
+    audio.addEventListener('timeupdate', handleTimeUpdate);
     audio.addEventListener('ended', handleEnded);
-    return () => audio.removeEventListener('ended', handleEnded);
-  }, [scheduleNextTrack]);
+    audio.addEventListener('play', handlePlay);
+
+    return () => {
+      audio.removeEventListener('timeupdate', handleTimeUpdate);
+      audio.removeEventListener('ended', handleEnded);
+      audio.removeEventListener('play', handlePlay);
+    };
+  }, [fadeOut, scheduleNextTrack]);
 
   // Start music on first user interaction
   useEffect(() => {
     const startMusic = () => {
-      if (!audioRef.current?.src && isEnabledRef.current) {
+      if (!audioRef.current?.src && musicEnabled) {
         const track = pickRandomTrack();
         playTrack(track);
       }
-      // Remove listeners after first interaction
       document.removeEventListener('click', startMusic);
       document.removeEventListener('keydown', startMusic);
     };
@@ -109,7 +183,29 @@ export function useBackgroundMusic() {
       document.removeEventListener('click', startMusic);
       document.removeEventListener('keydown', startMusic);
     };
-  }, [pickRandomTrack, playTrack]);
+  }, [pickRandomTrack, playTrack, musicEnabled]);
+
+  // Handle enable/disable changes
+  useEffect(() => {
+    if (!musicEnabled) {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      if (audioRef.current) {
+        fadeOut(audioRef.current, 500).then(() => {
+          audioRef.current?.pause();
+        });
+      }
+    } else if (audioRef.current && !audioRef.current.src) {
+      const track = pickRandomTrack();
+      playTrack(track);
+    } else if (audioRef.current?.paused && audioRef.current.src) {
+      audioRef.current.play().then(() => {
+        fadeIn(audioRef.current!, targetVolumeRef.current, FADE_DURATION);
+      });
+    }
+  }, [musicEnabled, fadeOut, fadeIn, pickRandomTrack, playTrack]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -117,65 +213,13 @@ export function useBackgroundMusic() {
       if (timeoutRef.current) {
         clearTimeout(timeoutRef.current);
       }
+      if (fadeIntervalRef.current) {
+        clearInterval(fadeIntervalRef.current);
+      }
       if (audioRef.current) {
         audioRef.current.pause();
         audioRef.current = null;
       }
     };
   }, []);
-
-  // Volume control
-  const setVolume = useCallback((volume: number) => {
-    const clampedVolume = Math.max(0, Math.min(1, volume));
-    setState(s => ({ ...s, volume: clampedVolume }));
-    if (audioRef.current) {
-      audioRef.current.volume = clampedVolume;
-    }
-  }, []);
-
-  // Toggle mute
-  const toggleMute = useCallback(() => {
-    if (audioRef.current) {
-      audioRef.current.muted = !audioRef.current.muted;
-    }
-  }, []);
-
-  // Enable/disable music
-  const setEnabled = useCallback((enabled: boolean) => {
-    isEnabledRef.current = enabled;
-    if (!enabled) {
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-        timeoutRef.current = null;
-      }
-      if (audioRef.current) {
-        audioRef.current.pause();
-        setState(s => ({ ...s, isPlaying: false, currentTrack: null }));
-      }
-    } else if (!audioRef.current?.src) {
-      const track = pickRandomTrack();
-      playTrack(track);
-    }
-  }, [pickRandomTrack, playTrack]);
-
-  // Skip to next track
-  const skipTrack = useCallback(() => {
-    if (timeoutRef.current) {
-      clearTimeout(timeoutRef.current);
-      timeoutRef.current = null;
-    }
-    if (audioRef.current) {
-      audioRef.current.pause();
-    }
-    const track = pickRandomTrack();
-    playTrack(track);
-  }, [pickRandomTrack, playTrack]);
-
-  return {
-    ...state,
-    setVolume,
-    toggleMute,
-    setEnabled,
-    skipTrack,
-  };
 }
