@@ -1,6 +1,7 @@
 import { useRef, useEffect, useCallback } from 'react';
 import { useGameStore } from '../stores/gameStore';
 import { useNetworkStore } from '../stores/networkStore';
+import { useHackingStore } from '../stores/hackingStore';
 import { GlobeRenderer } from '../renderer/GlobeRenderer';
 import { type Vector2, type Silo, type SiloMode, type GeoPosition, type Building, geoToPixel } from '@defcon/shared';
 import type { ManualInterceptState } from '../stores/gameStore';
@@ -34,7 +35,59 @@ export default function Game() {
   const clearInterceptSelection = useGameStore((s) => s.clearInterceptSelection);
   const manualInterceptState = useGameStore((s) => s.manualIntercept);
 
-  // Debug panel keyboard toggle
+  // Hacking network store
+  const initHackingNetwork = useHackingStore((s) => s.initNetwork);
+  const hackingNetworkState = useHackingStore((s) => ({
+    nodes: s.nodes,
+    connections: s.connections,
+    activeHacks: s.activeHacks,
+    playerSourceNodeId: s.playerSourceNodeId,
+    networkVisible: s.networkVisible,
+  }));
+  const toggleHackingNetworkVisible = useHackingStore((s) => s.toggleNetworkVisible);
+  const startDemoHack = useHackingStore((s) => s.startDemoHack);
+  const updateHackProgress = useHackingStore((s) => s.updateHackProgress);
+  const getActiveHacksArray = useHackingStore((s) => s.getActiveHacksArray);
+
+  // Initialize hacking network on mount
+  useEffect(() => {
+    initHackingNetwork();
+  }, [initHackingNetwork]);
+
+  // Animate active hacks
+  useEffect(() => {
+    let lastTime = performance.now();
+    let animationFrame: number;
+
+    const animate = () => {
+      const now = performance.now();
+      const deltaTime = (now - lastTime) / 1000;
+      lastTime = now;
+
+      // Update progress for all active hacks
+      const activeHacks = getActiveHacksArray();
+      for (const hack of activeHacks) {
+        if (hack.status === 'routing' || hack.status === 'active') {
+          // Calculate progress based on elapsed time and total latency
+          const elapsed = now - hack.startTime;
+          const newProgress = Math.min(1, elapsed / hack.route.totalLatency);
+          updateHackProgress(hack.id, newProgress);
+        }
+      }
+
+      animationFrame = requestAnimationFrame(animate);
+    };
+
+    animationFrame = requestAnimationFrame(animate);
+
+    return () => {
+      if (animationFrame) {
+        cancelAnimationFrame(animationFrame);
+      }
+    };
+  }, [getActiveHacksArray, updateHackProgress]);
+
+  // Debug panel and hacking network keyboard toggles
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'd' || e.key === 'D') {
@@ -42,10 +95,18 @@ export default function Game() {
           rendererRef.current.toggleDebugPanel();
         }
       }
+      // 'N' key toggles network visibility
+      if (e.key === 'n' || e.key === 'N') {
+        toggleHackingNetworkVisible();
+      }
+      // 'H' key starts a demo hack
+      if (e.key === 'h' || e.key === 'H') {
+        startDemoHack();
+      }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
+  }, [toggleHackingNetworkVisible, startDemoHack]);
 
   // Convert geo position to pixel position for server
   const geoToPixelPosition = useCallback((geo: GeoPosition): Vector2 => {
@@ -185,7 +246,7 @@ export default function Game() {
     );
 
     // Subscribe directly to store for immediate updates (bypasses React render cycle)
-    const unsubscribe = useGameStore.subscribe((state) => {
+    const unsubscribeGame = useGameStore.subscribe((state) => {
       if (state.gameState) {
         renderer.setGameState(state.gameState, state.playerId);
       }
@@ -195,14 +256,36 @@ export default function Game() {
       renderer.setManualInterceptState(state.manualIntercept);
     });
 
+    // Subscribe to hacking store
+    const unsubscribeHacking = useHackingStore.subscribe((state) => {
+      renderer.setHackingNetworkState({
+        nodes: state.nodes,
+        connections: state.connections,
+        activeHacks: state.activeHacks,
+        playerSourceNodeId: state.playerSourceNodeId,
+        networkVisible: state.networkVisible,
+      });
+    });
+
     // Initial state
     const initialState = useGameStore.getState();
     if (initialState.gameState) {
       renderer.setGameState(initialState.gameState, initialState.playerId);
     }
 
+    // Initial hacking network state
+    const initialHackingState = useHackingStore.getState();
+    renderer.setHackingNetworkState({
+      nodes: initialHackingState.nodes,
+      connections: initialHackingState.connections,
+      activeHacks: initialHackingState.activeHacks,
+      playerSourceNodeId: initialHackingState.playerSourceNodeId,
+      networkVisible: initialHackingState.networkVisible,
+    });
+
     return () => {
-      unsubscribe();
+      unsubscribeGame();
+      unsubscribeHacking();
       renderer.destroy();
     };
   }, [handleGlobeClick, handleBuildingClick, handleModeChange, handlePlacementModeChange, handleLaunchSatellite, sendDebugCommand, enableAI, disableAI, handleEnemyICBMClick, handleToggleInterceptSilo, handleLaunchIntercept, handleCancelIntercept]);

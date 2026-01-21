@@ -55,7 +55,7 @@ export class HUDRenderer {
   // Callbacks
   private onModeChange: ((siloId: string, mode: 'air_defense' | 'icbm') => void) | null = null;
   private onPlacementMode: ((type: string | null) => void) | null = null;
-  private onViewToggle: ((toggle: 'radar' | 'grid' | 'labels' | 'trails', value: boolean) => void) | null = null;
+  private onViewToggle: ((toggle: 'radar' | 'grid' | 'labels' | 'trails' | 'network', value: boolean) => void) | null = null;
   private onLaunchSatellite: ((facilityId: string, inclination: number) => void) | null = null;
   private onDebugCommand: ((command: string, value?: number, targetRegion?: string) => void) | null = null;
   private onEnableAI: ((region: string) => void) | null = null;
@@ -76,6 +76,7 @@ export class HUDRenderer {
     grid: true,
     labels: true,
     trails: true,
+    network: false,
   };
 
   // Debug panel state
@@ -140,7 +141,7 @@ export class HUDRenderer {
   setCallbacks(
     onModeChange: (siloId: string, mode: 'air_defense' | 'icbm') => void,
     onPlacementMode: (type: string | null) => void,
-    onViewToggle?: (toggle: 'radar' | 'grid' | 'labels' | 'trails', value: boolean) => void,
+    onViewToggle?: (toggle: 'radar' | 'grid' | 'labels' | 'trails' | 'network', value: boolean) => void,
     onLaunchSatellite?: (facilityId: string, inclination: number) => void
   ): void {
     this.onModeChange = onModeChange;
@@ -149,7 +150,7 @@ export class HUDRenderer {
     this.onLaunchSatellite = onLaunchSatellite || null;
   }
 
-  setViewToggles(toggles: { radar: boolean; grid: boolean; labels: boolean; trails: boolean }): void {
+  setViewToggles(toggles: { radar: boolean; grid: boolean; labels: boolean; trails: boolean; network: boolean }): void {
     this.viewToggles = { ...toggles };
   }
 
@@ -1072,11 +1073,12 @@ export class HUDRenderer {
     const toggleSpacing = 4;
     const panelPadding = 8;
 
-    const toggles: Array<{ key: 'radar' | 'grid' | 'labels' | 'trails'; label: string }> = [
+    const toggles: Array<{ key: 'radar' | 'grid' | 'labels' | 'trails' | 'network'; label: string }> = [
       { key: 'radar', label: 'RADAR' },
       { key: 'grid', label: 'GRID' },
       { key: 'labels', label: 'LABELS' },
       { key: 'trails', label: 'TRAILS' },
+      { key: 'network', label: 'NETWORK' },
     ];
 
     const panelWidth = toggles.length * (toggleWidth + toggleSpacing) - toggleSpacing + panelPadding * 2;
