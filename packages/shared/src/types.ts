@@ -185,9 +185,6 @@ export interface Satellite {
 // Missile flight phases for interceptors (legacy)
 export type InterceptorFlightPhase = 'boost' | 'track';
 
-// Physics-based interceptor phases (new system)
-export type InterceptorPhase = 'boost' | 'pitch' | 'cruise' | 'terminal' | 'coast';
-
 // Missile in flight (legacy/ICBM system)
 export interface Missile {
   id: string;
@@ -220,61 +217,6 @@ export interface Missile {
   missDirection?: GeoPosition;       // Direction to continue flying after missing
 }
 
-// Physics-based missile (legacy - being replaced by RailInterceptor)
-// Uses real physics simulation instead of progress-based curves
-export interface PhysicsMissile {
-  id: string;
-  type: 'interceptor';
-  ownerId: string;
-  sourceId: string;
-
-  // Physics state (server-authoritative)
-  position: { x: number; y: number; z: number };   // Current 3D position
-  velocity: { x: number; y: number; z: number };   // Velocity vector (units/sec)
-  heading: { x: number; y: number; z: number };    // Direction missile is pointing
-
-  // Engine/fuel
-  fuel: number;                // Remaining burn time (seconds)
-  maxFuel: number;             // Starting fuel (e.g., 8 seconds)
-  thrust: number;              // Current thrust level
-
-  // Guidance
-  phase: InterceptorPhase;
-  targetId?: string;
-  predictedInterceptPoint?: { x: number; y: number; z: number };
-  timeToIntercept?: number;
-
-  // Status
-  launchTime: number;
-  intercepted: boolean;
-  detonated: boolean;
-  engineFlameout: boolean;
-  flameoutTime?: number;  // Timestamp when engine flamed out
-  flameoutPosition?: { x: number; y: number; z: number };  // Position when engine flamed out
-
-  // For rendering compatibility (derived from position)
-  geoCurrentPosition?: GeoPosition;
-
-  // Legacy compatibility fields (for gradual migration)
-  launchPosition?: Vector2;
-  targetPosition?: Vector2;
-  currentPosition?: Vector2;
-  progress?: number;
-  flightDuration?: number;
-  geoLaunchPosition?: GeoPosition;
-  geoTargetPosition?: GeoPosition;
-  apexHeight?: number;
-
-  // Legacy interceptor fields (maintained for compatibility)
-  detectedByRadarId?: string;
-  launchingSiloId?: string;
-  lastKnownTargetPosition?: GeoPosition;
-  flightPhase?: InterceptorFlightPhase;
-  boostEndProgress?: number;
-  missedTarget?: boolean;
-  maxFlightDuration?: number;
-  missDirection?: GeoPosition;
-}
 
 // ICBM flight phase for hit probability calculation
 export type IcbmPhase = 'boost' | 'midcourse' | 'reentry';
@@ -300,6 +242,16 @@ export interface GuidedInterceptor {
   targetId: string;            // ICBM being intercepted
   hasGuidance: boolean;        // False = ballistic (lost radar lock)
   trackingRadarIds: string[];  // Radars currently providing guidance
+
+  // Prediction accuracy (radar-guided improvement over time)
+  predictionError: number;        // Current error magnitude (0 = perfect, starts ~0.15-0.25)
+  lastRadarUpdateTime: number;    // When prediction was last improved
+
+  // Error biases (random per-interceptor, stay constant during flight)
+  // These determine the direction of error for each component
+  progressErrorBias: number;      // -1 to 1: thinks ICBM is ahead (+) or behind (-) on path
+  altitudeErrorBias: number;      // -1 to 1: thinks ICBM is higher (+) or lower (-)
+  speedErrorBias: number;         // -1 to 1: thinks ICBM is faster (+) or slower (-)
 
   // Fuel/timing
   launchTime: number;
@@ -330,94 +282,21 @@ export interface GuidedInterceptor {
 }
 
 // Type guard for guided interceptors
-export function isGuidedInterceptor(m: Missile | PhysicsMissile | RailInterceptor | GuidedInterceptor | null | undefined): m is GuidedInterceptor {
+export function isGuidedInterceptor(m: Missile | GuidedInterceptor | null | undefined): m is GuidedInterceptor {
   if (!m) return false;
   return m.type === 'guided_interceptor' && 'heading' in m && 'climbAngle' in m;
 }
 
-// Rail-based interceptor (new deterministic system)
-// Pre-calculates a ballistic arc at launch, flies along it like an ICBM
-export interface RailInterceptor {
-  id: string;
-  type: 'rail_interceptor';
-  ownerId: string;
-  sourceId: string;  // Launching silo
 
-  // Pre-calculated rail (set at launch, doesn't change)
-  rail: {
-    startGeo: GeoPosition;       // Launch position
-    endGeo: GeoPosition;         // Interception point
-    endAltitude: number;         // Altitude at intercept (matches ICBM altitude there)
-    apexHeight: number;          // Peak altitude of ballistic arc
-    flightDuration: number;      // Total flight time in ms
-  };
-
-  // Target information
-  targetId: string;                    // ICBM being intercepted
-  targetProgressAtIntercept: number;   // Expected ICBM progress when we intercept
-
-  // Radar tracking
-  tracking: {
-    radarIds: string[];           // Radars currently tracking the ICBM
-    hasGuidance: boolean;         // True if at least one radar can see target
-    lostGuidanceTime?: number;    // Timestamp when guidance was lost (2s grace period)
-  };
-
-  // State
-  fuel: number;           // Remaining fuel (seconds), used for hit probability penalty
-  maxFuel: number;        // Max fuel capacity (e.g., 10 seconds)
-  launchTime: number;     // When launched
-  progress: number;       // 0-1 along rail
-  status: 'active' | 'missed' | 'hit' | 'crashed';
-
-  // Compatibility flags for rendering (derived from status)
-  intercepted: boolean;   // Always false for interceptors (they intercept, not get intercepted)
-  detonated: boolean;     // True when status is 'hit' or 'crashed'
-
-  // Current position (derived from progress along rail)
-  geoCurrentPosition?: GeoPosition;
-  currentAltitude?: number;
-
-  // Miss trajectory (when status = 'missed')
-  missBehavior?: {
-    missStartTime: number;   // When the miss was determined
-    missStartProgress: number; // Progress along rail when miss occurred
-    endGeo: GeoPosition;     // Where the missile will crash
-    duration: number;        // How long until crash (ms)
-  };
-
-  // Legacy compatibility fields for rendering
-  launchPosition?: Vector2;
-  targetPosition?: Vector2;
-  currentPosition?: Vector2;
-  geoLaunchPosition?: GeoPosition;
-  geoTargetPosition?: GeoPosition;
-
-  // Compatibility fields (mirrors rail data for easier access)
-  flightDuration?: number;  // Same as rail.flightDuration
-  apexHeight?: number;      // Same as rail.apexHeight
-}
-
-// Type guard to check if a missile is using the old physics system
-export function isPhysicsMissile(m: Missile | PhysicsMissile | RailInterceptor | GuidedInterceptor | null | undefined): m is PhysicsMissile {
-  if (!m) return false;
-  return 'velocity' in m && 'thrust' in m && 'phase' in m && typeof (m as PhysicsMissile).fuel === 'number';
-}
-
-// Type guard to check if a missile is a rail-based interceptor
-export function isRailInterceptor(m: Missile | PhysicsMissile | RailInterceptor | GuidedInterceptor | null | undefined): m is RailInterceptor {
-  if (!m) return false;
-  return m.type === 'rail_interceptor' && 'rail' in m && 'tracking' in m;
-}
 
 // Type guard to check if a missile is any kind of interceptor
-export function isInterceptor(m: Missile | PhysicsMissile | RailInterceptor | GuidedInterceptor | null | undefined): boolean {
+export function isInterceptor(m: Missile | GuidedInterceptor | null | undefined): boolean {
   if (!m) return false;
-  return m.type === 'interceptor' || m.type === 'rail_interceptor' || m.type === 'guided_interceptor';
+  return m.type === 'interceptor' || m.type === 'guided_interceptor';
 }
 
 // Combined missile type for game state
-export type AnyMissile = Missile | PhysicsMissile | RailInterceptor | GuidedInterceptor;
+export type AnyMissile = Missile | GuidedInterceptor;
 
 // Full game state
 export interface GameState {
@@ -432,7 +311,7 @@ export interface GameState {
   territories: Record<string, Territory>;
   cities: Record<string, City>;
   buildings: Record<string, Building>;
-  missiles: Record<string, Missile | PhysicsMissile | RailInterceptor | GuidedInterceptor>;
+  missiles: Record<string, Missile | GuidedInterceptor>;
   satellites: Record<string, Satellite>;
   aircraft: Record<string, Aircraft>;
 }
@@ -562,7 +441,7 @@ export type GameStateRecords = {
   territories: Territory;
   cities: City;
   buildings: Building;
-  missiles: Missile | PhysicsMissile | RailInterceptor | GuidedInterceptor;
+  missiles: Missile | GuidedInterceptor;
   satellites: Satellite;
 };
 
@@ -583,7 +462,7 @@ export function getBuildings(state: GameState): Building[] {
   return Object.values(state.buildings);
 }
 
-export function getMissiles(state: GameState): (Missile | PhysicsMissile | RailInterceptor | GuidedInterceptor)[] {
+export function getMissiles(state: GameState): (Missile | GuidedInterceptor)[] {
   return Object.values(state.missiles);
 }
 

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useTerminalStore, type Email } from '../../../stores/terminalStore';
 import { useEvilAI } from '../../../hooks/useEvilAI';
+import { soundEffects } from '../../../audio/SoundEffects';
 
 function formatTime(timestamp: number): string {
   const date = new Date(timestamp);
@@ -106,6 +107,7 @@ export default function EmailTab() {
   }, [emails.length]);
 
   const handleSelectEmail = (email: Email) => {
+    soundEffects.playClick();
     setSelectedEmail(email);
     if (!email.read) {
       markEmailRead(email.id);
@@ -113,6 +115,7 @@ export default function EmailTab() {
   };
 
   const handleBack = () => {
+    soundEffects.playBack();
     setSelectedEmail(null);
   };
 

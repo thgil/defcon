@@ -1,7 +1,12 @@
 import { create } from 'zustand';
+import { v4 as uuidv4 } from 'uuid';
 import {
   type GameState,
   type Building,
+  type Silo,
+  type Radar,
+  type Airfield,
+  type SatelliteLaunchFacility,
   type Missile,
   type AnyMissile,
   type Satellite,
@@ -13,6 +18,8 @@ import {
   type GeoPosition,
   type LaunchDetectedEvent,
   getBuildings,
+  canPlaceBuilding,
+  pixelToGeo,
 } from '@defcon/shared';
 
 // Alert types for HUD display
@@ -59,6 +66,7 @@ interface GameStore {
   finalScores: Record<string, number> | null;
   alerts: GameAlert[];
   manualIntercept: ManualInterceptState;
+  pendingBuildings: Record<string, Building>;  // Optimistic buildings awaiting server confirmation
 
   // Actions
   initGame: (state: GameState, playerId: string) => void;
@@ -85,11 +93,17 @@ interface GameStore {
   toggleInterceptSilo: (siloId: string) => void;
   clearInterceptSelection: () => void;
 
+  // Optimistic building placement actions
+  placeOptimisticBuilding: (buildingType: BuildingType, position: Vector2) => string | null;
+  confirmBuilding: (pendingId: string, serverBuilding: Building) => void;
+  rejectBuilding: (pendingId: string) => void;
+
   // Computed
   getDefconColor: () => string;
   getMyBuildings: () => Building[];
   getMySilos: () => Building[];
   getAlerts: () => GameAlert[];
+  getAllBuildings: () => Building[];  // Combines confirmed + pending buildings
 }
 
 const DEFCON_COLORS: Record<DefconLevel, string> = {
@@ -99,6 +113,10 @@ const DEFCON_COLORS: Record<DefconLevel, string> = {
   2: '#ff8800',
   1: '#ff0000',
 };
+
+// Map dimensions for geo conversion (must match server)
+const MAP_WIDTH = 1000;
+const MAP_HEIGHT = 700;
 
 export const useGameStore = create<GameStore>((set, get) => ({
   gameState: null,
@@ -115,6 +133,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
     selectedSiloIds: new Set(),
     existingInterceptors: [],
   },
+  pendingBuildings: {},
 
   initGame: (state, playerId) => {
     set({
@@ -132,6 +151,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
         selectedSiloIds: new Set(),
         existingInterceptors: [],
       },
+      pendingBuildings: {},
     });
   },
 
@@ -146,6 +166,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
     const newState = { ...gameState, tick, timestamp };
     let updatedSelectedBuilding = selectedBuilding;
     const newAlerts: GameAlert[] = [];
+    const pendingBuildingsToRemove: Set<string> = new Set();
 
     // Validate arrays before iterating (protect against null/undefined)
     const safeEvents = events || [];
@@ -236,12 +257,30 @@ export const useGameStore = create<GameStore>((set, get) => ({
           }
           break;
 
-        case 'building_placed':
+        case 'building_placed': {
           newState.buildings = {
             ...newState.buildings,
             [event.building.id]: event.building,
           };
+          // Reconcile with pending buildings - find matching pending building by position
+          const serverBuildingGeo = event.building.geoPosition;
+          if (serverBuildingGeo) {
+            const currentPendingBuildings = get().pendingBuildings;
+            for (const [pendingId, pendingBuilding] of Object.entries(currentPendingBuildings)) {
+              const pendingGeo = pendingBuilding.geoPosition;
+              if (pendingGeo &&
+                  pendingBuilding.type === event.building.type &&
+                  pendingBuilding.ownerId === event.building.ownerId &&
+                  Math.abs(pendingGeo.lat - serverBuildingGeo.lat) < 0.5 &&
+                  Math.abs(pendingGeo.lng - serverBuildingGeo.lng) < 0.5) {
+                // Found matching pending building - mark for removal
+                pendingBuildingsToRemove.add(pendingId);
+                break;
+              }
+            }
+          }
           break;
+        }
 
         case 'missile_launch':
           // Missile already in updates
@@ -296,11 +335,20 @@ export const useGameStore = create<GameStore>((set, get) => ({
     const currentAlerts = get().alerts.filter(a => a.expiresAt > now);
     const finalAlerts = [...currentAlerts, ...newAlerts];
 
+    // Calculate new pending buildings (removing confirmed ones)
+    let newPendingBuildings = get().pendingBuildings;
+    if (pendingBuildingsToRemove.size > 0) {
+      newPendingBuildings = { ...newPendingBuildings };
+      for (const pendingId of pendingBuildingsToRemove) {
+        delete newPendingBuildings[pendingId];
+      }
+    }
+
     // Update game state and optionally clear placement mode
     if (shouldClearPlacement) {
-      set({ gameState: newState, placementMode: null, selectedBuilding: null, alerts: finalAlerts });
+      set({ gameState: newState, placementMode: null, selectedBuilding: null, alerts: finalAlerts, pendingBuildings: newPendingBuildings });
     } else {
-      set({ gameState: newState, selectedBuilding: updatedSelectedBuilding, alerts: finalAlerts });
+      set({ gameState: newState, selectedBuilding: updatedSelectedBuilding, alerts: finalAlerts, pendingBuildings: newPendingBuildings });
     }
   },
 
@@ -399,5 +447,116 @@ export const useGameStore = create<GameStore>((set, get) => ({
     const { alerts } = get();
     const now = Date.now();
     return alerts.filter(a => a.expiresAt > now);
+  },
+
+  // Optimistic building placement
+  placeOptimisticBuilding: (buildingType: BuildingType, position: Vector2) => {
+    const { gameState, playerId, pendingBuildings } = get();
+    if (!gameState || !playerId) return null;
+
+    const player = gameState.players[playerId];
+    if (!player?.territoryId) return null;
+
+    const territory = gameState.territories[player.territoryId];
+    if (!territory) return null;
+
+    // Convert pixel position to geo
+    const geoPosition = pixelToGeo(position, MAP_WIDTH, MAP_HEIGHT);
+
+    // Validate placement using shared validation
+    if (!canPlaceBuilding(gameState, playerId, buildingType, geoPosition, pendingBuildings)) {
+      return null;
+    }
+
+    // Generate a pending building ID
+    const pendingId = `pending-${uuidv4()}`;
+
+    // Create the optimistic building
+    let building: Building;
+    const baseBuilding = {
+      id: pendingId,
+      territoryId: territory.id,
+      ownerId: playerId,
+      position,
+      health: 100,
+      destroyed: false,
+      geoPosition,
+    };
+
+    switch (buildingType) {
+      case 'silo':
+        building = {
+          ...baseBuilding,
+          type: 'silo',
+          mode: 'air_defense',
+          modeSwitchCooldown: 0,
+          missileCount: 10,
+          airDefenseAmmo: 20,
+          lastFireTime: 0,
+          fireCooldown: 2000,
+        } as Silo;
+        break;
+
+      case 'radar':
+        building = {
+          ...baseBuilding,
+          type: 'radar',
+          range: gameState.config.radarRange,
+          active: true,
+        } as Radar;
+        break;
+
+      case 'airfield':
+        building = {
+          ...baseBuilding,
+          type: 'airfield',
+          fighterCount: 5,
+          bomberCount: 2,
+          radarCount: 1,
+        } as Airfield;
+        break;
+
+      case 'satellite_launch_facility':
+        building = {
+          ...baseBuilding,
+          type: 'satellite_launch_facility',
+          satellites: 3,
+          launchCooldown: 30000,
+          lastLaunchTime: 0,
+        } as SatelliteLaunchFacility;
+        break;
+
+      default:
+        return null;
+    }
+
+    // Add to pending buildings
+    set({
+      pendingBuildings: {
+        ...pendingBuildings,
+        [pendingId]: building,
+      },
+    });
+
+    return pendingId;
+  },
+
+  confirmBuilding: (pendingId: string, serverBuilding: Building) => {
+    const { pendingBuildings } = get();
+    const { [pendingId]: removed, ...rest } = pendingBuildings;
+    set({ pendingBuildings: rest });
+    // The server building is added through normal delta processing
+  },
+
+  rejectBuilding: (pendingId: string) => {
+    const { pendingBuildings } = get();
+    const { [pendingId]: removed, ...rest } = pendingBuildings;
+    set({ pendingBuildings: rest });
+  },
+
+  getAllBuildings: () => {
+    const { gameState, pendingBuildings } = get();
+    if (!gameState) return Object.values(pendingBuildings);
+    return [...getBuildings(gameState), ...Object.values(pendingBuildings)];
   },
 }));

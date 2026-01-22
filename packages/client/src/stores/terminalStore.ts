@@ -55,6 +55,7 @@ interface TerminalState {
   // UI State
   isOpen: boolean;
   isMinimized: boolean;
+  hasPlayedStartup: boolean;
   activeTab: TerminalTab;
   theme: TerminalTheme;
   position: { x: number; y: number };
@@ -83,6 +84,7 @@ interface TerminalState {
   close: () => void;
   minimize: () => void;
   restore: () => void;
+  setHasPlayedStartup: (played: boolean) => void;
   setActiveTab: (tab: TerminalTab) => void;
   setTheme: (theme: TerminalTheme) => void;
   setPosition: (position: { x: number; y: number }) => void;
@@ -122,6 +124,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
   // Initial state
   isOpen: true,
   isMinimized: true,
+  hasPlayedStartup: false,
   activeTab: 'installations',
   theme: 'defcon',
   position: { x: 50, y: 50 },
@@ -153,6 +156,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
   close: () => set({ isOpen: false, isMinimized: false }),
   minimize: () => set({ isMinimized: true }),
   restore: () => set({ isMinimized: false }),
+  setHasPlayedStartup: (played) => set({ hasPlayedStartup: played }),
   setActiveTab: (tab) => set({ activeTab: tab }),
   setTheme: (theme) => set({ theme }),
   setPosition: (position) => set({ position }),

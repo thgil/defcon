@@ -6,6 +6,10 @@ import { useAudioStore } from '../stores/audioStore';
 
 const SOUNDS = {
   icbmImpact: '/assets/sounds/icbm_impact.wav',
+  computerStartup: '/assets/sounds/computer-startup.wav',
+  uiBack: '/assets/sounds/ui/836199__matustrm__ui_back.wav',
+  uiConfirm: '/assets/sounds/ui/836200__matustrm__ui_confirm.wav',
+  uiHover: '/assets/sounds/ui/836201__matustrm__ui_hover.wav',
 } as const;
 
 type SoundName = keyof typeof SOUNDS;
@@ -94,6 +98,34 @@ class SoundEffectsManager {
     // Convert screen position (0-1) to pan value (-1 to 1)
     const pan = (screenX * 2) - 1;
     this.play('icbmImpact', { volume: 1, pan });
+  }
+
+  /**
+   * Play computer startup sound
+   */
+  playComputerStartup() {
+    this.play('computerStartup', { volume: 0.8 });
+  }
+
+  /**
+   * Play UI click/confirm sound
+   */
+  playClick() {
+    this.play('uiConfirm', { volume: 0.5 });
+  }
+
+  /**
+   * Play UI back/cancel sound
+   */
+  playBack() {
+    this.play('uiBack', { volume: 0.5 });
+  }
+
+  /**
+   * Play UI hover sound
+   */
+  playHover() {
+    this.play('uiHover', { volume: 0.3 });
   }
 }
 

@@ -134,6 +134,10 @@ export default function Game() {
     return geoToPixel(geo, MAP_WIDTH, MAP_HEIGHT);
   }, []);
 
+  // Get optimistic placement actions
+  const placeOptimisticBuilding = useGameStore((s) => s.placeOptimisticBuilding);
+  const rejectBuilding = useGameStore((s) => s.rejectBuilding);
+
   // Handle globe click
   const handleGlobeClick = useCallback(
     (geoPosition: GeoPosition) => {
@@ -145,8 +149,27 @@ export default function Game() {
       const position = geoToPixelPosition(geoPosition);
 
       if (placementMode && gameState.defconLevel === 5) {
-        // Place building
-        placeBuilding(placementMode, position);
+        // Optimistic building placement:
+        // 1. Add building locally immediately (if validation passes)
+        // 2. Send to server
+        // 3. Server will confirm/reject via delta events
+        const pendingId = placeOptimisticBuilding(placementMode, position);
+
+        if (pendingId) {
+          // Validation passed - send to server
+          placeBuilding(placementMode, position);
+
+          // Set timeout to reject if server doesn't confirm within 5 seconds
+          // (server confirmation removes pending building via delta reconciliation)
+          setTimeout(() => {
+            const pending = useGameStore.getState().pendingBuildings;
+            if (pending[pendingId]) {
+              // Still pending after timeout - server likely rejected
+              rejectBuilding(pendingId);
+            }
+          }, 5000);
+        }
+        // If pendingId is null, validation failed (limit reached, wrong DEFCON, etc.)
       } else if (gameState.defconLevel === 1) {
         // Launch missile
         const selectedSilo = useGameStore.getState().selectedBuilding;
@@ -158,7 +181,7 @@ export default function Game() {
         }
       }
     },
-    [geoToPixelPosition, placeBuilding, launchMissile]
+    [geoToPixelPosition, placeBuilding, launchMissile, placeOptimisticBuilding, rejectBuilding]
   );
 
   // Handle building click
@@ -300,7 +323,19 @@ export default function Game() {
     // Subscribe directly to store for immediate updates (bypasses React render cycle)
     const unsubscribeGame = useGameStore.subscribe((state) => {
       if (state.gameState) {
-        renderer.setGameState(state.gameState, state.playerId);
+        // Merge pending buildings into gameState for rendering
+        // This allows optimistic buildings to be displayed immediately
+        const hasPendingBuildings = Object.keys(state.pendingBuildings).length > 0;
+        const gameStateForRenderer = hasPendingBuildings
+          ? {
+              ...state.gameState,
+              buildings: {
+                ...state.gameState.buildings,
+                ...state.pendingBuildings,
+              },
+            }
+          : state.gameState;
+        renderer.setGameState(gameStateForRenderer, state.playerId);
       }
       renderer.setPlacementMode(state.placementMode);
       renderer.setSelectedBuilding(state.selectedBuilding);
@@ -319,10 +354,20 @@ export default function Game() {
       });
     });
 
-    // Initial state
+    // Initial state (also merge pending buildings)
     const initialState = useGameStore.getState();
     if (initialState.gameState) {
-      renderer.setGameState(initialState.gameState, initialState.playerId);
+      const hasPendingBuildings = Object.keys(initialState.pendingBuildings).length > 0;
+      const gameStateForRenderer = hasPendingBuildings
+        ? {
+            ...initialState.gameState,
+            buildings: {
+              ...initialState.gameState.buildings,
+              ...initialState.pendingBuildings,
+            },
+          }
+        : initialState.gameState;
+      renderer.setGameState(gameStateForRenderer, initialState.playerId);
     }
 
     // Initial hacking network state

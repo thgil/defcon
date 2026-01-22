@@ -1,4 +1,5 @@
 import { useTerminalStore, type TerminalTab } from '../../stores/terminalStore';
+import { soundEffects } from '../../audio/SoundEffects';
 import EmailTab from './tabs/EmailTab';
 import InstallationsTab from './tabs/InstallationsTab';
 import CommandsTab from './tabs/CommandsTab';
@@ -27,7 +28,10 @@ export default function TerminalScreen() {
           <button
             key={tab.id}
             className={`terminal-tab ${activeTab === tab.id ? 'active' : ''}`}
-            onClick={() => setActiveTab(tab.id)}
+            onClick={() => {
+              soundEffects.playClick();
+              setActiveTab(tab.id);
+            }}
           >
             {tab.label}
             {tab.id === 'email' && unreadCount > 0 && (

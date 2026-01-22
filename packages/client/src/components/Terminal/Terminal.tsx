@@ -1,7 +1,8 @@
-import { useCallback, useRef, useEffect } from 'react';
+import { useCallback, useRef, useEffect, useState } from 'react';
 import { useTerminalStore, TERMINAL_THEMES } from '../../stores/terminalStore';
 import { useEvilAI } from '../../hooks/useEvilAI';
 import { useSystemEmails } from '../../hooks/useSystemEmails';
+import { soundEffects } from '../../audio/SoundEffects';
 import TerminalScreen from './TerminalScreen';
 import HackingOverlay from './HackingOverlay';
 import './Terminal.css';
@@ -19,11 +20,32 @@ export default function Terminal() {
   const glitchActive = useTerminalStore((s) => s.glitchActive);
   const glitchIntensity = useTerminalStore((s) => s.glitchIntensity);
   const getUnreadCount = useTerminalStore((s) => s.getUnreadCount);
+  const hasPlayedStartup = useTerminalStore((s) => s.hasPlayedStartup);
+  const setHasPlayedStartup = useTerminalStore((s) => s.setHasPlayedStartup);
 
   const { aiPresenceLevel } = useEvilAI();
 
+  // Startup animation state
+  const [isStartingUp, setIsStartingUp] = useState(false);
+
   // System emails (DEFCON changes, etc.)
   useSystemEmails();
+
+  // Startup animation - plays once when terminal is first opened
+  useEffect(() => {
+    if (!isMinimized && !hasPlayedStartup) {
+      setIsStartingUp(true);
+      soundEffects.playComputerStartup();
+
+      // Animation duration matches CSS (2.5 seconds)
+      const timer = setTimeout(() => {
+        setIsStartingUp(false);
+        setHasPlayedStartup(true);
+      }, 2500);
+
+      return () => clearTimeout(timer);
+    }
+  }, [isMinimized, hasPlayedStartup, setHasPlayedStartup]);
 
   const dragOffset = useRef({ x: 0, y: 0 });
   const terminalRef = useRef<HTMLDivElement>(null);
@@ -74,7 +96,10 @@ export default function Terminal() {
     return (
       <div
         className="terminal terminal-minimized"
-        onClick={restore}
+        onClick={() => {
+          soundEffects.playClick();
+          restore();
+        }}
         style={{
           '--terminal-primary': themeConfig.primary,
           '--terminal-bg': themeConfig.background,
@@ -96,7 +121,7 @@ export default function Terminal() {
   return (
     <div
       ref={terminalRef}
-      className={`terminal ${glitchActive ? 'glitch' : ''}`}
+      className={`terminal ${glitchActive ? 'glitch' : ''} ${isStartingUp ? 'startup-animation' : ''}`}
       style={{
         left: position.x,
         top: position.y,
@@ -120,6 +145,7 @@ export default function Terminal() {
             className="terminal-minimize"
             onClick={(e) => {
               e.stopPropagation();
+              soundEffects.playBack();
               minimize();
             }}
           >

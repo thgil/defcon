@@ -1,5 +1,6 @@
 import { useTerminalStore, TERMINAL_THEMES, type TerminalTheme } from '../../../stores/terminalStore';
 import { useAudioStore } from '../../../stores/audioStore';
+import { soundEffects } from '../../../audio/SoundEffects';
 
 export default function OptionsTab() {
   const theme = useTerminalStore((s) => s.theme);
@@ -34,7 +35,10 @@ export default function OptionsTab() {
               <input
                 type="checkbox"
                 checked={musicEnabled}
-                onChange={toggleMusic}
+                onChange={() => {
+                  soundEffects.playClick();
+                  toggleMusic();
+                }}
               />
               <span>Music</span>
             </label>
@@ -54,7 +58,10 @@ export default function OptionsTab() {
               <input
                 type="checkbox"
                 checked={sfxEnabled}
-                onChange={toggleSfx}
+                onChange={() => {
+                  soundEffects.playClick();
+                  toggleSfx();
+                }}
               />
               <span>Sound FX</span>
             </label>
@@ -79,7 +86,10 @@ export default function OptionsTab() {
             <button
               key={id}
               className={`theme-option ${theme === id ? 'active' : ''}`}
-              onClick={() => setTheme(id)}
+              onClick={() => {
+                soundEffects.playClick();
+                setTheme(id);
+              }}
               style={{ '--theme-color': config.primary } as React.CSSProperties}
             >
               <span className="theme-indicator" style={{ background: config.primary }} />

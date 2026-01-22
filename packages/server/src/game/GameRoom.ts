@@ -13,7 +13,6 @@ import {
   SatelliteLaunchFacility,
   Satellite,
   Missile,
-  RailInterceptor,
   GuidedInterceptor,
   Aircraft,
   AircraftType,
@@ -37,24 +36,17 @@ import {
   greatCircleDistance,
   geoInterpolate,
   pointInPolygon,
-  isPhysicsMissile,
-  isRailInterceptor,
   isGuidedInterceptor,
   isInterceptor,
-  PhysicsMissile,
 } from '@defcon/shared';
 import { Lobby, LobbyPlayer } from '../lobby/Lobby';
 import { ConnectionManager, Connection } from '../ConnectionManager';
 import { MissileSimulator } from '../simulation/MissileSimulator';
 import { SatelliteSimulator, SATELLITE_CONFIG } from '../simulation/SatelliteSimulator';
-import { RailInterceptorSimulator } from '../simulation/RailInterceptorSimulator';
 import { GuidedInterceptorSimulator } from '../simulation/GuidedInterceptorSimulator';
 import { AircraftSimulator } from '../simulation/AircraftSimulator';
 import { AIPlayer, AIAction } from './AIPlayer';
 import { HackingSystem } from './HackingSystem';
-
-// Feature flag: use guided interceptors (true) or rail interceptors (false)
-const USE_GUIDED_INTERCEPTORS = true;
 
 const TICK_RATE = 20; // 20 Hz
 const TICK_INTERVAL = 1000 / TICK_RATE;
@@ -145,7 +137,6 @@ export class GameRoom {
   private connectionManager: ConnectionManager;
   private missileSimulator: MissileSimulator;
   private satelliteSimulator: SatelliteSimulator;
-  private railInterceptorSimulator: RailInterceptorSimulator;
   private guidedInterceptorSimulator: GuidedInterceptorSimulator;
   private aircraftSimulator: AircraftSimulator;
   private hackingSystem: HackingSystem;
@@ -163,7 +154,6 @@ export class GameRoom {
     this.connectionManager = connectionManager;
     this.missileSimulator = new MissileSimulator(this.config.missileSpeed);
     this.satelliteSimulator = new SatelliteSimulator();
-    this.railInterceptorSimulator = new RailInterceptorSimulator();
     this.guidedInterceptorSimulator = new GuidedInterceptorSimulator();
     this.aircraftSimulator = new AircraftSimulator();
     this.hackingSystem = new HackingSystem();
@@ -298,22 +288,12 @@ export class GameRoom {
     );
     this.pendingEvents.push(...missileEvents);
 
-    // Update interceptors based on feature flag
-    if (USE_GUIDED_INTERCEPTORS) {
-      // Update guided interceptors (proportional navigation)
-      const guidedInterceptorEvents = this.guidedInterceptorSimulator.update(
-        this.state,
-        TICK_INTERVAL / 1000
-      );
-      this.pendingEvents.push(...guidedInterceptorEvents);
-    } else {
-      // Update rail-based interceptors (pre-calculated paths)
-      const railInterceptorEvents = this.railInterceptorSimulator.update(
-        this.state,
-        TICK_INTERVAL / 1000
-      );
-      this.pendingEvents.push(...railInterceptorEvents);
-    }
+    // Update guided interceptors (proportional navigation with radar-improved prediction)
+    const guidedInterceptorEvents = this.guidedInterceptorSimulator.update(
+      this.state,
+      TICK_INTERVAL / 1000
+    );
+    this.pendingEvents.push(...guidedInterceptorEvents);
 
     // Update satellites
     const satelliteEvents = this.satelliteSimulator.update(
@@ -460,24 +440,13 @@ export class GameRoom {
       const best = candidateSilos[0];
       const silo = best.silo;
 
-      // Launch interceptor based on feature flag
-      let interceptor: RailInterceptor | GuidedInterceptor | null;
-
-      if (USE_GUIDED_INTERCEPTORS) {
-        interceptor = this.guidedInterceptorSimulator.launchInterceptor(
-          silo,
-          icbmMissile,
-          silo.ownerId,
-          best.radarIds
-        );
-      } else {
-        interceptor = this.railInterceptorSimulator.launchInterceptor(
-          silo,
-          icbmMissile,
-          silo.ownerId,
-          best.radarIds
-        );
-      }
+      // Launch guided interceptor
+      const interceptor = this.guidedInterceptorSimulator.launchInterceptor(
+        silo,
+        icbmMissile,
+        silo.ownerId,
+        best.radarIds
+      );
 
       if (!interceptor) {
         // Could not calculate valid intercept - skip this missile
@@ -1613,10 +1582,8 @@ export class GameRoom {
       const trackingRadarIds = this.findAllTrackingRadars(missile, playerId);
       if (trackingRadarIds.length === 0) continue;
 
-      // Calculate hit probability using the appropriate interceptor simulator
-      const hitProbability = USE_GUIDED_INTERCEPTORS
-        ? this.guidedInterceptorSimulator.estimateHitProbability(silo, missile, trackingRadarIds.length)
-        : this.railInterceptorSimulator.estimateHitProbability(silo, missile, trackingRadarIds.length);
+      // Calculate hit probability using the guided interceptor simulator
+      const hitProbability = this.guidedInterceptorSimulator.estimateHitProbability(silo, missile, trackingRadarIds.length);
 
       // Estimate where the intercept would occur
       const interceptProgress = this.estimateInterceptProgress(silo, missile);
@@ -1643,12 +1610,14 @@ export class GameRoom {
       .map(m => {
         const sourceSilo = this.state.buildings[m.sourceId] as Silo | undefined;
         const territory = sourceSilo ? this.state.territories[sourceSilo.territoryId] : null;
-        // Estimate time to intercept based on rail interceptor's remaining flight time
+        // Estimate time to intercept based on guided interceptor's remaining flight time
         let estimatedTimeToIntercept = 5000;  // Default
-        if (isRailInterceptor(m)) {
-          const railInterceptor = m as RailInterceptor;
-          const remainingProgress = 1 - railInterceptor.progress;
-          estimatedTimeToIntercept = remainingProgress * railInterceptor.rail.flightDuration;
+        if (isGuidedInterceptor(m)) {
+          const guidedInterceptor = m as GuidedInterceptor;
+          if (guidedInterceptor.flightDuration && guidedInterceptor.progress !== undefined) {
+            const remainingProgress = 1 - guidedInterceptor.progress;
+            estimatedTimeToIntercept = remainingProgress * guidedInterceptor.flightDuration;
+          }
         }
         return {
           interceptorId: m.id,
@@ -1692,24 +1661,13 @@ export class GameRoom {
       const trackingRadarIds = this.findAllTrackingRadars(missile, playerId);
       if (trackingRadarIds.length === 0) continue;
 
-      // Launch interceptor based on feature flag
-      let interceptor: RailInterceptor | GuidedInterceptor | null;
-
-      if (USE_GUIDED_INTERCEPTORS) {
-        interceptor = this.guidedInterceptorSimulator.launchInterceptor(
-          silo,
-          missile,
-          playerId,
-          trackingRadarIds
-        );
-      } else {
-        interceptor = this.railInterceptorSimulator.launchInterceptor(
-          silo,
-          missile,
-          playerId,
-          trackingRadarIds
-        );
-      }
+      // Launch guided interceptor
+      const interceptor = this.guidedInterceptorSimulator.launchInterceptor(
+        silo,
+        missile,
+        playerId,
+        trackingRadarIds
+      );
 
       if (!interceptor) {
         console.log(`[MANUAL INTERCEPT] Could not calculate intercept from silo ${siloId}`);
@@ -1731,8 +1689,7 @@ export class GameRoom {
           : silo.position,
       });
 
-      const interceptorType = USE_GUIDED_INTERCEPTORS ? 'guided' : 'rail';
-      console.log(`[MANUAL INTERCEPT] Player ${playerId} launched ${interceptorType} interceptor from silo ${siloId} at ICBM ${targetMissileId}`);
+      console.log(`[MANUAL INTERCEPT] Player ${playerId} launched guided interceptor from silo ${siloId} at ICBM ${targetMissileId}`);
     }
   }
 

@@ -2,118 +2,27 @@ import { v4 as uuidv4 } from 'uuid';
 import {
   GameState,
   Missile,
-  PhysicsMissile,
   Silo,
   Vector2,
   GameEvent,
-  GeoPosition,
   MissileImpactEvent,
   CityHitEvent,
   BuildingDestroyedEvent,
-  InterceptionEvent,
   pixelToGeo,
   geoInterpolate,
   greatCircleDistance,
-  isPhysicsMissile,
-  isRailInterceptor,
-  geoToCartesian,
-  vec3Normalize,
-  Vector3,
+  isGuidedInterceptor,
 } from '@defcon/shared';
 
 // Map dimensions for converting pixel to geo coordinates
 const MAP_WIDTH = 1000;
 const MAP_HEIGHT = 700;
 
-// Globe radius (must match client)
-const GLOBE_RADIUS = 100;
-
-// Interceptor speed multiplier (faster than ICBMs, but not too fast)
-const INTERCEPTOR_SPEED_MULTIPLIER = 1.25;
-// Base probability of interceptor hitting its target
-const INTERCEPTOR_HIT_PROBABILITY = 0.7;
-// Interceptor boost phase duration (25% of flight for higher climb)
-const INTERCEPTOR_BOOST_DURATION = 0.25;
-// How much longer a missed interceptor continues flying (50% extra)
-const INTERCEPTOR_MISS_EXTENSION = 1.5;
-
 export class MissileSimulator {
   private missileSpeed: number;
 
   constructor(missileSpeed: number) {
     this.missileSpeed = missileSpeed;
-  }
-
-  /**
-   * Launch a physics-based interceptor missile to intercept a target missile.
-   * Uses real physics simulation with velocity, thrust, and guidance.
-   *
-   * Flight phases:
-   * - Boost (0-2s): Vertical launch, full thrust upward
-   * - Pitch (2-3.5s): Smooth tilt-over toward target
-   * - Cruise: Fly toward predicted intercept point
-   * - Terminal: Final aggressive guidance near intercept
-   * - Coast: No fuel - ballistic trajectory (no steering)
-   */
-  launchInterceptor(
-    silo: Silo,
-    targetMissile: Missile,
-    ownerId: string,
-    detectingRadarId?: string
-  ): PhysicsMissile {
-    const launchPosition = { ...silo.position };
-    const geoLaunchPosition = silo.geoPosition || pixelToGeo(launchPosition, MAP_WIDTH, MAP_HEIGHT);
-
-    // Get launch position in 3D (on globe surface)
-    const launchPos3D = geoToCartesian(geoLaunchPosition, 0, GLOBE_RADIUS);
-
-    // Up vector at launch point (for initial heading)
-    const up = vec3Normalize(launchPos3D);
-
-    // Estimate flight duration for legacy compatibility
-    const targetGeo = targetMissile.geoCurrentPosition || targetMissile.geoLaunchPosition || geoLaunchPosition;
-    const angularDistance = greatCircleDistance(geoLaunchPosition, targetGeo);
-    const distance = angularDistance * 100;
-    const flightDuration = Math.max(6000, (distance / (this.missileSpeed * INTERCEPTOR_SPEED_MULTIPLIER)) * 1000);
-
-    return {
-      id: uuidv4(),
-      type: 'interceptor',
-      ownerId,
-      sourceId: silo.id,
-
-      // Physics state - start at silo position, zero velocity, pointing up
-      position: { ...launchPos3D },
-      velocity: { x: 0, y: 0, z: 0 },
-      heading: { ...up },
-
-      // Full fuel tank (8 seconds of burn time)
-      fuel: 8,
-      maxFuel: 8,
-      thrust: 0, // Will be set by physics engine
-
-      // Initial phase
-      phase: 'boost',
-      targetId: targetMissile.id,
-
-      // Status
-      launchTime: Date.now(),
-      intercepted: false,
-      detonated: false,
-      engineFlameout: false,
-
-      // Rendering compatibility
-      geoCurrentPosition: { ...geoLaunchPosition },
-
-      // Legacy compatibility fields
-      launchPosition,
-      targetPosition: { ...targetMissile.currentPosition },
-      currentPosition: { ...launchPosition },
-      progress: 0,
-      flightDuration,
-      geoLaunchPosition,
-      geoTargetPosition: targetGeo,
-    };
   }
 
   launchMissile(
@@ -164,19 +73,15 @@ export class MissileSimulator {
   update(state: GameState, deltaSeconds: number): GameEvent[] {
     const events: GameEvent[] = [];
 
-    // Physics missiles are updated by their own simulator
-    // Rail interceptors are updated by RailInterceptorSimulator
-    // This method only handles legacy ICBMs
+    // Guided interceptors are updated by GuidedInterceptorSimulator
+    // This method only handles ICBMs
 
     // Update all ICBM positions (skip interceptors)
     for (const missile of Object.values(state.missiles)) {
       if (missile.detonated || missile.intercepted) continue;
 
-      // Skip physics-based missiles - they're updated by their own simulator
-      if (isPhysicsMissile(missile)) continue;
-
-      // Skip rail interceptors - they're updated by RailInterceptorSimulator
-      if (isRailInterceptor(missile)) continue;
+      // Skip guided interceptors - they're updated by GuidedInterceptorSimulator
+      if (isGuidedInterceptor(missile)) continue;
 
       // Cast to Missile type (we've eliminated other types)
       const icbm = missile as Missile;
@@ -202,11 +107,8 @@ export class MissileSimulator {
     for (const missile of Object.values(state.missiles)) {
       if (missile.detonated || missile.intercepted) continue;
 
-      // Skip physics-based missiles
-      if (isPhysicsMissile(missile)) continue;
-
-      // Skip rail interceptors
-      if (isRailInterceptor(missile)) continue;
+      // Skip guided interceptors
+      if (isGuidedInterceptor(missile)) continue;
 
       const icbm = missile as Missile;
       if (icbm.progress >= 1) {
