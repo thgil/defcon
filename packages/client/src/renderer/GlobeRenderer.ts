@@ -201,8 +201,14 @@ export class GlobeRenderer {
     traceLine: THREE.Line;
     tracePoints: THREE.Vector3[];  // Pre-calculated curve points
     glowLine: THREE.Line;
+    // Counter-trace (trace-back from target to source)
+    counterTraceHead: THREE.Mesh;
+    counterTraceLine: THREE.Line;
+    counterGlowLine: THREE.Line;
   }>();
   private hackingAnimationTime = 0;
+  // Smoothed display progress for each hack (lerps toward server progress)
+  private hackingDisplayProgress = new Map<string, { progress: number; traceProgress: number }>();
 
   private territoryMeshes = new Map<string, THREE.Mesh>();
   private radarCoverageBeams = new Map<string, THREE.Group>();
@@ -308,6 +314,8 @@ export class GlobeRenderer {
 
   // Camera tracking - for following missiles or centering on objects
   private trackedMissileId: string | null = null;
+  // Linked target ICBM (auto-selected when clicking an interceptor with a target)
+  private linkedTargetId: string | null = null;
   private cameraTargetGeo: GeoPosition | null = null;
   private cameraAnimating: boolean = false;
   private cameraAnimationStabilizeFrames: number = 0;
@@ -343,6 +351,7 @@ export class GlobeRenderer {
   private flameoutMarker: THREE.Group | null = null;
   private missileStatsLabel: THREE.Sprite | null = null;
   private interceptorProjectedPath: THREE.Line | null = null;
+  private targetIcbmProjectedPath: THREE.Line | null = null;
 
   // Fog of war toggle (for debug mode)
   private fogOfWarDisabled: boolean = false;
@@ -4266,6 +4275,11 @@ export class GlobeRenderer {
           const interceptorPosition = new THREE.Vector3(interceptorPos3D.x, interceptorPos3D.y, interceptorPos3D.z);
           this.createInterceptorProjectedPath(interceptorPosition, markerPosition);
         }
+
+        // Render target ICBM's projected path if this interceptor is selected
+        if (this.linkedTargetId === icbm.id) {
+          this.createTargetIcbmProjectedPath(icbm);
+        }
       }
       return;
     }
@@ -4855,6 +4869,15 @@ export class GlobeRenderer {
       }
       this.interceptorProjectedPath = null;
     }
+
+    if (this.targetIcbmProjectedPath) {
+      this.interceptPredictionGroup.remove(this.targetIcbmProjectedPath);
+      this.targetIcbmProjectedPath.geometry.dispose();
+      if (this.targetIcbmProjectedPath.material instanceof THREE.Material) {
+        this.targetIcbmProjectedPath.material.dispose();
+      }
+      this.targetIcbmProjectedPath = null;
+    }
   }
 
   /**
@@ -4879,6 +4902,53 @@ export class GlobeRenderer {
     line.computeLineDistances(); // Required for dashed lines
 
     this.interceptorProjectedPath = line;
+    this.interceptPredictionGroup.add(line);
+  }
+
+  /**
+   * Create a line showing the target ICBM's projected path from current position to target.
+   */
+  private createTargetIcbmProjectedPath(icbm: Missile): void {
+    if (!icbm.geoCurrentPosition || !icbm.geoTargetPosition || !icbm.geoLaunchPosition) return;
+
+    const icbmApex = icbm.apexHeight || 30;
+
+    // Create points along the ICBM's remaining path
+    const points: THREE.Vector3[] = [];
+    const numSegments = 32;
+
+    for (let i = 0; i <= numSegments; i++) {
+      // Interpolate progress from current to target
+      const t = i / numSegments;
+      const progress = icbm.progress + (1 - icbm.progress) * t;
+
+      // Get geo position at this progress
+      const geo = geoInterpolate(icbm.geoLaunchPosition, icbm.geoTargetPosition, progress);
+
+      // Get altitude at this progress using the ballistic arc
+      const altitude = getIcbmAltitude(progress, icbmApex, 0.6);
+
+      // Convert to 3D position
+      const pos3D = geoToSphere(geo, GLOBE_RADIUS + altitude);
+      points.push(new THREE.Vector3(pos3D.x, pos3D.y, pos3D.z));
+    }
+
+    const geometry = new THREE.BufferGeometry().setFromPoints(points);
+
+    // Use red/orange dashed line to distinguish from interceptor path
+    const material = new THREE.LineDashedMaterial({
+      color: 0xff6600,
+      dashSize: 2,
+      gapSize: 1,
+      linewidth: 1,
+      transparent: true,
+      opacity: 0.6,
+    });
+
+    const line = new THREE.Line(geometry, material);
+    line.computeLineDistances();
+
+    this.targetIcbmProjectedPath = line;
     this.interceptPredictionGroup.add(line);
   }
 
@@ -6214,6 +6284,8 @@ export class GlobeRenderer {
         const building = obj.userData.building as Building;
         // Stop any missile tracking
         this.trackedMissileId = null;
+        // Clear linked target
+        this.linkedTargetId = null;
         // Clear satellite selection
         this.selectedSatelliteId = null;
         // Clear aircraft selection
@@ -6262,6 +6334,13 @@ export class GlobeRenderer {
               this.selectedAircraftId = null;
               this.selectedBuilding = null;
               this.selectedCityInfo = null;
+
+              // If this is an interceptor with a target, also link to the target ICBM
+              if (isInterceptorType(missile) && (missile as any).targetId) {
+                this.linkedTargetId = (missile as any).targetId;
+              } else {
+                this.linkedTargetId = null;
+              }
             }
           }
           return;
@@ -6401,6 +6480,7 @@ export class GlobeRenderer {
 
     // Stop tracking and clear all selections when clicking elsewhere
     this.trackedMissileId = null;
+    this.linkedTargetId = null;
     this.selectedSatelliteId = null;
     this.selectedBuilding = null;
     this.selectedCityInfo = null;
@@ -6978,6 +7058,7 @@ export class GlobeRenderer {
       (trace.glowLine.material as THREE.Material).dispose();
     }
     this.hackingActiveTraces.clear();
+    this.hackingDisplayProgress.clear();
   }
 
   /**
@@ -7122,13 +7203,23 @@ export class GlobeRenderer {
           this.hackingNetworkGroup.remove(trace.traceHead);
           this.hackingNetworkGroup.remove(trace.traceLine);
           this.hackingNetworkGroup.remove(trace.glowLine);
+          this.hackingNetworkGroup.remove(trace.counterTraceHead);
+          this.hackingNetworkGroup.remove(trace.counterTraceLine);
+          this.hackingNetworkGroup.remove(trace.counterGlowLine);
           (trace.traceHead.geometry as THREE.BufferGeometry).dispose();
           (trace.traceHead.material as THREE.Material).dispose();
           (trace.traceLine.geometry as THREE.BufferGeometry).dispose();
           (trace.traceLine.material as THREE.Material).dispose();
           (trace.glowLine.geometry as THREE.BufferGeometry).dispose();
           (trace.glowLine.material as THREE.Material).dispose();
+          (trace.counterTraceHead.geometry as THREE.BufferGeometry).dispose();
+          (trace.counterTraceHead.material as THREE.Material).dispose();
+          (trace.counterTraceLine.geometry as THREE.BufferGeometry).dispose();
+          (trace.counterTraceLine.material as THREE.Material).dispose();
+          (trace.counterGlowLine.geometry as THREE.BufferGeometry).dispose();
+          (trace.counterGlowLine.material as THREE.Material).dispose();
           this.hackingActiveTraces.delete(id);
+          this.hackingDisplayProgress.delete(id);
         }
       }
     }
@@ -7142,6 +7233,9 @@ export class GlobeRenderer {
     traceLine: THREE.Line;
     tracePoints: THREE.Vector3[];
     glowLine: THREE.Line;
+    counterTraceHead: THREE.Mesh;
+    counterTraceLine: THREE.Line;
+    counterGlowLine: THREE.Line;
   } | null {
     if (!this.hackingNetworkState || hack.route.nodeIds.length < 2) return null;
 
@@ -7168,9 +7262,11 @@ export class GlobeRenderer {
 
     // Parse the hack color
     const color = new THREE.Color(hack.color);
+    // Counter-trace uses red/orange color
+    const counterColor = new THREE.Color('#ff4444');
 
-    // Create trace head (glowing sphere)
-    const headGeometry = new THREE.SphereGeometry(2, 16, 16);
+    // Create trace head (glowing sphere) - green, travels source -> target
+    const headGeometry = new THREE.SphereGeometry(1.2, 16, 16);
     const headMaterial = new THREE.MeshBasicMaterial({
       color: color,
       transparent: true,
@@ -7198,15 +7294,50 @@ export class GlobeRenderer {
     });
     const glowLine = new THREE.Line(glowGeometry, glowMaterial);
 
+    // Counter-trace head (red sphere) - travels target -> source
+    const counterHeadGeometry = new THREE.SphereGeometry(1.2, 16, 16);
+    const counterHeadMaterial = new THREE.MeshBasicMaterial({
+      color: counterColor,
+      transparent: true,
+      opacity: 1.0,
+    });
+    const counterTraceHead = new THREE.Mesh(counterHeadGeometry, counterHeadMaterial);
+
+    // Counter-trace line
+    const counterTraceGeometry = new THREE.BufferGeometry();
+    const counterTraceMaterial = new THREE.LineBasicMaterial({
+      color: counterColor,
+      transparent: true,
+      opacity: 0.9,
+      linewidth: 2,
+    });
+    const counterTraceLine = new THREE.Line(counterTraceGeometry, counterTraceMaterial);
+
+    // Counter glow line
+    const counterGlowGeometry = new THREE.BufferGeometry();
+    const counterGlowMaterial = new THREE.LineBasicMaterial({
+      color: counterColor,
+      transparent: true,
+      opacity: 0.3,
+      linewidth: 4,
+    });
+    const counterGlowLine = new THREE.Line(counterGlowGeometry, counterGlowMaterial);
+
     this.hackingNetworkGroup.add(traceHead);
     this.hackingNetworkGroup.add(traceLine);
     this.hackingNetworkGroup.add(glowLine);
+    this.hackingNetworkGroup.add(counterTraceHead);
+    this.hackingNetworkGroup.add(counterTraceLine);
+    this.hackingNetworkGroup.add(counterGlowLine);
 
     return {
       traceHead,
       traceLine,
       tracePoints: allPoints,
       glowLine,
+      counterTraceHead,
+      counterTraceLine,
+      counterGlowLine,
     };
   }
 
@@ -7240,12 +7371,27 @@ export class GlobeRenderer {
       const hack = this.hackingNetworkState.activeHacks[hackId];
       if (!hack) continue;
 
-      const progress = hack.progress;
+      // Get or initialize smoothed display progress
+      let displayState = this.hackingDisplayProgress.get(hackId);
+      if (!displayState) {
+        displayState = { progress: hack.progress, traceProgress: hack.traceProgress || 0 };
+        this.hackingDisplayProgress.set(hackId, displayState);
+      }
+
+      // Lerp display progress toward server progress (smooth interpolation)
+      const lerpSpeed = 5; // Units per second - adjust for smoothness
+      const lerpFactor = Math.min(1, deltaTime * lerpSpeed);
+      displayState.progress += (hack.progress - displayState.progress) * lerpFactor;
+      displayState.traceProgress += ((hack.traceProgress || 0) - displayState.traceProgress) * lerpFactor;
+
+      const progress = displayState.progress;
+      const traceProgress = displayState.traceProgress;
       const points = trace.tracePoints;
       const totalPoints = points.length;
 
       if (totalPoints < 2) continue;
 
+      // === HACK PROGRESS (source -> target, green) ===
       // Calculate head position
       const headIndex = Math.floor(progress * (totalPoints - 1));
       const headT = (progress * (totalPoints - 1)) - headIndex;
@@ -7260,28 +7406,71 @@ export class GlobeRenderer {
       trace.traceHead.position.copy(headPos);
 
       // Add pulsing glow to head
-      const headPulse = 1 + Math.sin(this.hackingAnimationTime * 8) * 0.2;
+      const headPulse = 1 + Math.sin(this.hackingAnimationTime * 8) * 0.1;
       trace.traceHead.scale.setScalar(headPulse);
 
       // Update trace line to show path traveled
       const traceEndIndex = Math.ceil(progress * (totalPoints - 1));
       const traceStartIndex = Math.max(0, traceEndIndex - Math.floor(totalPoints * HACKING_TRACE_HEAD_LENGTH));
 
-      const tracePoints = points.slice(traceStartIndex, traceEndIndex + 1);
-      if (tracePoints.length >= 2) {
-        (trace.traceLine.geometry as THREE.BufferGeometry).setFromPoints(tracePoints);
-        (trace.glowLine.geometry as THREE.BufferGeometry).setFromPoints(tracePoints);
+      const hackTracePoints = points.slice(traceStartIndex, traceEndIndex + 1);
+      if (hackTracePoints.length >= 2) {
+        (trace.traceLine.geometry as THREE.BufferGeometry).setFromPoints(hackTracePoints);
+        (trace.glowLine.geometry as THREE.BufferGeometry).setFromPoints(hackTracePoints);
       }
 
-      // Fade out completed traces
-      if (hack.status === 'complete') {
+      // === COUNTER-TRACE (target -> source, red) ===
+      // Calculate counter-trace head position (goes backwards along the path)
+      const counterProgress = traceProgress;
+      const counterHeadIndex = Math.floor((1 - counterProgress) * (totalPoints - 1));
+      const counterHeadT = ((1 - counterProgress) * (totalPoints - 1)) - counterHeadIndex;
+
+      let counterHeadPos: THREE.Vector3;
+      if (counterHeadIndex >= totalPoints - 1) {
+        counterHeadPos = points[totalPoints - 1].clone();
+      } else if (counterHeadIndex < 0) {
+        counterHeadPos = points[0].clone();
+      } else {
+        counterHeadPos = points[counterHeadIndex].clone().lerp(points[Math.min(counterHeadIndex + 1, totalPoints - 1)], counterHeadT);
+      }
+
+      trace.counterTraceHead.position.copy(counterHeadPos);
+
+      // Pulsing for counter-trace head
+      const counterPulse = 1 + Math.sin(this.hackingAnimationTime * 10) * 0.15;
+      trace.counterTraceHead.scale.setScalar(counterPulse);
+
+      // Update counter-trace line (from end of path back to counter head)
+      const counterEndIndex = Math.floor((1 - counterProgress) * (totalPoints - 1));
+      const counterStartIndex = Math.min(totalPoints - 1, counterEndIndex + Math.floor(totalPoints * HACKING_TRACE_HEAD_LENGTH));
+
+      const counterTracePoints = points.slice(counterEndIndex, counterStartIndex + 1);
+      if (counterTracePoints.length >= 2) {
+        (trace.counterTraceLine.geometry as THREE.BufferGeometry).setFromPoints(counterTracePoints);
+        (trace.counterGlowLine.geometry as THREE.BufferGeometry).setFromPoints(counterTracePoints);
+      }
+
+      // Show/hide counter-trace based on whether tracing is active
+      const counterVisible = traceProgress > 0;
+      trace.counterTraceHead.visible = counterVisible;
+      trace.counterTraceLine.visible = counterVisible;
+      trace.counterGlowLine.visible = counterVisible;
+
+      // Fade out completed/traced hacks
+      if (hack.status === 'complete' || hack.status === 'traced') {
         const headMat = trace.traceHead.material as THREE.MeshBasicMaterial;
         const traceMat = trace.traceLine.material as THREE.LineBasicMaterial;
         const glowMat = trace.glowLine.material as THREE.LineBasicMaterial;
+        const counterHeadMat = trace.counterTraceHead.material as THREE.MeshBasicMaterial;
+        const counterTraceMat = trace.counterTraceLine.material as THREE.LineBasicMaterial;
+        const counterGlowMat = trace.counterGlowLine.material as THREE.LineBasicMaterial;
 
         headMat.opacity = Math.max(0, headMat.opacity - deltaTime * 0.5);
         traceMat.opacity = Math.max(0, traceMat.opacity - deltaTime * 0.5);
         glowMat.opacity = Math.max(0, glowMat.opacity - deltaTime * 0.5);
+        counterHeadMat.opacity = Math.max(0, counterHeadMat.opacity - deltaTime * 0.5);
+        counterTraceMat.opacity = Math.max(0, counterTraceMat.opacity - deltaTime * 0.5);
+        counterGlowMat.opacity = Math.max(0, counterGlowMat.opacity - deltaTime * 0.5);
       }
     }
 

@@ -143,14 +143,14 @@ export class GuidedInterceptorSimulator {
       detonated: false,
 
       // Prediction accuracy (starts with significant error, improves with radar)
-      predictionError: 0.15 + Math.random() * 0.10,  // 15-25% initial error
+      predictionError: 0.08 + Math.random() * 0.07,  // 8-15% initial error
       lastRadarUpdateTime: now,
 
       // Error biases - random per interceptor, constant during flight
-      // Biased forward (80%) because interceptors are slower than ICBMs
-      progressErrorBias: this.generateBiasedError(0.8),  // 80% forward, 20% behind
-      altitudeErrorBias: (Math.random() - 0.5) * 2,      // Keep uniform (no bias needed)
-      speedErrorBias: this.generateBiasedError(0.8),     // 80% overspeed, 20% underspeed
+      // Biased forward (95%) because interceptors need to aim ahead of ICBMs
+      progressErrorBias: this.generateBiasedError(0.95),  // 95% forward, 5% behind
+      altitudeErrorBias: (Math.random() - 0.5) * 2,       // Keep uniform (no bias needed)
+      speedErrorBias: this.generateBiasedError(0.95),     // 95% overspeed, 5% underspeed
 
       // Cached position
       geoCurrentPosition: { ...siloGeo },
@@ -353,8 +353,8 @@ export class GuidedInterceptorSimulator {
     const perceivedIcbmFlightDuration = target.flightDuration / speedErrorFactor;
 
     // Apply progress error: radar's estimate of where ICBM currently is on its path
-    // At 20% error with bias of +1, thinks ICBM is 0.05 (5%) further along than it is
-    const progressError = errorMagnitude * interceptor.progressErrorBias * 0.25;
+    // At 20% error with bias of +1, thinks ICBM is 0.07 (7%) further along than it is
+    const progressError = errorMagnitude * interceptor.progressErrorBias * 0.35;
     const perceivedIcbmProgress = Math.max(0, Math.min(1, target.progress + progressError));
 
     // Iteratively find intercept point using perceived (erroneous) values
