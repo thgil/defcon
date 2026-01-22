@@ -154,6 +154,7 @@ export class GameRoom {
   private tickInterval: NodeJS.Timeout | null = null;
   private lastFullSync = 0;
   private pendingEvents: GameEvent[] = [];
+  private previouslyDetonated: Set<string> = new Set();
 
   constructor(lobby: Lobby, connectionManager: ConnectionManager) {
     this.id = uuidv4();
@@ -780,17 +781,27 @@ export class GameRoom {
       return;
     }
 
-    // Collect missile updates
-    const missileUpdates = Object.values(this.state.missiles).filter(
-      (m) => !m.detonated && !m.intercepted
-    );
+    // Collect missile updates - include ALL missiles, even detonated/intercepted ones
+    // so the client can see the detonated/intercepted flag and show the explosion
+    const missileUpdates = Object.values(this.state.missiles);
 
-    // Collect removed missiles
+    // Track missiles that detonated THIS tick (not previously seen by client)
+    const justDetonated = new Set<string>();
+    for (const missile of Object.values(this.state.missiles)) {
+      if ((missile.detonated || missile.intercepted) && !this.previouslyDetonated.has(missile.id)) {
+        justDetonated.add(missile.id);
+      }
+    }
+
+    // Only remove missiles that were detonated LAST tick (client has already seen them)
     const removedMissileIds = Object.values(this.state.missiles)
-      .filter((m) => m.detonated || m.intercepted)
+      .filter((m) => (m.detonated || m.intercepted) && this.previouslyDetonated.has(m.id))
       .map((m) => m.id);
 
-    // Remove detonated/intercepted missiles from state
+    // Update tracking set for next tick
+    this.previouslyDetonated = justDetonated;
+
+    // Remove detonated/intercepted missiles from state (only those the client has seen)
     for (const id of removedMissileIds) {
       delete this.state.missiles[id];
     }
