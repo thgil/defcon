@@ -4,12 +4,13 @@ import { useAudioStore } from '../stores/audioStore';
 const MUSIC_TRACKS = [
   '/assets/music/cyberpunk.mp3',
   '/assets/music/synthwave-dark.mp3',
-  '/assets/music/synthwave-echo.mp3',
+  '/assets/music/Elysium Sound - From Another Planet _ Synthwave Cyberpunk.mp3',
+  '/assets/music/Elysium Sound - Night Drive Middle Cyberpunk Retrowave 80s.mp3',
 ];
 
 const MIN_DELAY = 5000;  // 5 seconds
 const MAX_DELAY = 30000; // 30 seconds
-const FADE_DURATION = 2000; // 2 seconds fade in/out
+const FADE_DURATION = 5000; // 5 seconds fade in for gradual volume ramp
 const FADE_OUT_BEFORE_END = 3000; // Start fade out 3 seconds before track ends
 
 export function useBackgroundMusic() {
@@ -18,6 +19,8 @@ export function useBackgroundMusic() {
   const fadeIntervalRef = useRef<number | null>(null);
   const lastTrackRef = useRef<string | null>(null);
   const targetVolumeRef = useRef(0);
+  const handlersAttachedRef = useRef(false);
+  const fadeOutTriggeredRef = useRef(false);
 
   const musicVolume = useAudioStore((s) => s.musicVolume);
   const musicEnabled = useAudioStore((s) => s.musicEnabled);
@@ -117,6 +120,34 @@ export function useBackgroundMusic() {
     }
 
     const audio = audioRef.current;
+
+    // Attach event listeners once
+    if (!handlersAttachedRef.current) {
+      const handleTimeUpdate = () => {
+        if (!audio.duration || fadeOutTriggeredRef.current) return;
+        const timeRemaining = audio.duration - audio.currentTime;
+        if (timeRemaining <= FADE_OUT_BEFORE_END / 1000 && timeRemaining > 0) {
+          fadeOutTriggeredRef.current = true;
+          fadeOut(audio, timeRemaining * 1000);
+        }
+      };
+
+      const handleEnded = () => {
+        fadeOutTriggeredRef.current = false;
+        scheduleNextTrack();
+      };
+
+      const handlePlay = () => {
+        fadeOutTriggeredRef.current = false;
+      };
+
+      audio.addEventListener('timeupdate', handleTimeUpdate);
+      audio.addEventListener('ended', handleEnded);
+      audio.addEventListener('play', handlePlay);
+      handlersAttachedRef.current = true;
+    }
+
+    fadeOutTriggeredRef.current = false; // Reset for new track
     audio.src = trackUrl;
     lastTrackRef.current = trackUrl;
 
@@ -126,44 +157,7 @@ export function useBackgroundMusic() {
     }).catch(err => {
       console.log('Music autoplay blocked, waiting for user interaction');
     });
-  }, [fadeIn]);
-
-  // Handle timeupdate for fade out before end
-  useEffect(() => {
-    const audio = audioRef.current;
-    if (!audio) return;
-
-    let fadeOutTriggered = false;
-
-    const handleTimeUpdate = () => {
-      if (!audio.duration || fadeOutTriggered) return;
-
-      const timeRemaining = audio.duration - audio.currentTime;
-      if (timeRemaining <= FADE_OUT_BEFORE_END / 1000 && timeRemaining > 0) {
-        fadeOutTriggered = true;
-        fadeOut(audio, timeRemaining * 1000);
-      }
-    };
-
-    const handleEnded = () => {
-      fadeOutTriggered = false;
-      scheduleNextTrack();
-    };
-
-    const handlePlay = () => {
-      fadeOutTriggered = false;
-    };
-
-    audio.addEventListener('timeupdate', handleTimeUpdate);
-    audio.addEventListener('ended', handleEnded);
-    audio.addEventListener('play', handlePlay);
-
-    return () => {
-      audio.removeEventListener('timeupdate', handleTimeUpdate);
-      audio.removeEventListener('ended', handleEnded);
-      audio.removeEventListener('play', handlePlay);
-    };
-  }, [fadeOut, scheduleNextTrack]);
+  }, [fadeIn, fadeOut, scheduleNextTrack]);
 
   // Start music on first user interaction
   useEffect(() => {
