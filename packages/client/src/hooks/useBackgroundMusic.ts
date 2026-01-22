@@ -16,6 +16,7 @@ const INITIAL_MUSIC_DELAY = 15000; // 15 seconds before first track starts
 
 export function useBackgroundMusic() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const preloadRef = useRef<HTMLAudioElement | null>(null);
   const timeoutRef = useRef<number | null>(null);
   const fadeIntervalRef = useRef<number | null>(null);
   const lastTrackRef = useRef<string | null>(null);
@@ -99,20 +100,34 @@ export function useBackgroundMusic() {
     });
   }, []);
 
+  // Preload next track to prevent lag when it starts
+  const preloadTrack = useCallback((trackUrl: string) => {
+    if (!preloadRef.current) {
+      preloadRef.current = new Audio();
+    }
+    preloadRef.current.src = trackUrl;
+    preloadRef.current.preload = 'auto';
+    // Just load it, don't play
+    preloadRef.current.load();
+  }, []);
+
   // Schedule next track after delay
   const scheduleNextTrack = useCallback(() => {
     if (!musicEnabled) return;
 
     const delay = getRandomDelay();
+    const nextTrack = pickRandomTrack();
     console.log(`Next track in ${(delay / 1000).toFixed(1)}s`);
+
+    // Preload the next track immediately so it's ready when delay ends
+    preloadTrack(nextTrack);
 
     timeoutRef.current = window.setTimeout(() => {
       if (musicEnabled) {
-        const track = pickRandomTrack();
-        playTrack(track);
+        playTrack(nextTrack);
       }
     }, delay);
-  }, [getRandomDelay, pickRandomTrack, musicEnabled]);
+  }, [getRandomDelay, pickRandomTrack, musicEnabled, preloadTrack]);
 
   // Play a specific track with fade in
   const playTrack = useCallback((trackUrl: string) => {
@@ -149,11 +164,14 @@ export function useBackgroundMusic() {
     }
 
     fadeOutTriggeredRef.current = false; // Reset for new track
+
+    // Set volume to 0 BEFORE setting src and playing to prevent audio spike
+    audio.volume = 0;
     audio.src = trackUrl;
     lastTrackRef.current = trackUrl;
 
     audio.play().then(() => {
-      // Fade in
+      // Fade in from 0
       fadeIn(audio, targetVolumeRef.current, FADE_DURATION);
     }).catch(err => {
       console.log('Music autoplay blocked, waiting for user interaction');
@@ -163,13 +181,17 @@ export function useBackgroundMusic() {
   // Start music 15 seconds after first user interaction
   useEffect(() => {
     let startupTimer: number | null = null;
+    let firstTrack: string | null = null;
 
     const scheduleMusic = () => {
       if (!audioRef.current?.src && musicEnabled) {
+        // Pick and preload the first track immediately
+        firstTrack = pickRandomTrack();
+        preloadTrack(firstTrack);
+
         startupTimer = window.setTimeout(() => {
-          if (musicEnabled) {
-            const track = pickRandomTrack();
-            playTrack(track);
+          if (musicEnabled && firstTrack) {
+            playTrack(firstTrack);
           }
         }, INITIAL_MUSIC_DELAY);
       }
@@ -187,7 +209,7 @@ export function useBackgroundMusic() {
         clearTimeout(startupTimer);
       }
     };
-  }, [pickRandomTrack, playTrack, musicEnabled]);
+  }, [pickRandomTrack, playTrack, preloadTrack, musicEnabled]);
 
   // Handle enable/disable changes
   useEffect(() => {
@@ -223,6 +245,10 @@ export function useBackgroundMusic() {
       if (audioRef.current) {
         audioRef.current.pause();
         audioRef.current = null;
+      }
+      if (preloadRef.current) {
+        preloadRef.current.src = '';
+        preloadRef.current = null;
       }
     };
   }, []);
