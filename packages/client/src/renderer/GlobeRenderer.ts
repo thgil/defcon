@@ -6,8 +6,6 @@ import {
   type GameState,
   type Building,
   type Missile,
-  type PhysicsMissile,
-  type RailInterceptor,
   type GuidedInterceptor,
   type Aircraft,
   type AircraftType,
@@ -29,8 +27,6 @@ import {
   sphereToGeo,
   getMissilePosition3D,
   getMissileDirection3D,
-  getInterceptorPosition3D,
-  getInterceptorDirection3D,
   geoInterpolate,
   greatCircleDistance,
   getTerritories,
@@ -44,13 +40,12 @@ import {
   SatelliteOrbitalParams,
   TERRITORY_GEO_DATA,
   CITY_GEO_DATA,
-  isPhysicsMissile,
-  isRailInterceptor,
   isGuidedInterceptor,
   isInterceptor as isInterceptorType,
   GLOBAL_MISSILE_SPEED_MULTIPLIER,
   createConnectionId,
   getRouteSegmentProgress,
+  getIcbmAltitude,
 } from '@defcon/shared';
 import { HUDRenderer } from './HUDRenderer';
 
@@ -224,14 +219,6 @@ export class GlobeRenderer {
     estimatedSpeed: number;  // Progress per second
   }>();
 
-  // Client-side interpolation for physics missiles (position-based)
-  private physicsMissileInterpolation = new Map<string, {
-    lastPosition: { x: number; y: number; z: number };
-    targetPosition: { x: number; y: number; z: number };
-    estimatedVelocity: { x: number; y: number; z: number };
-    lastUpdateTime: number;
-  }>();
-
   // Track missile positions for explosions when they're removed
   private missileTargets = new Map<string, GeoPosition>();
   private missileLastPositions = new Map<string, GeoPosition>();
@@ -245,7 +232,6 @@ export class GlobeRenderer {
 
   // Stage markers for SpaceX-style flight event visualization
   private stageMarkers = new Map<string, THREE.Group[]>();
-  private interceptorPhases = new Map<string, string>();  // Track previous phase for transition detection
   private missileRadarStatus = new Map<string, boolean>(); // Track radar coverage for LOS markers
   private icbmMarkerProgress = new Map<string, Set<string>>(); // Track which ICBM markers have been added
 
@@ -332,6 +318,12 @@ export class GlobeRenderer {
   private commChainPackets: THREE.Mesh[] = [];
   private packetAnimationTime: number = 0;
 
+  // ICBM tracking visualization (shown when enemy ICBM is selected)
+  private icbmTrackingGroup: THREE.Group;
+  private icbmTrackingLines: THREE.Line[] = [];
+  private icbmTrackingSpheres: THREE.Mesh[] = [];
+  private icbmTrackingAnimationTime: number = 0;
+
   // Satellite-Radar communication links (shown when satellite or radar is selected)
   private satCommGroup: THREE.Group;
   private satCommLines: THREE.Line[] = [];
@@ -350,6 +342,7 @@ export class GlobeRenderer {
   private interceptChanceLabel: THREE.Sprite | null = null;
   private flameoutMarker: THREE.Group | null = null;
   private missileStatsLabel: THREE.Sprite | null = null;
+  private interceptorProjectedPath: THREE.Line | null = null;
 
   // Fog of war toggle (for debug mode)
   private fogOfWarDisabled: boolean = false;
@@ -410,6 +403,7 @@ export class GlobeRenderer {
     this.interceptPredictionGroup = new THREE.Group();
     this.satCommGroup = new THREE.Group();
     this.aircraftGroup = new THREE.Group();
+    this.icbmTrackingGroup = new THREE.Group();
 
     this.scene.add(this.territoryGroup);
     this.scene.add(this.coastlineGroup);
@@ -428,6 +422,7 @@ export class GlobeRenderer {
     this.scene.add(this.satCommGroup);
     this.scene.add(this.aircraftGroup);
     this.scene.add(this.hackingNetworkGroup);
+    this.scene.add(this.icbmTrackingGroup);
 
     // Create starfield background
     this.createStarfield();
@@ -2231,15 +2226,25 @@ export class GlobeRenderer {
       if (missile.detonated || missile.intercepted) {
         // Detonated = at target, Intercepted = at current position (interception point)
         const explosionGeo = missile.intercepted ? currentGeo : targetGeo;
+        const isInterceptor = isInterceptorType(missile);
 
         // Show explosion effect (only once per missile)
         if (!this.shownExplosions.has(missile.id)) {
           if (missile.intercepted) {
-            // Intercepted: show cyan intercept explosion (small, quick)
-            const pos3d = geoToSphere(explosionGeo, GLOBE_RADIUS + 3);
+            // Intercepted: show cyan intercept explosion at actual missile altitude
+            // Calculate proper 3D position using missile trajectory
+            const maxAltitude = (missile as any).apexHeight ?? calculateMissileAltitude(startGeo, targetGeo);
+            const missileProgress = missile.progress ?? 0;
+            const flightDuration = missile.flightDuration ?? 30000;
+            const seed = this.hashStringToNumber(missile.id);
+            const pos3d = getMissilePosition3D(startGeo, targetGeo, missileProgress, maxAltitude, GLOBE_RADIUS, flightDuration, seed);
             this.createInterceptExplosion(pos3d);
+          } else if (isInterceptor && missile.detonated) {
+            // Interceptor hit its target - don't show a separate explosion
+            // The ICBM being intercepted will show the cyan intercept explosion
+            // (Ground impact explosions for missed interceptors are handled separately)
           } else {
-            // Detonated: show nuclear explosion (large, orange)
+            // Detonated ICBM: show nuclear explosion (large, orange) at ground target
             this.showExplosionAt(explosionGeo);
           }
           this.shownExplosions.add(missile.id);
@@ -2248,8 +2253,17 @@ export class GlobeRenderer {
         // Move missile to fading state instead of immediate removal
         const objects = this.missileObjects.get(missile.id);
         if (objects) {
-          // Get impact position in 3D
-          const impactPos3d = geoToSphere(explosionGeo, GLOBE_RADIUS + 2);
+          // Get impact position in 3D - use proper altitude for intercepted missiles
+          let impactPos3d;
+          if (missile.intercepted) {
+            const maxAltitude = (missile as any).apexHeight ?? calculateMissileAltitude(startGeo, targetGeo);
+            const missileProgress = missile.progress ?? 0;
+            const flightDuration = missile.flightDuration ?? 30000;
+            const seed = this.hashStringToNumber(missile.id);
+            impactPos3d = getMissilePosition3D(startGeo, targetGeo, missileProgress, maxAltitude, GLOBE_RADIUS, flightDuration, seed);
+          } else {
+            impactPos3d = geoToSphere(explosionGeo, GLOBE_RADIUS + 2);
+          }
           const impactVec = new THREE.Vector3(impactPos3d.x, impactPos3d.y, impactPos3d.z);
 
           // Extract current trail points
@@ -2291,8 +2305,7 @@ export class GlobeRenderer {
 
         // Clean up tracking
         this.missileInterpolation.delete(missile.id);
-        this.physicsMissileInterpolation.delete(missile.id);
-        this.missileTargets.delete(missile.id);
+                this.missileTargets.delete(missile.id);
         this.missileLastPositions.delete(missile.id);
         this.missileWasIntercepted.delete(missile.id);
         continue;
@@ -2328,8 +2341,7 @@ export class GlobeRenderer {
             this.missileObjects.delete(missile.id);
           }
           this.missileInterpolation.delete(missile.id);
-          this.physicsMissileInterpolation.delete(missile.id);
-          this.uncertainContacts.delete(missile.id);
+                    this.uncertainContacts.delete(missile.id);
           continue;
         }
 
@@ -2426,13 +2438,10 @@ export class GlobeRenderer {
       }
 
       // Client-side interpolation for smooth movement
-      // Use defaults for physics missiles that may have undefined progress/flightDuration
       let interpolatedProgress = missileProgress;
       let interpState = this.missileInterpolation.get(missile.id);
 
-      // Skip interpolation for physics missiles - they use server position directly
-      if (!isPhysicsMissile(missile)) {
-        if (!interpState) {
+      if (!interpState) {
           // New missile - initialize interpolation state
           // Guard against division by zero if flight duration is 0
           const flightDurationSec = Math.max(1, missileFlightDuration / 1000);
@@ -2466,14 +2475,13 @@ export class GlobeRenderer {
           interpolatedProgress = Math.min(predictedProgress, interpState.targetProgress + 0.02);
           interpolatedProgress = Math.max(interpolatedProgress, interpState.targetProgress);
 
-          // Cap at 1.0 for normal missiles, but allow up to 1.5 for missed interceptors
-          // Allow extended progress for missed interceptors
-          const isMissed = isRailInterceptor(missile)
-            ? (missile as RailInterceptor).status === 'missed'
-            : (missile as any).missedTarget;
-          const maxProgress = (isInterceptor && isMissed) ? 1.5 : 1.0;
-          interpolatedProgress = Math.min(interpolatedProgress, maxProgress);
-        }
+        // Cap at 1.0 for normal missiles, but allow up to 1.5 for missed interceptors
+        // Allow extended progress for missed interceptors
+        const isMissed = isGuidedInterceptor(missile)
+          ? (missile as GuidedInterceptor).status === 'missed' || (missile as GuidedInterceptor).status === 'crashed'
+          : (missile as any).missedTarget;
+        const maxProgress = (isInterceptor && isMissed) ? 1.5 : 1.0;
+        interpolatedProgress = Math.min(interpolatedProgress, maxProgress);
       }
 
       // startGeo and targetGeo already defined above
@@ -2535,8 +2543,8 @@ export class GlobeRenderer {
         )] : undefined;
 
         // Get targetId from the appropriate field based on missile type
-        const targetMissileId = isRailInterceptor(missile)
-          ? (missile as RailInterceptor).targetId
+        const targetMissileId = isGuidedInterceptor(missile)
+          ? (missile as GuidedInterceptor).targetId
           : (missile as any).targetId;
         objects = { trail, head, maxAltitude, flightDuration: missileFlightDuration, seed, plannedRoute, isInterceptor, targetMissileId, interceptorTrailHistory, lastTrailProgress: 0 };
         this.missileObjects.set(missile.id, objects);
@@ -2557,8 +2565,8 @@ export class GlobeRenderer {
       let pos3d: { x: number; y: number; z: number };
 
       // Calculate flameout progress for legacy interceptors (when fuel runs out)
-      // For physics missiles and rail interceptors, we don't use this (they handle fuel differently)
-      const flameoutProgress = isInterceptor && !isPhysicsMissile(missile) && !isRailInterceptor(missile)
+      // Guided interceptors handle fuel differently
+      const flameoutProgress = isInterceptor && !isGuidedInterceptor(missile)
         ? this.calculateFlameoutProgress(missile as Missile)
         : 1.0;
 
@@ -2574,42 +2582,6 @@ export class GlobeRenderer {
           // Fallback to launch position
           pos3d = geoToSphere(startGeo, GLOBE_RADIUS);
         }
-      } else if (isRailInterceptor(missile)) {
-        // Rail-based interceptor: use pre-calculated rail path
-        const railMissile = missile as RailInterceptor;
-        if (railMissile.status === 'missed' && railMissile.missBehavior) {
-          // Missed interceptor: interpolate from miss point to crash point
-          const elapsed = now - railMissile.missBehavior.missStartTime;
-          const coastProgress = Math.min(1, elapsed / railMissile.missBehavior.duration);
-          const missGeo = geoInterpolate(
-            railMissile.rail.startGeo,
-            railMissile.rail.endGeo,
-            railMissile.missBehavior.missStartProgress
-          );
-          const currentGeo = geoInterpolate(
-            missGeo,
-            railMissile.missBehavior.endGeo,
-            coastProgress
-          );
-          // Altitude decreases during coast
-          const startAltitude = railMissile.currentAltitude || railMissile.rail.endAltitude;
-          const altitude = startAltitude * (1 - coastProgress) * (1 - coastProgress);
-          const groundPos = geoToSphere(currentGeo, GLOBE_RADIUS + altitude);
-          pos3d = { x: groundPos.x, y: groundPos.y, z: groundPos.z };
-        } else {
-          // Active interceptor: follow rail path
-          pos3d = getInterceptorPosition3D(
-            railMissile.rail.startGeo,
-            railMissile.rail.endGeo,
-            interpolatedProgress,
-            railMissile.rail.apexHeight,
-            railMissile.rail.endAltitude,
-            GLOBE_RADIUS
-          );
-        }
-      } else if (isPhysicsMissile(missile)) {
-        // Physics-based interceptor: use interpolated position for smooth movement
-        pos3d = this.getInterpolatedPhysicsPosition(missile, now);
       } else if (isInterceptor && (missile as any).targetId) {
         // Legacy interceptor: use trajectory calculation
         const legacyMissile = missile as Missile;
@@ -2631,11 +2603,9 @@ export class GlobeRenderer {
 
       // Check for ground impact on missed interceptors
       const isMissedInterceptor = isInterceptor && (
-        isRailInterceptor(missile)
-          ? (missile as RailInterceptor).status === 'missed'
-          : isGuidedInterceptor(missile)
-            ? (missile as GuidedInterceptor).status === 'missed' || (missile as GuidedInterceptor).status === 'crashed'
-            : (missile as any).missedTarget
+        isGuidedInterceptor(missile)
+          ? (missile as GuidedInterceptor).status === 'missed' || (missile as GuidedInterceptor).status === 'crashed'
+          : (missile as any).missedTarget
       );
       if (isMissedInterceptor && missileProgress > 1) {
         const altitude = Math.sqrt(pos3d.x * pos3d.x + pos3d.y * pos3d.y + pos3d.z * pos3d.z) - GLOBE_RADIUS;
@@ -2685,31 +2655,6 @@ export class GlobeRenderer {
         objects.trail.visible = true;
       }
 
-      // Apply fade effect for coasting physics missiles approaching timeout
-      if (isPhysicsMissile(missile) && missile.engineFlameout && missile.flameoutTime) {
-        const coastTimeout = 15 / GLOBAL_MISSILE_SPEED_MULTIPLIER; // Matches server's scaled coastTimeout
-        const coastTime = (now - missile.flameoutTime) / 1000;
-        // Start fading 5 seconds before despawn
-        const fadeStartTime = coastTimeout - 5;
-        if (coastTime > fadeStartTime) {
-          const fadeProgress = (coastTime - fadeStartTime) / 5; // 0 to 1 over 5 seconds
-          const fadeOpacity = Math.max(0.1, 1 - fadeProgress * 0.9); // Fade from 1.0 to 0.1
-
-          objects.head.traverse((child) => {
-            if (child instanceof THREE.Mesh && child.material) {
-              const mat = child.material as THREE.MeshBasicMaterial | THREE.MeshStandardMaterial;
-              if (mat.transparent !== undefined) {
-                mat.transparent = true;
-                mat.opacity = fadeOpacity;
-              }
-            }
-          });
-
-          const trailMat = objects.trail.material as THREE.LineBasicMaterial;
-          trailMat.opacity = fadeOpacity * 0.35;
-        }
-      }
-
       // Orient missile along flight path (direction of movement)
       let lookTarget: THREE.Vector3 | null = null;
 
@@ -2745,49 +2690,6 @@ export class GlobeRenderer {
           pos3d.y + forward.y * 10,
           pos3d.z + forward.z * 10
         );
-      } else if (isRailInterceptor(missile)) {
-        // Rail interceptor: calculate direction from rail path
-        const railMissile = missile as RailInterceptor;
-        if (railMissile.status === 'missed' && railMissile.missBehavior) {
-          // Missed: point toward crash location
-          const crashPos = geoToSphere(railMissile.missBehavior.endGeo, GLOBE_RADIUS);
-          lookTarget = new THREE.Vector3(crashPos.x, crashPos.y, crashPos.z);
-        } else {
-          // Active: use rail direction
-          const direction = getInterceptorDirection3D(
-            railMissile.rail.startGeo,
-            railMissile.rail.endGeo,
-            interpolatedProgress,
-            railMissile.rail.apexHeight,
-            railMissile.rail.endAltitude,
-            GLOBE_RADIUS
-          );
-          lookTarget = new THREE.Vector3(
-            pos3d.x + direction.x,
-            pos3d.y + direction.y,
-            pos3d.z + direction.z
-          );
-        }
-      } else if (isPhysicsMissile(missile)) {
-        // Physics missile: orient along velocity vector (or heading if velocity is zero)
-        const vel = missile.velocity;
-        const velMag = Math.sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
-        if (velMag > 0.01) {
-          // Point along velocity direction
-          lookTarget = new THREE.Vector3(
-            pos3d.x + vel.x,
-            pos3d.y + vel.y,
-            pos3d.z + vel.z
-          );
-        } else {
-          // No velocity yet - use heading
-          const hdg = missile.heading;
-          lookTarget = new THREE.Vector3(
-            pos3d.x + hdg.x,
-            pos3d.y + hdg.y,
-            pos3d.z + hdg.z
-          );
-        }
       } else if (isInterceptor && (missile as any).targetId && this.gameState) {
         // Legacy interceptor: calculate orientation from trajectory
         const legacyMissile = missile as Missile;
@@ -2805,7 +2707,7 @@ export class GlobeRenderer {
         } else {
           // Still tracking: point toward predicted intercept point
           const targetIcbm = this.gameState.missiles[legacyMissile.targetId!];
-          if (targetIcbm && targetIcbm.geoLaunchPosition && targetIcbm.geoTargetPosition && !isPhysicsMissile(targetIcbm)) {
+          if (targetIcbm && targetIcbm.geoLaunchPosition && targetIcbm.geoTargetPosition) {
             const interceptorRemaining = 1 - interpolatedProgress;
             const leadFactor = 0.5;
             const predictedIcbmProgress = Math.min(1, (targetIcbm.progress || 0) + interceptorRemaining * leadFactor);
@@ -2865,44 +2767,6 @@ export class GlobeRenderer {
         }
       }
 
-      // Track phase transitions for SpaceX-style stage markers (physics missiles)
-      if (isPhysicsMissile(missile)) {
-        const currentPhase = missile.phase;
-        const prevPhase = this.interceptorPhases.get(missile.id);
-
-        // Add launch marker on first update
-        if (!prevPhase && currentPhase === 'boost') {
-          const launchPos = new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z);
-          this.addStageMarker(missile.id, launchPos, 'LNC', 0x00ffff);
-        }
-
-        // Track phase transitions
-        if (prevPhase && prevPhase !== currentPhase) {
-          const phaseInfo = this.getPhaseMarkerInfo(currentPhase);
-          if (phaseInfo) {
-            const markerPos = new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z);
-            this.addStageMarker(missile.id, markerPos, phaseInfo.label, phaseInfo.color);
-          }
-        }
-
-        // Add MECO marker when engine flames out
-        if (missile.engineFlameout && prevPhase && !this.stageMarkers.get(missile.id)?.some(m => m.userData?.label === 'MECO')) {
-          const flameoutPos = missile.flameoutPosition;
-          if (flameoutPos) {
-            const mecoPos = new THREE.Vector3(flameoutPos.x, flameoutPos.y, flameoutPos.z);
-            const marker = this.createStageMarker(mecoPos, 'MECO', 0xff8800);
-            marker.userData = { label: 'MECO' };
-            if (!this.stageMarkers.has(missile.id)) {
-              this.stageMarkers.set(missile.id, []);
-            }
-            this.stageMarkers.get(missile.id)!.push(marker);
-            this.missileGroup.add(marker);
-          }
-        }
-
-        this.interceptorPhases.set(missile.id, currentPhase);
-      }
-
       // Add ICBM milestone markers (launch, BECO, apogee, re-entry)
       if (!isInterceptor) {
         const markerSet = this.icbmMarkerProgress.get(missile.id) || new Set<string>();
@@ -2931,11 +2795,12 @@ export class GlobeRenderer {
 
             // Calculate booster arc trajectory
             // Start: BECO position (in geo coordinates)
-            const becoGeo = sphereToGeo(becoVec, GLOBE_RADIUS + maxAltitude * 0.2 * 4 * (1 - 0.2));
+            const becoAltitudeValue = getIcbmAltitude(0.20, maxAltitude, 0.6);
+            const becoGeo = sphereToGeo(becoVec, GLOBE_RADIUS + becoAltitudeValue);
             // End: A point ~30% along the original path (booster falls forward a bit)
             const boosterEndGeo = geoInterpolate(startGeo, targetGeo, 0.30);
             // Max altitude: current altitude at BECO (lower arc than main missile)
-            const becoAltitude = maxAltitude * 4 * 0.20 * (1 - 0.20);  // Parabolic altitude at 20%
+            const becoAltitude = getIcbmAltitude(0.20, maxAltitude, 0.6);  // Ballistic altitude at 20%
             const boosterMaxAlt = becoAltitude * 0.6;  // Slightly lower arc
             const boosterDuration = 6000;  // 6 seconds to fall
 
@@ -3197,7 +3062,6 @@ export class GlobeRenderer {
       this.missileLastPositions.delete(id);
       this.missileWasIntercepted.delete(id);
       this.missileInterpolation.delete(id);
-      this.physicsMissileInterpolation.delete(id);
       this.uncertainContacts.delete(id);
       this.shownExplosions.delete(id);
       this.groundImpactMissiles.delete(id);
@@ -3382,29 +3246,12 @@ export class GlobeRenderer {
     head: THREE.Group,
     progress: number,
     isInterceptorMissile: boolean,
-    missile?: Missile | PhysicsMissile | RailInterceptor | GuidedInterceptor
+    missile?: Missile | GuidedInterceptor
   ): void {
     const exhaust = head.getObjectByName('exhaust') as THREE.Mesh | undefined;
     const exhaustGlow = head.getObjectByName('exhaustGlow') as THREE.Mesh | undefined;
 
     if (!exhaust || !exhaustGlow) return;
-
-    // Physics missiles: exhaust visible when engine has fuel
-    if (missile && isPhysicsMissile(missile)) {
-      const engineOn = missile.fuel > 0 && !missile.engineFlameout;
-      exhaust.visible = engineOn;
-      exhaustGlow.visible = engineOn;
-      return;
-    }
-
-    // Rail interceptors: exhaust visible while has fuel
-    if (missile && isRailInterceptor(missile)) {
-      const railMissile = missile as RailInterceptor;
-      const engineOn = railMissile.fuel > 0 && railMissile.status === 'active';
-      exhaust.visible = engineOn;
-      exhaustGlow.visible = engineOn;
-      return;
-    }
 
     // Guided interceptors: exhaust visible while has fuel and active
     if (missile && isGuidedInterceptor(missile)) {
@@ -3637,8 +3484,8 @@ export class GlobeRenderer {
       return null;
     }
 
-    // Skip rail interceptors - this method is for ICBMs
-    if (isRailInterceptor(targetIcbm)) return null;
+    // Skip interceptors - this method is for ICBMs only
+    if (isInterceptorType(targetIcbm)) return null;
 
     // Calculate the ICBM's altitude for its arc (use server's apexHeight if available)
     const icbmAltitude = (targetIcbm as any).apexHeight ?? calculateMissileAltitude(targetIcbm.geoLaunchPosition, targetIcbm.geoTargetPosition);
@@ -3675,8 +3522,8 @@ export class GlobeRenderer {
       return null;
     }
 
-    // Skip rail interceptors - this method is for ICBMs
-    if (isRailInterceptor(targetIcbm)) return null;
+    // Skip interceptors - this method is for ICBMs only
+    if (isInterceptorType(targetIcbm)) return null;
 
     // Calculate what the ICBM's progress was when the interceptor reached its flameout point
     // We need to figure out how much time elapsed from interceptor launch to flameout
@@ -3726,70 +3573,6 @@ export class GlobeRenderer {
       targetIcbm.flightDuration,
       seed
     );
-  }
-
-  /**
-   * Get interpolated position for physics missiles for smooth client-side rendering.
-   * Interpolates between server updates to eliminate network jitter.
-   */
-  private getInterpolatedPhysicsPosition(
-    missile: PhysicsMissile,
-    now: number
-  ): { x: number; y: number; z: number } {
-    let interpState = this.physicsMissileInterpolation.get(missile.id);
-
-    if (!interpState) {
-      // New missile - initialize interpolation state
-      interpState = {
-        lastPosition: { ...missile.position },
-        targetPosition: { ...missile.position },
-        estimatedVelocity: { ...missile.velocity },
-        lastUpdateTime: now,
-      };
-      this.physicsMissileInterpolation.set(missile.id, interpState);
-      return { ...missile.position };
-    }
-
-    // Check if server sent a new position (position changed significantly)
-    const dx = missile.position.x - interpState.targetPosition.x;
-    const dy = missile.position.y - interpState.targetPosition.y;
-    const dz = missile.position.z - interpState.targetPosition.z;
-    const posDelta = Math.sqrt(dx * dx + dy * dy + dz * dz);
-
-    if (posDelta > 0.01) {
-      // Server update received - update interpolation targets
-      const timeSinceLastUpdate = Math.max(0.001, (now - interpState.lastUpdateTime) / 1000);
-
-      // Estimate velocity from position delta
-      interpState.estimatedVelocity = {
-        x: dx / timeSinceLastUpdate,
-        y: dy / timeSinceLastUpdate,
-        z: dz / timeSinceLastUpdate,
-      };
-
-      interpState.lastPosition = { ...interpState.targetPosition };
-      interpState.targetPosition = { ...missile.position };
-      interpState.lastUpdateTime = now;
-    }
-
-    // Interpolate position based on estimated velocity
-    const timeSinceUpdate = (now - interpState.lastUpdateTime) / 1000;
-
-    // Predict current position based on last known position + velocity * time
-    // But blend toward server position to prevent drift
-    const predictedX = interpState.targetPosition.x + interpState.estimatedVelocity.x * timeSinceUpdate;
-    const predictedY = interpState.targetPosition.y + interpState.estimatedVelocity.y * timeSinceUpdate;
-    const predictedZ = interpState.targetPosition.z + interpState.estimatedVelocity.z * timeSinceUpdate;
-
-    // Clamp prediction to not overshoot too much (within 0.5 seconds of predicted travel)
-    const maxExtrapolation = 0.5; // seconds
-    const clampedTime = Math.min(timeSinceUpdate, maxExtrapolation);
-
-    return {
-      x: interpState.targetPosition.x + interpState.estimatedVelocity.x * clampedTime,
-      y: interpState.targetPosition.y + interpState.estimatedVelocity.y * clampedTime,
-      z: interpState.targetPosition.z + interpState.estimatedVelocity.z * clampedTime,
-    };
   }
 
   // Hash string to a deterministic number for seeding randomness
@@ -3861,13 +3644,17 @@ export class GlobeRenderer {
 
     // Get interceptor 3D position (at its current flight altitude)
     let interceptorVec: THREE.Vector3;
-    if (isPhysicsMissile(trackedMissile)) {
-      // Physics missile: use position directly
-      interceptorVec = new THREE.Vector3(
-        trackedMissile.position.x,
-        trackedMissile.position.y,
-        trackedMissile.position.z
-      );
+    if (isGuidedInterceptor(trackedMissile)) {
+      // Guided interceptor: use position from server
+      const guidedMissile = trackedMissile as GuidedInterceptor;
+      const altitude = guidedMissile.altitude || guidedMissile.currentAltitude || 0;
+      const geoPos = guidedMissile.geoPosition || guidedMissile.geoCurrentPosition;
+      if (geoPos) {
+        const groundPos = geoToSphere(geoPos, GLOBE_RADIUS + altitude);
+        interceptorVec = new THREE.Vector3(groundPos.x, groundPos.y, groundPos.z);
+      } else {
+        interceptorVec = new THREE.Vector3(0, 0, 0);
+      }
     } else {
       // Legacy missile: calculate position from trajectory
       const boostEnd = trackedMissile.boostEndProgress ?? 0.15;
@@ -3963,29 +3750,36 @@ export class GlobeRenderer {
 
   /**
    * Create an arced line between two 3D points that curves away from the globe.
-   * This prevents lines from intersecting the globe surface.
+   * Preserves the actual altitude of start and end points (e.g., for ICBMs in flight).
    */
   private createArcedLine(start: THREE.Vector3, end: THREE.Vector3, segments: number = 16): THREE.Vector3[] {
     const points: THREE.Vector3[] = [];
 
-    // Base altitude above globe surface for the arc
-    const baseAltitude = GLOBE_RADIUS + 5;
+    // Get the actual altitudes of start and end points (distance from globe center)
+    const startAltitude = start.length();
+    const endAltitude = end.length();
 
-    // Calculate the angular distance to determine arc height
+    // Get normalized directions
     const startNorm = start.clone().normalize();
     const endNorm = end.clone().normalize();
+
+    // Calculate the angular distance to determine arc height
     const angularDist = Math.acos(Math.max(-1, Math.min(1, startNorm.dot(endNorm))));
 
     // Arc height scales with angular distance - longer arcs need higher peaks
-    const arcHeight = Math.max(8, angularDist * GLOBE_RADIUS * 0.3);
+    // Use a smaller factor for shorter distances
+    const arcHeight = Math.max(5, angularDist * GLOBE_RADIUS * 0.2);
 
     for (let i = 0; i <= segments; i++) {
       const t = i / segments;
 
-      // Spherical interpolation for direction (stays on sphere surface)
+      // Spherical interpolation for direction
       const dir = new THREE.Vector3().lerpVectors(startNorm, endNorm, t).normalize();
 
-      // Calculate how much to lift this point (parabolic arc - highest at middle)
+      // Interpolate altitude between start and end
+      const baseAltitude = startAltitude + (endAltitude - startAltitude) * t;
+
+      // Add arc height (parabolic - highest at middle)
       const arcFactor = 4 * t * (1 - t); // 0 at ends, 1 at middle
       const altitude = baseAltitude + arcHeight * arcFactor;
 
@@ -4020,6 +3814,284 @@ export class GlobeRenderer {
       }
     }
     this.commChainPackets = [];
+  }
+
+  /**
+   * Update ICBM tracking visualization.
+   * Shows radar detection lines (orange) and interceptor tracking lines (cyan)
+   * when an enemy ICBM is selected (tracked).
+   */
+  private updateIcbmTrackingVisualization(deltaTime: number): void {
+    // Clear existing visualization
+    this.clearIcbmTrackingVisualization();
+
+    if (!this.trackedMissileId || !this.gameState || !this.playerId) return;
+
+    // Get the tracked missile and verify it's an enemy ICBM
+    const trackedMissile = this.gameState.missiles[this.trackedMissileId];
+    if (!trackedMissile) return;
+
+    // Only show for enemy ICBMs (not interceptors, not own missiles)
+    if (trackedMissile.ownerId === this.playerId) return;
+    if (isInterceptorType(trackedMissile) || isGuidedInterceptor(trackedMissile)) return;
+    if (trackedMissile.detonated || trackedMissile.intercepted) return;
+
+    // Get ICBM's current 3D position
+    const icbm3D = this.getTargetIcbm3DPosition(this.trackedMissileId);
+    if (!icbm3D) return;
+    const icbmVec = new THREE.Vector3(icbm3D.x, icbm3D.y, icbm3D.z);
+
+    // Get ICBM's geo position for radar range checks
+    const icbmGeo = trackedMissile.geoCurrentPosition || trackedMissile.geoLaunchPosition;
+    if (!icbmGeo) return;
+
+    // Calculate ICBM altitude for horizon checks
+    const progress = trackedMissile.progress ?? 0;
+    const apexHeight = (trackedMissile as any).apexHeight ?? 30;
+    const icbmAltitudeGlobe = getIcbmAltitude(progress, apexHeight);
+    // Convert globe units to km (approximate: globe radius 100 = Earth radius 6371km)
+    const icbmAltitudeKm = (icbmAltitudeGlobe / GLOBE_RADIUS) * this.EARTH_RADIUS_KM;
+
+    // Update animation time
+    this.icbmTrackingAnimationTime += deltaTime;
+
+    // Colors for visualization
+    const radarColor = 0xff8800;     // Orange for radar detection
+    const interceptorColor = 0x00ffff; // Cyan for interceptor tracking
+
+    // Find detecting radars and draw lines
+    const detectingRadars = this.findDetectingRadars(icbmGeo, icbmAltitudeKm);
+    for (const { radar, position3D } of detectingRadars) {
+      this.createTrackingLineWithSphere(position3D, icbmVec, radarColor);
+    }
+
+    // Find tracking interceptors and draw lines
+    const trackingInterceptors = this.findTrackingInterceptors(this.trackedMissileId);
+    for (const { interceptor, position3D } of trackingInterceptors) {
+      this.createTrackingLineWithSphere(position3D, icbmVec, interceptorColor);
+    }
+
+    // Animate spheres
+    this.animateTrackingSpheres();
+  }
+
+  /**
+   * Find all player radars that are currently detecting the ICBM.
+   */
+  private findDetectingRadars(icbmGeo: GeoPosition, icbmAltitudeKm: number): Array<{
+    radar: Radar;
+    position3D: THREE.Vector3;
+  }> {
+    const result: Array<{ radar: Radar; position3D: THREE.Vector3 }> = [];
+
+    if (!this.gameState || !this.playerId) return result;
+
+    // Calculate horizon-limited range based on ICBM altitude
+    const horizonRangeKm = Math.sqrt(2 * this.EARTH_RADIUS_KM * this.RADAR_HEIGHT_KM) +
+                           Math.sqrt(2 * this.EARTH_RADIUS_KM * Math.max(0, icbmAltitudeKm));
+    const horizonRangeDegrees = (horizonRangeKm / this.EARTH_RADIUS_KM) * (180 / Math.PI);
+    const effectiveRangeDegrees = Math.min(horizonRangeDegrees, this.RADAR_MAX_RANGE_DEGREES);
+
+    // Check all player's radars
+    for (const building of getBuildings(this.gameState)) {
+      if (building.ownerId !== this.playerId) continue;
+      if (building.type !== 'radar') continue;
+      if (building.destroyed) continue;
+
+      const radar = building as Radar;
+      const radarGeo = radar.geoPosition || this.pixelToGeoFallback(radar.position);
+      const angularDistance = this.calculateAngularDistance(icbmGeo, radarGeo);
+
+      if (angularDistance <= effectiveRangeDegrees) {
+        // Radar is detecting this ICBM
+        const pos3D = geoToSphere(radarGeo, GLOBE_RADIUS + 3);
+        result.push({
+          radar,
+          position3D: new THREE.Vector3(pos3D.x, pos3D.y, pos3D.z),
+        });
+      }
+    }
+
+    // Also check AWACS aircraft
+    for (const aircraft of getAircraft(this.gameState)) {
+      if (aircraft.ownerId !== this.playerId) continue;
+      if (aircraft.type !== 'radar') continue;
+      if (aircraft.status !== 'flying') continue;
+
+      const angularDistance = this.calculateAngularDistance(icbmGeo, aircraft.geoPosition);
+      // AWACS has higher altitude, so better radar horizon
+      const awacsAltitudeKm = (aircraft.altitude / GLOBE_RADIUS) * this.EARTH_RADIUS_KM;
+      const awacsHorizonKm = Math.sqrt(2 * this.EARTH_RADIUS_KM * awacsAltitudeKm) +
+                              Math.sqrt(2 * this.EARTH_RADIUS_KM * Math.max(0, icbmAltitudeKm));
+      const awacsRangeDegrees = Math.min(
+        (awacsHorizonKm / this.EARTH_RADIUS_KM) * (180 / Math.PI),
+        this.RADAR_MAX_RANGE_DEGREES
+      );
+
+      if (angularDistance <= awacsRangeDegrees) {
+        const pos3D = geoToSphere(aircraft.geoPosition, GLOBE_RADIUS + aircraft.altitude);
+        result.push({
+          radar: { type: 'radar' } as Radar, // Dummy radar type for AWACS
+          position3D: new THREE.Vector3(pos3D.x, pos3D.y, pos3D.z),
+        });
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Find all player interceptors that are tracking this ICBM.
+   */
+  private findTrackingInterceptors(targetIcbmId: string): Array<{
+    interceptor: GuidedInterceptor;
+    position3D: THREE.Vector3;
+  }> {
+    const result: Array<{ interceptor: GuidedInterceptor; position3D: THREE.Vector3 }> = [];
+
+    if (!this.gameState || !this.playerId) return result;
+
+    // Check all missiles
+    for (const missile of getMissiles(this.gameState)) {
+      // Must be player's missile
+      if (missile.ownerId !== this.playerId) continue;
+
+      // Must be targeting this ICBM
+      if (missile.targetId !== targetIcbmId) continue;
+
+      // Must be active (not detonated or intercepted)
+      if (missile.detonated || missile.intercepted) continue;
+
+      // Must be an interceptor
+      if (!isGuidedInterceptor(missile) && !isInterceptorType(missile)) continue;
+
+      // Get interceptor position
+      let pos3D: THREE.Vector3;
+      if (isGuidedInterceptor(missile)) {
+        const guidedMissile = missile as GuidedInterceptor;
+        const altitude = guidedMissile.altitude || guidedMissile.currentAltitude || 0;
+        const geoPos = guidedMissile.geoPosition || guidedMissile.geoCurrentPosition;
+        if (geoPos) {
+          const groundPos = geoToSphere(geoPos, GLOBE_RADIUS + altitude);
+          pos3D = new THREE.Vector3(groundPos.x, groundPos.y, groundPos.z);
+        } else {
+          continue;
+        }
+      } else {
+        // Legacy interceptor - use geo position with estimated altitude
+        const geoPos = missile.geoCurrentPosition;
+        if (!geoPos) continue;
+        const groundPos = geoToSphere(geoPos, GLOBE_RADIUS + 10); // Estimate altitude
+        pos3D = new THREE.Vector3(groundPos.x, groundPos.y, groundPos.z);
+      }
+
+      result.push({
+        interceptor: missile as GuidedInterceptor,
+        position3D: pos3D,
+      });
+    }
+
+    return result;
+  }
+
+  /**
+   * Create a tracking line with an animated sphere traveling along it.
+   */
+  private createTrackingLineWithSphere(
+    start: THREE.Vector3,
+    end: THREE.Vector3,
+    color: number
+  ): void {
+    // Create arced line
+    const curvePoints = this.createArcedLine(start, end, 24);
+    const lineGeom = new THREE.BufferGeometry().setFromPoints(curvePoints);
+    const lineMat = new THREE.LineDashedMaterial({
+      color,
+      dashSize: 3,
+      gapSize: 2,
+      transparent: true,
+      opacity: 0.5,
+    });
+    const line = new THREE.Line(lineGeom, lineMat);
+    line.computeLineDistances();
+    this.icbmTrackingGroup.add(line);
+    this.icbmTrackingLines.push(line);
+
+    // Create traveling sphere
+    const sphereGeom = new THREE.SphereGeometry(0.8, 12, 12);
+    const sphereMat = new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: 0.9,
+    });
+    const sphere = new THREE.Mesh(sphereGeom, sphereMat);
+
+    // Store curve points for animation
+    sphere.userData.curvePoints = curvePoints;
+
+    this.icbmTrackingGroup.add(sphere);
+    this.icbmTrackingSpheres.push(sphere);
+  }
+
+  /**
+   * Animate tracking spheres on a 5-second cycle.
+   */
+  private animateTrackingSpheres(): void {
+    const cycleDuration = 5.0; // seconds
+    const cycleProgress = (this.icbmTrackingAnimationTime % cycleDuration) / cycleDuration;
+
+    for (const sphere of this.icbmTrackingSpheres) {
+      const curvePoints = sphere.userData.curvePoints as THREE.Vector3[];
+      if (!curvePoints || curvePoints.length < 2) continue;
+
+      // Position along curve
+      const curveIndex = cycleProgress * (curvePoints.length - 1);
+      const lowerIndex = Math.floor(curveIndex);
+      const upperIndex = Math.min(lowerIndex + 1, curvePoints.length - 1);
+      const localT = curveIndex - lowerIndex;
+      sphere.position.lerpVectors(curvePoints[lowerIndex], curvePoints[upperIndex], localT);
+
+      // Pulse scale with sin wave
+      const scale = 0.8 + 0.4 * Math.sin(cycleProgress * Math.PI * 2);
+      sphere.scale.setScalar(scale);
+
+      // Fade opacity at start and end of cycle
+      const mat = sphere.material as THREE.MeshBasicMaterial;
+      if (cycleProgress < 0.1) {
+        // Fade in
+        mat.opacity = cycleProgress / 0.1 * 0.9;
+      } else if (cycleProgress > 0.9) {
+        // Fade out
+        mat.opacity = (1 - cycleProgress) / 0.1 * 0.9;
+      } else {
+        mat.opacity = 0.9;
+      }
+    }
+  }
+
+  /**
+   * Clear ICBM tracking visualization.
+   */
+  private clearIcbmTrackingVisualization(): void {
+    // Remove and dispose lines
+    for (const line of this.icbmTrackingLines) {
+      this.icbmTrackingGroup.remove(line);
+      line.geometry.dispose();
+      if (line.material instanceof THREE.Material) {
+        line.material.dispose();
+      }
+    }
+    this.icbmTrackingLines = [];
+
+    // Remove and dispose spheres
+    for (const sphere of this.icbmTrackingSpheres) {
+      this.icbmTrackingGroup.remove(sphere);
+      sphere.geometry.dispose();
+      if (sphere.material instanceof THREE.Material) {
+        sphere.material.dispose();
+      }
+    }
+    this.icbmTrackingSpheres = [];
   }
 
   /**
@@ -4146,11 +4218,9 @@ export class GlobeRenderer {
     if (interceptor.detonated || interceptor.intercepted) return;
 
     // Get the target ICBM
-    const targetId = isRailInterceptor(interceptor)
-      ? (interceptor as RailInterceptor).targetId
-      : isGuidedInterceptor(interceptor)
-        ? (interceptor as GuidedInterceptor).targetId
-        : (interceptor as any).targetId;
+    const targetId = isGuidedInterceptor(interceptor)
+      ? (interceptor as GuidedInterceptor).targetId
+      : (interceptor as any).targetId;
     const targetIcbm = targetId ? this.gameState.missiles[targetId] : null;
     if (!targetIcbm || targetIcbm.detonated || targetIcbm.intercepted) return;
 
@@ -4182,49 +4252,23 @@ export class GlobeRenderer {
         const interceptProgress = Math.min(0.95, icbm.progress + progressDelta);
         const interceptGeo = geoInterpolate(icbm.geoLaunchPosition, icbm.geoTargetPosition, interceptProgress);
         const icbmApex = icbm.apexHeight || 30;
-        const icbmAltitude = 4 * icbmApex * interceptProgress * (1 - interceptProgress);
+        const icbmAltitude = getIcbmAltitude(interceptProgress, icbmApex, 0.6);
 
-        const markerPos = geoToSphere(interceptGeo, GLOBE_RADIUS + icbmAltitude * 0.3);
+        const markerPos = geoToSphere(interceptGeo, GLOBE_RADIUS + icbmAltitude);
+        const markerPosition = new THREE.Vector3(markerPos.x, markerPos.y, markerPos.z);
         const chance = guidedMissile.hasGuidance ? 0.75 : 0.15;
-        this.createInterceptMarker(
-          new THREE.Vector3(markerPos.x, markerPos.y, markerPos.z),
-          chance
-        );
+        this.createInterceptMarker(markerPosition, chance);
+
+        // Get interceptor's current 3D position and create projected path
+        if (guidedMissile.geoPosition) {
+          const altitude = guidedMissile.altitude || 0;
+          const interceptorPos3D = geoToSphere(guidedMissile.geoPosition, GLOBE_RADIUS + altitude);
+          const interceptorPosition = new THREE.Vector3(interceptorPos3D.x, interceptorPos3D.y, interceptorPos3D.z);
+          this.createInterceptorProjectedPath(interceptorPosition, markerPosition);
+        }
       }
       return;
     }
-
-    // Rail interceptors: show marker at ICBM's predicted position at intercept
-    if (isRailInterceptor(interceptor)) {
-      const railMissile = interceptor as RailInterceptor;
-      const icbm = targetIcbm as Missile;
-
-      // Get ICBM position at the intercept progress (where they'll meet)
-      if (icbm.geoLaunchPosition && icbm.geoTargetPosition) {
-        const interceptProgress = railMissile.targetProgressAtIntercept;
-        const icbmGeo = geoInterpolate(icbm.geoLaunchPosition, icbm.geoTargetPosition, interceptProgress);
-        const icbmApex = icbm.apexHeight || 30;
-        const icbmAltitude = 4 * icbmApex * interceptProgress * (1 - interceptProgress);
-
-        // Place marker at ICBM's position (on the globe surface, not at altitude)
-        const markerPos = geoToSphere(icbmGeo, GLOBE_RADIUS + icbmAltitude * 0.3);
-        const chance = railMissile.tracking.hasGuidance ? 0.7 : 0.1;
-        this.createInterceptMarker(
-          new THREE.Vector3(markerPos.x, markerPos.y, markerPos.z),
-          chance
-        );
-      }
-      return;
-    }
-
-    // Physics missiles: use server-provided predicted intercept point
-    if (isPhysicsMissile(interceptor)) {
-      this.updateInterceptPredictionForPhysicsMissile(interceptor, targetIcbm as Missile | PhysicsMissile);
-      return;
-    }
-
-    // Skip if target is a rail interceptor
-    if (isRailInterceptor(targetIcbm)) return;
 
     // Legacy interceptor: calculate intercept point locally
     const interceptPoint = this.calculateInterceptPoint(interceptor as Missile, targetIcbm as Missile);
@@ -4247,114 +4291,6 @@ export class GlobeRenderer {
 
     // Show fuel and speed beside the missile
     this.createMissileStatsLabel(interceptor, flameoutProgress);
-  }
-
-  /**
-   * Update intercept prediction for physics-based missiles.
-   * Uses server-provided data for more accurate visualization.
-   */
-  private updateInterceptPredictionForPhysicsMissile(
-    interceptor: PhysicsMissile,
-    targetIcbm: Missile | PhysicsMissile
-  ): void {
-    // Use server-calculated predicted intercept point
-    if (interceptor.predictedInterceptPoint) {
-      const pt = interceptor.predictedInterceptPoint;
-      const position = new THREE.Vector3(pt.x, pt.y, pt.z);
-
-      // Calculate interception chance based on physics state
-      const chance = this.calculatePhysicsMissileChance(interceptor);
-
-      // Create intercept marker
-      this.createInterceptMarker(position, chance);
-
-      // Create chance label
-      this.createChanceLabel(position, chance);
-    }
-
-    // Show flameout marker if engine has flamed out
-    if (interceptor.engineFlameout) {
-      this.createPhysicsFlameoutMarker(interceptor);
-    }
-
-    // Show fuel and time-to-intercept stats
-    this.createPhysicsMissileStatsLabel(interceptor);
-  }
-
-  /**
-   * Calculate interception chance for physics missiles.
-   */
-  private calculatePhysicsMissileChance(missile: PhysicsMissile): number {
-    let chance = 0.7; // Base chance
-
-    // Coast phase (no fuel) has very low chance
-    if (missile.phase === 'coast' || missile.engineFlameout) {
-      return 0.05;
-    }
-
-    // Terminal phase has higher chance
-    if (missile.phase === 'terminal') {
-      chance += 0.1;
-    }
-
-    // Low fuel reduces chance
-    if (missile.fuel < 2) {
-      chance -= 0.15;
-    }
-
-    // Close to intercept increases chance
-    if (missile.timeToIntercept !== undefined && missile.timeToIntercept < 2) {
-      chance += 0.1;
-    }
-
-    return Math.max(0.05, Math.min(0.85, chance));
-  }
-
-  /**
-   * Create flameout marker for physics missiles.
-   */
-  private createPhysicsFlameoutMarker(missile: PhysicsMissile): void {
-    // Position marker at flameout location (not current position)
-    const pos = missile.flameoutPosition || missile.position;
-    const markerGroup = new THREE.Group();
-
-    // Red X shape for flameout
-    const xMaterial = new THREE.LineBasicMaterial({ color: 0xff4444 });
-    const size = 1.5;
-
-    const xGeom1 = new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(-size, 0, -size),
-      new THREE.Vector3(size, 0, size),
-    ]);
-    const xGeom2 = new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(-size, 0, size),
-      new THREE.Vector3(size, 0, -size),
-    ]);
-
-    markerGroup.add(new THREE.Line(xGeom1, xMaterial));
-    markerGroup.add(new THREE.Line(xGeom2, xMaterial));
-
-    markerGroup.position.set(pos.x, pos.y, pos.z);
-    markerGroup.lookAt(0, 0, 0);
-
-    // Store reference so it gets cleaned up properly
-    this.flameoutMarker = markerGroup;
-    this.interceptPredictionGroup.add(markerGroup);
-  }
-
-  /**
-   * Create stats label for physics missiles showing fuel and time to intercept.
-   */
-  private createPhysicsMissileStatsLabel(missile: PhysicsMissile): void {
-    // Create stats display near the missile
-    const fuelPercent = Math.round((missile.fuel / missile.maxFuel) * 100);
-    const timeToInt = missile.timeToIntercept !== undefined
-      ? `T-${missile.timeToIntercept.toFixed(1)}s`
-      : '--';
-    const phase = missile.phase.toUpperCase();
-
-    // Create label (simplified - just add to debug if needed)
-    // Full implementation would create a sprite or HTML overlay
   }
 
   /**
@@ -4387,12 +4323,10 @@ export class GlobeRenderer {
       icbmProgressAtIntercept
     );
 
-    // ICBM altitude follows parabolic arc: 4 * apex * p * (1-p)
-    // Scale apex to globe units (apex is in abstract units, roughly 1 unit = 1 degree)
-    const icbmAltitude = 4 * icbm.apexHeight * icbmProgressAtIntercept * (1 - icbmProgressAtIntercept);
-    const altitudeInGlobeUnits = icbmAltitude * 0.3; // Scale factor for visualization
+    // ICBM altitude follows asymmetric ballistic arc: apex * sin^0.6(π * progress)
+    const icbmAltitude = getIcbmAltitude(icbmProgressAtIntercept, icbm.apexHeight, 0.6);
 
-    const icbmPos = geoToSphere(icbmGeoAtIntercept, GLOBE_RADIUS + altitudeInGlobeUnits);
+    const icbmPos = geoToSphere(icbmGeoAtIntercept, GLOBE_RADIUS + icbmAltitude);
 
     return {
       position: new THREE.Vector3(icbmPos.x, icbmPos.y, icbmPos.z),
@@ -4779,7 +4713,6 @@ export class GlobeRenderer {
     }
 
     // Also clean up tracking state
-    this.interceptorPhases.delete(missileId);
     this.missileRadarStatus.delete(missileId);
     this.icbmMarkerProgress.delete(missileId);
   }
@@ -4913,6 +4846,40 @@ export class GlobeRenderer {
       }
       this.missileStatsLabel = null;
     }
+
+    if (this.interceptorProjectedPath) {
+      this.interceptPredictionGroup.remove(this.interceptorProjectedPath);
+      this.interceptorProjectedPath.geometry.dispose();
+      if (this.interceptorProjectedPath.material instanceof THREE.Material) {
+        this.interceptorProjectedPath.material.dispose();
+      }
+      this.interceptorProjectedPath = null;
+    }
+  }
+
+  /**
+   * Create a dashed line from the interceptor's current position to the predicted intercept point.
+   */
+  private createInterceptorProjectedPath(interceptorPos: THREE.Vector3, interceptPoint: THREE.Vector3): void {
+    // Create dashed line geometry
+    const points = [interceptorPos.clone(), interceptPoint.clone()];
+    const geometry = new THREE.BufferGeometry().setFromPoints(points);
+
+    // Use a cyan dashed line material
+    const material = new THREE.LineDashedMaterial({
+      color: 0x00ffff,
+      dashSize: 2,
+      gapSize: 1,
+      linewidth: 1,
+      transparent: true,
+      opacity: 0.7,
+    });
+
+    const line = new THREE.Line(geometry, material);
+    line.computeLineDistances(); // Required for dashed lines
+
+    this.interceptorProjectedPath = line;
+    this.interceptPredictionGroup.add(line);
   }
 
   private showExplosionAt(geoPos: GeoPosition): void {
@@ -6094,11 +6061,9 @@ export class GlobeRenderer {
 
   /**
    * Get the 3D position of a missile for camera tracking.
-   * Works with physics missiles, rail interceptors, guided interceptors, legacy interceptors, and ICBMs.
+   * Works with guided interceptors, legacy interceptors, and ICBMs.
    */
-  private getMissile3DPositionForTracking(missile: Missile | PhysicsMissile | RailInterceptor | GuidedInterceptor): THREE.Vector3 | null {
-    const now = Date.now();
-
+  private getMissile3DPositionForTracking(missile: Missile | GuidedInterceptor): THREE.Vector3 | null {
     // Guided interceptors use server-provided position
     if (isGuidedInterceptor(missile)) {
       const guidedMissile = missile as GuidedInterceptor;
@@ -6109,34 +6074,6 @@ export class GlobeRenderer {
         return new THREE.Vector3(pos.x, pos.y, pos.z);
       }
       return null;
-    }
-
-    // Rail interceptors use pre-calculated rail path
-    if (isRailInterceptor(missile)) {
-      const railMissile = missile as RailInterceptor;
-      if (railMissile.status === 'missed' && railMissile.missBehavior) {
-        // Use current position during miss coast
-        if (railMissile.geoCurrentPosition) {
-          const altitude = railMissile.currentAltitude || 0;
-          const pos = geoToSphere(railMissile.geoCurrentPosition, GLOBE_RADIUS + altitude);
-          return new THREE.Vector3(pos.x, pos.y, pos.z);
-        }
-      }
-      const pos = getInterceptorPosition3D(
-        railMissile.rail.startGeo,
-        railMissile.rail.endGeo,
-        railMissile.progress,
-        railMissile.rail.apexHeight,
-        railMissile.rail.endAltitude,
-        GLOBE_RADIUS
-      );
-      return new THREE.Vector3(pos.x, pos.y, pos.z);
-    }
-
-    // Physics missiles have direct 3D position
-    if (isPhysicsMissile(missile)) {
-      const pos = this.getInterpolatedPhysicsPosition(missile, now);
-      return new THREE.Vector3(pos.x, pos.y, pos.z);
     }
 
     // For legacy missiles, get geo position and convert
@@ -6166,8 +6103,8 @@ export class GlobeRenderer {
     // For interceptors and others, use current geo position at estimated altitude
     const progress = legacyMissile.progress || 0;
     const apexHeight = legacyMissile.apexHeight || 20;
-    // Parabolic altitude based on progress
-    const altitude = 4 * apexHeight * progress * (1 - progress);
+    // Ballistic altitude based on progress (asymmetric arc with shallow reentry)
+    const altitude = getIcbmAltitude(progress, apexHeight, 0.6);
     const pos = geoToSphere(missileGeo, GLOBE_RADIUS + altitude);
     return new THREE.Vector3(pos.x, pos.y, pos.z);
   }
@@ -6793,6 +6730,9 @@ export class GlobeRenderer {
 
       // Update communication chain visualization (for tracked interceptor)
       this.updateCommunicationChain(deltaTime);
+
+      // Update ICBM tracking visualization (for tracked enemy ICBM)
+      this.updateIcbmTrackingVisualization(deltaTime);
 
       // Update intercept prediction visualization (for tracked interceptor)
       this.updateInterceptPrediction();
