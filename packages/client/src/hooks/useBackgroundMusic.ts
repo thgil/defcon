@@ -12,6 +12,7 @@ const MIN_DELAY = 5000;  // 5 seconds
 const MAX_DELAY = 30000; // 30 seconds
 const FADE_DURATION = 5000; // 5 seconds fade in for gradual volume ramp
 const FADE_OUT_BEFORE_END = 3000; // Start fade out 3 seconds before track ends
+const INITIAL_MUSIC_DELAY = 15000; // 15 seconds before first track starts
 
 export function useBackgroundMusic() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -159,23 +160,32 @@ export function useBackgroundMusic() {
     });
   }, [fadeIn, fadeOut, scheduleNextTrack]);
 
-  // Start music on first user interaction
+  // Start music 15 seconds after first user interaction
   useEffect(() => {
-    const startMusic = () => {
+    let startupTimer: number | null = null;
+
+    const scheduleMusic = () => {
       if (!audioRef.current?.src && musicEnabled) {
-        const track = pickRandomTrack();
-        playTrack(track);
+        startupTimer = window.setTimeout(() => {
+          if (musicEnabled) {
+            const track = pickRandomTrack();
+            playTrack(track);
+          }
+        }, INITIAL_MUSIC_DELAY);
       }
-      document.removeEventListener('click', startMusic);
-      document.removeEventListener('keydown', startMusic);
+      document.removeEventListener('click', scheduleMusic);
+      document.removeEventListener('keydown', scheduleMusic);
     };
 
-    document.addEventListener('click', startMusic);
-    document.addEventListener('keydown', startMusic);
+    document.addEventListener('click', scheduleMusic);
+    document.addEventListener('keydown', scheduleMusic);
 
     return () => {
-      document.removeEventListener('click', startMusic);
-      document.removeEventListener('keydown', startMusic);
+      document.removeEventListener('click', scheduleMusic);
+      document.removeEventListener('keydown', scheduleMusic);
+      if (startupTimer) {
+        clearTimeout(startupTimer);
+      }
     };
   }, [pickRandomTrack, playTrack, musicEnabled]);
 

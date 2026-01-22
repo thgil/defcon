@@ -20,8 +20,8 @@ interface AudioStore extends AudioState {
 export const useAudioStore = create<AudioStore>()(
   persist(
     (set) => ({
-      // Default to 60% of original values (0.3 * 0.6 = 0.18 for music, 0.5 * 0.6 = 0.3 for sfx)
-      musicVolume: 0.18,
+      // Keep music quiet and ambient (30% less than previous 0.18)
+      musicVolume: 0.12,
       sfxVolume: 0.3,
       musicEnabled: true,
       sfxEnabled: true,
