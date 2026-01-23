@@ -156,6 +156,13 @@ export class ConnectionManager {
         }
         break;
 
+      case 'set_game_speed':
+        if (connection.gameId) {
+          const game = this.lobbyManager.getGame(connection.gameId);
+          game?.handleSetGameSpeed(message.speed);
+        }
+        break;
+
       case 'launch_satellite':
         if (connection.gameId) {
           const game = this.lobbyManager.getGame(connection.gameId);
@@ -280,6 +287,30 @@ export class ConnectionManager {
         if (connection.gameId && connection.playerId) {
           const game = this.lobbyManager.getGame(connection.gameId);
           game?.handleHackTrace(connection.playerId);
+        }
+        break;
+
+      // Network warfare messages
+      case 'launch_decoy':
+        if (connection.gameId && connection.playerId) {
+          const game = this.lobbyManager.getGame(connection.gameId);
+          game?.handleLaunchDecoy(
+            connection.playerId,
+            message.siloId,
+            message.targetPosition,
+            message.count
+          );
+        }
+        break;
+
+      case 'set_silo_target':
+        if (connection.gameId && connection.playerId) {
+          const game = this.lobbyManager.getGame(connection.gameId);
+          game?.handleSetSiloTarget(
+            connection.playerId,
+            message.siloId,
+            message.targetPosition
+          );
         }
         break;
     }

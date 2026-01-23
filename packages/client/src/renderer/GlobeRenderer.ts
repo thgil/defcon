@@ -622,7 +622,8 @@ export class GlobeRenderer {
   setDebugCallbacks(
     onDebugCommand: (command: string, value?: number, targetRegion?: string) => void,
     onEnableAI: (region: string) => void,
-    onDisableAI: () => void
+    onDisableAI: () => void,
+    onSetGameSpeed?: (speed: 1 | 2 | 5) => void
   ): void {
     this.hudRenderer.setDebugCallbacks(
       onDebugCommand,
@@ -640,7 +641,8 @@ export class GlobeRenderer {
       },
       (enabled) => {
         this.setFogOfWarEnabled(enabled);
-      }
+      },
+      onSetGameSpeed
     );
     // Initialize layer visibility in HUD
     this.hudRenderer.setLayerVisibility(this.getLayerVisibility());

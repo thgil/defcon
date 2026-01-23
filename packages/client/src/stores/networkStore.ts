@@ -11,10 +11,13 @@ import type {
   AircraftType,
   GeoPosition,
   HackType,
+  GameSpeed,
 } from '@defcon/shared';
+import { getBuildings } from '@defcon/shared';
 import { useAppStore } from './appStore';
 import { useGameStore } from './gameStore';
 import { useTerminalStore } from './terminalStore';
+import { useHackingStore } from './hackingStore';
 
 interface LobbyState {
   lobby: LobbyInfo | null;
@@ -50,6 +53,7 @@ interface NetworkState {
   launchSatellite: (facilityId: string, inclination: number) => void;
   launchAircraft: (airfieldId: string, aircraftType: AircraftType, waypoints: GeoPosition[]) => void;
   setSiloMode: (siloId: string, mode: SiloMode) => void;
+  setGameSpeed: (speed: GameSpeed) => void;
   sendDebugCommand: (command: 'advance_defcon' | 'set_defcon' | 'add_missiles' | 'skip_timer' | 'launch_test_missiles', value?: number, targetRegion?: string) => void;
   enableAI: (region: string) => void;
   disableAI: () => void;
@@ -177,6 +181,10 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
 
   setSiloMode: (siloId: string, mode: SiloMode) => {
     send({ type: 'set_silo_mode', siloId, mode });
+  },
+
+  setGameSpeed: (speed: GameSpeed) => {
+    send({ type: 'set_game_speed', speed });
   },
 
   sendDebugCommand: (command: 'advance_defcon' | 'set_defcon' | 'add_missiles' | 'skip_timer' | 'launch_test_missiles', value?: number, targetRegion?: string) => {
@@ -360,6 +368,38 @@ function handleMessage(message: ServerMessage) {
       useTerminalStore.getState().setDetectedBuildings(message.detectedBuildings);
       break;
 
+    case 'hack_started': {
+      const terminalStore = useTerminalStore.getState();
+      terminalStore.setActiveHack({
+        hackId: message.hackId,
+        targetId: message.targetId,
+        targetName: message.targetName,
+        hackType: message.hackType,
+        progress: 0,
+        traceProgress: 0,
+        status: 'connecting',
+      });
+
+      // Create network trace for 3D visualization
+      const hackGameState = gameStore.gameState;
+      const hackPlayerId = networkStore.playerId;
+      if (hackGameState && hackPlayerId) {
+        const targetBuilding = terminalStore.detectedBuildings.find(b => b.id === message.targetId);
+        const sourceBuilding = getBuildings(hackGameState).find(b => b.ownerId === hackPlayerId && !b.destroyed);
+
+        if (targetBuilding?.geoPosition && sourceBuilding?.geoPosition) {
+          const hackingStore = useHackingStore.getState();
+          hackingStore.startHackFromGeo(
+            sourceBuilding.geoPosition,
+            targetBuilding.geoPosition,
+            message.hackId
+          );
+          hackingStore.setNetworkVisible(true);
+        }
+      }
+      break;
+    }
+
     case 'hack_progress':
       useTerminalStore.getState().updateHackProgress(
         message.hackId,
@@ -367,9 +407,16 @@ function handleMessage(message: ServerMessage) {
         message.traceProgress,
         message.status
       );
+      // Sync to hackingStore for 3D visualization (convert 0-100 to 0-1)
+      useHackingStore.getState().updateHackProgress(
+        message.hackId,
+        message.progress / 100,
+        message.traceProgress / 100
+      );
       break;
 
     case 'hack_complete':
+      useHackingStore.getState().removeHack(message.hackId);
       useTerminalStore.getState().setActiveHack(null);
       useTerminalStore.getState().addCompromise(message.compromise);
       // Add success email
@@ -383,6 +430,7 @@ function handleMessage(message: ServerMessage) {
       break;
 
     case 'hack_traced':
+      useHackingStore.getState().removeHack(message.hackId);
       useTerminalStore.getState().setActiveHack(null);
       // Add failure email
       useTerminalStore.getState().addEmail({
@@ -395,6 +443,7 @@ function handleMessage(message: ServerMessage) {
       break;
 
     case 'hack_disconnected':
+      useHackingStore.getState().removeHack(message.hackId);
       useTerminalStore.getState().setActiveHack(null);
       break;
 
@@ -417,5 +466,62 @@ function handleMessage(message: ServerMessage) {
       useTerminalStore.getState().setIntrusionAlerts(message.activeIntrusions);
       useTerminalStore.getState().setCompromisedBuildings(message.compromisedBuildings);
       break;
+
+    // Network warfare messages
+    case 'launch_warning':
+      // Play alert sound and show warning
+      useTerminalStore.getState().addEmail({
+        from: 'LAUNCH WARNING',
+        to: 'COMMANDER',
+        subject: `LAUNCH DETECTED FROM ${message.fromPlayerName.toUpperCase()}`,
+        body: `WARNING: Enemy missile launch detected!\n\nSource: ${message.fromPlayerName}\nSilo: ${message.siloId}\nApproximate Direction: ${message.approximateDirection}° (${getCompassDirection(message.approximateDirection)})\n\nPrepare defensive measures.`,
+        isSystem: true,
+      });
+      console.log(`[LAUNCH WARNING] Received warning from ${message.fromPlayerName}, heading ${message.approximateDirection}°`);
+      break;
+
+    case 'target_intel_result':
+      // Show intel result
+      useTerminalStore.getState().addEmail({
+        from: 'INTEL',
+        to: 'COMMANDER',
+        subject: `SILO TARGET INTEL: ${message.siloId}`,
+        body: message.targetPosition
+          ? `Target acquisition successful.\n\nSilo: ${message.siloId}\nTarget City: ${message.targetCityName || 'Unknown'}\nPosition: (${message.targetPosition.lat.toFixed(2)}°, ${message.targetPosition.lng.toFixed(2)}°)\n\nMark this location for defensive priority.`
+          : `Target acquisition complete.\n\nSilo: ${message.siloId}\nResult: NO TARGET SET\n\nEnemy silo has not yet acquired a target.`,
+        isSystem: true,
+      });
+      break;
+
+    case 'ddos_status':
+      if (message.active) {
+        useTerminalStore.getState().addEmail({
+          from: 'SYSTEM ALERT',
+          to: 'COMMANDER',
+          subject: 'NETWORK UNDER ATTACK',
+          body: `WARNING: Your network is under DDoS attack!\n\nYou cannot initiate new hacks until the attack subsides.\nEstimated duration: ${message.expiresAt ? Math.ceil((message.expiresAt - Date.now()) / 1000) : '?'}s`,
+          isSystem: true,
+        });
+      }
+      break;
+
+    case 'cable_status':
+      if (message.status === 'cut') {
+        useTerminalStore.getState().addEmail({
+          from: 'NETWORK ALERT',
+          to: 'COMMANDER',
+          subject: 'UNDERSEA CABLE SEVERED',
+          body: `Cable ${message.cableId} has been cut.\n\nHacks using this route have been disconnected.\nEstimated repair time: ${message.expiresAt ? Math.ceil((message.expiresAt - Date.now()) / 1000) : '?'}s`,
+          isSystem: true,
+        });
+      }
+      break;
   }
+}
+
+// Helper to convert heading to compass direction
+function getCompassDirection(heading: number): string {
+  const directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+  const index = Math.round(heading / 45) % 8;
+  return directions[index];
 }

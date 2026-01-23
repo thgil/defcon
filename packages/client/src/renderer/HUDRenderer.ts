@@ -1,4 +1,4 @@
-import type { GameState, Building, Silo, SatelliteLaunchFacility, Airfield, DefconLevel, Player, AircraftType, GeoPosition } from '@defcon/shared';
+import type { GameState, Building, Silo, SatelliteLaunchFacility, Airfield, DefconLevel, Player, AircraftType, GeoPosition, GameSpeed } from '@defcon/shared';
 import type { GameAlert, ManualInterceptState, InterceptSiloInfo } from '../stores/gameStore';
 
 const DEFCON_COLORS: Record<DefconLevel, string> = {
@@ -61,6 +61,7 @@ export class HUDRenderer {
   private onEnableAI: ((region: string) => void) | null = null;
   private onDisableAI: (() => void) | null = null;
   private onLayerToggle: ((layer: 'coastlines' | 'borders' | 'airspaces') => boolean) | null = null;
+  private onSetGameSpeed: ((speed: GameSpeed) => void) | null = null;
 
   // Placement state
   private placementMode: string | null = null;
@@ -164,13 +165,15 @@ export class HUDRenderer {
     onEnableAI: (region: string) => void,
     onDisableAI: () => void,
     onLayerToggle: (layer: 'coastlines' | 'borders' | 'airspaces') => boolean,
-    onFogOfWarToggle?: (enabled: boolean) => void
+    onFogOfWarToggle?: (enabled: boolean) => void,
+    onSetGameSpeed?: (speed: GameSpeed) => void
   ): void {
     this.onDebugCommand = onDebugCommand;
     this.onEnableAI = onEnableAI;
     this.onDisableAI = onDisableAI;
     this.onLayerToggle = onLayerToggle;
     this.onFogOfWarToggle = onFogOfWarToggle || null;
+    this.onSetGameSpeed = onSetGameSpeed || null;
   }
 
   setDebugPanelVisible(visible: boolean): void {
@@ -516,29 +519,58 @@ export class HUDRenderer {
     const state = this.gameState!;
     const color = DEFCON_COLORS[state.defconLevel];
     const centerX = width / 2;
+    const currentSpeed = state.gameSpeed || 1;
 
-    // Background
+    // Background - wider to accommodate speed buttons
     this.ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
-    this.ctx.fillRect(centerX - 100, 8, 200, 50);
+    this.ctx.fillRect(centerX - 140, 8, 280, 50);
     this.ctx.strokeStyle = color;
     this.ctx.lineWidth = 1;
-    this.ctx.strokeRect(centerX - 100, 8, 200, 50);
+    this.ctx.strokeRect(centerX - 140, 8, 280, 50);
 
     // DEFCON text
     this.ctx.fillStyle = color;
     this.ctx.font = FONT_TITLE;
     this.ctx.textAlign = 'center';
-    this.ctx.fillText(`DEFCON ${state.defconLevel}`, centerX, 38);
+    this.ctx.fillText(`DEFCON ${state.defconLevel}`, centerX - 40, 38);
 
     // Timer - interpolate client-side for smooth updates
     const elapsedSinceUpdate = performance.now() - this.lastStateUpdateTime;
-    const interpolatedTimer = Math.max(0, this.lastDefconTimer - elapsedSinceUpdate);
+    // Scale interpolation by game speed
+    const interpolatedTimer = Math.max(0, this.lastDefconTimer - elapsedSinceUpdate * currentSpeed);
     const timeLeft = Math.ceil(interpolatedTimer / 1000);
     const minutes = Math.floor(timeLeft / 60);
     const seconds = timeLeft % 60;
     this.ctx.font = FONT;
     this.ctx.fillStyle = '#888';
-    this.ctx.fillText(`${minutes}:${seconds.toString().padStart(2, '0')}`, centerX, 52);
+    this.ctx.fillText(`${minutes}:${seconds.toString().padStart(2, '0')}`, centerX - 40, 52);
+
+    // Speed buttons
+    const speeds: GameSpeed[] = [1, 2, 5];
+    const buttonWidth = 28;
+    const buttonHeight = 20;
+    const buttonSpacing = 4;
+    const speedStartX = centerX + 40;
+
+    speeds.forEach((speed, i) => {
+      const x = speedStartX + i * (buttonWidth + buttonSpacing);
+      const y = 22;
+      const isActive = currentSpeed === speed;
+
+      this.drawButton({
+        x,
+        y,
+        width: buttonWidth,
+        height: buttonHeight,
+        label: `${speed}x`,
+        action: () => {
+          if (this.onSetGameSpeed) {
+            this.onSetGameSpeed(speed);
+          }
+        },
+        active: isActive,
+      });
+    });
   }
 
   private drawPlayerInfo(): void {
@@ -1367,9 +1399,9 @@ export class HUDRenderer {
     // Top left player info
     if (x >= 8 && x <= 188 && y >= 8 && y <= 68) return true;
 
-    // Top center DEFCON
+    // Top center DEFCON (wider to include speed buttons)
     const centerX = width / 2;
-    if (x >= centerX - 100 && x <= centerX + 100 && y >= 8 && y <= 58) return true;
+    if (x >= centerX - 140 && x <= centerX + 140 && y >= 8 && y <= 58) return true;
 
     // Top right scoreboard
     const players = this.gameState ? Object.values(this.gameState.players) : [];

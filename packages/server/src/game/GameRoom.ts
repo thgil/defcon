@@ -238,6 +238,7 @@ export class GameRoom {
       defconTimer: this.config.defconTimings.defcon5Duration,
       tick: 0,
       timestamp: Date.now(),
+      gameSpeed: 1,
       players,
       territories,
       cities,
@@ -278,27 +279,32 @@ export class GameRoom {
     this.state.tick++;
     this.state.timestamp = now;
 
+    // Apply game speed multiplier to delta time
+    const gameSpeed = this.state.gameSpeed || 1;
+    const scaledTickInterval = TICK_INTERVAL * gameSpeed;
+    const deltaSeconds = scaledTickInterval / 1000;
+
     // Update DEFCON timer
-    this.updateDefconTimer(TICK_INTERVAL);
+    this.updateDefconTimer(scaledTickInterval);
 
     // Update ICBMs (legacy missiles)
     const missileEvents = this.missileSimulator.update(
       this.state,
-      TICK_INTERVAL / 1000
+      deltaSeconds
     );
     this.pendingEvents.push(...missileEvents);
 
     // Update guided interceptors (proportional navigation with radar-improved prediction)
     const guidedInterceptorEvents = this.guidedInterceptorSimulator.update(
       this.state,
-      TICK_INTERVAL / 1000
+      deltaSeconds
     );
     this.pendingEvents.push(...guidedInterceptorEvents);
 
     // Update satellites
     const satelliteEvents = this.satelliteSimulator.update(
       this.state,
-      TICK_INTERVAL / 1000,
+      deltaSeconds,
       SPHERE_RADIUS
     );
     this.pendingEvents.push(...satelliteEvents);
@@ -306,7 +312,7 @@ export class GameRoom {
     // Update aircraft
     const aircraftEvents = this.aircraftSimulator.update(
       this.state,
-      TICK_INTERVAL / 1000
+      deltaSeconds
     );
     this.pendingEvents.push(...aircraftEvents);
 
@@ -317,7 +323,7 @@ export class GameRoom {
     }
 
     // Update hacking system
-    const hackingResult = this.hackingSystem.update(this.state, TICK_INTERVAL / 1000);
+    const hackingResult = this.hackingSystem.update(this.state, deltaSeconds);
     this.processHackingResults(hackingResult);
 
     // Check for interceptions
@@ -424,8 +430,9 @@ export class GameRoom {
         if (trackingRadarIds.length === 0) continue;
 
 
-        // Check cooldown
-        if (now - silo.lastFireTime < silo.fireCooldown) continue;
+        // Check cooldown (scaled by game speed)
+        const effectiveCooldown = silo.fireCooldown / (this.state.gameSpeed || 1);
+        if (now - silo.lastFireTime < effectiveCooldown) continue;
 
         // Score this silo based on geometry
         const score = this.scoreSiloForIntercept(silo, icbmMissile);
@@ -1001,7 +1008,8 @@ export class GameRoom {
     playerId: string,
     siloId: string,
     targetPosition: Vector2,
-    targetId?: string
+    targetId?: string,
+    isDecoy: boolean = false
   ): void {
     // Only allow at DEFCON 1
     if (this.state.defconLevel !== 1) return;
@@ -1010,9 +1018,19 @@ export class GameRoom {
     if (!silo || silo.type !== 'silo' || silo.ownerId !== playerId) return;
     if (silo.destroyed || silo.mode !== 'icbm' || silo.missileCount <= 0) return;
 
-    // Check cooldown
+    // For decoys, require air defense ammo instead of missiles
+    if (isDecoy && silo.airDefenseAmmo < 3) return;
+
+    // Check cooldown (scaled by game speed)
     const now = Date.now();
-    if (now - silo.lastFireTime < silo.fireCooldown) return;
+    const effectiveCooldown = silo.fireCooldown / (this.state.gameSpeed || 1);
+    if (now - silo.lastFireTime < effectiveCooldown) return;
+
+    // Check for launch warning monitoring
+    const monitorStatus = this.hackingSystem.isSiloMonitored(siloId);
+    if (monitorStatus.monitored && monitorStatus.attackerId) {
+      this.sendLaunchWarning(monitorStatus.attackerId, playerId, siloId, targetPosition);
+    }
 
     // Create missile
     const missile = this.missileSimulator.launchMissile(
@@ -1022,8 +1040,15 @@ export class GameRoom {
       targetId
     );
 
+    // Mark as decoy if applicable
+    if (isDecoy) {
+      missile.isDecoy = true;
+      silo.airDefenseAmmo -= 3; // Decoys cost 3 air defense ammo
+    } else {
+      silo.missileCount--;
+    }
+
     this.state.missiles[missile.id] = missile;
-    silo.missileCount--;
     silo.lastFireTime = now;
 
     this.pendingEvents.push({
@@ -1039,6 +1064,43 @@ export class GameRoom {
     const launchGeoPos = silo.geoPosition || pixelToGeoLocal(silo.position);
     const detectionEvents = this.checkSatelliteLaunchDetection(launchGeoPos, playerId);
     this.pendingEvents.push(...detectionEvents);
+  }
+
+  /**
+   * Send launch warning to monitoring player
+   */
+  private sendLaunchWarning(
+    attackerId: string,
+    launchingPlayerId: string,
+    siloId: string,
+    targetPosition: Vector2
+  ): void {
+    const connection = this.getPlayerConnection(attackerId);
+    if (!connection) return;
+
+    const launchingPlayer = this.state.players[launchingPlayerId];
+    const silo = this.state.buildings[siloId] as Silo;
+    if (!silo || !launchingPlayer) return;
+
+    // Calculate approximate direction to target
+    const siloGeo = silo.geoPosition || pixelToGeoLocal(silo.position);
+    const targetGeo = pixelToGeoLocal(targetPosition);
+
+    // Calculate heading (0 = north, 90 = east)
+    const dLng = targetGeo.lng - siloGeo.lng;
+    const dLat = targetGeo.lat - siloGeo.lat;
+    const heading = (Math.atan2(dLng, dLat) * 180 / Math.PI + 360) % 360;
+
+    this.connectionManager.send(connection, {
+      type: 'launch_warning',
+      fromPlayerId: launchingPlayerId,
+      fromPlayerName: launchingPlayer.name,
+      siloId,
+      approximateDirection: Math.round(heading),
+      countdown: 5,
+    });
+
+    console.log(`[LAUNCH WARNING] ${attackerId} warned about launch from ${siloId} heading ${Math.round(heading)}°`);
   }
 
   handleSetSiloMode(playerId: string, siloId: string, mode: SiloMode): void {
@@ -1059,7 +1121,7 @@ export class GameRoom {
       return;
     }
 
-    // Mode switch has a cooldown
+    // Mode switch has a cooldown (scaled by game speed)
     const now = Date.now();
     if (now < silo.modeSwitchCooldown) {
       console.log(`[DEBUG] Mode change on cooldown: now=${now}, cooldown=${silo.modeSwitchCooldown}`);
@@ -1067,7 +1129,8 @@ export class GameRoom {
     }
 
     silo.mode = mode;
-    silo.modeSwitchCooldown = now + 5000; // 5 second cooldown
+    const modeCooldownMs = 5000 / (this.state.gameSpeed || 1);
+    silo.modeSwitchCooldown = now + modeCooldownMs;
     console.log(`[DEBUG] Mode changed successfully to ${mode}, pendingEvents will have ${this.pendingEvents.length + 1} events`);
 
     this.pendingEvents.push({
@@ -1101,7 +1164,8 @@ export class GameRoom {
       facility,
       inclination,
       playerId,
-      this.state.tick
+      this.state.tick,
+      this.state.gameSpeed || 1
     );
 
     if (!result) return;
@@ -1162,6 +1226,14 @@ export class GameRoom {
     }
 
     console.log(`[AIRCRAFT] ${playerId} launched ${aircraftType} from ${airfieldId}`);
+  }
+
+  handleSetGameSpeed(speed: 1 | 2 | 5): void {
+    if (speed === 1 || speed === 2 || speed === 5) {
+      this.state.gameSpeed = speed;
+      console.log(`[GAME] Speed set to ${speed}x`);
+      this.sendFullSync();
+    }
   }
 
   handleDebugCommand(command: string, value?: number, targetRegion?: string): void {
@@ -1575,8 +1647,9 @@ export class GameRoom {
     }> = [];
 
     for (const silo of silos) {
-      // Check cooldown
-      if (now - silo.lastFireTime < silo.fireCooldown) continue;
+      // Check cooldown (scaled by game speed)
+      const effectiveCooldown = silo.fireCooldown / (this.state.gameSpeed || 1);
+      if (now - silo.lastFireTime < effectiveCooldown) continue;
 
       // Find all radars that can see the missile
       const trackingRadarIds = this.findAllTrackingRadars(missile, playerId);
@@ -1654,8 +1727,9 @@ export class GameRoom {
       if (!silo || silo.type !== 'silo' || silo.ownerId !== playerId) continue;
       if (silo.destroyed || silo.mode !== 'air_defense' || silo.airDefenseAmmo <= 0) continue;
 
-      // Check cooldown
-      if (now - silo.lastFireTime < silo.fireCooldown) continue;
+      // Check cooldown (scaled by game speed)
+      const effectiveCooldown = silo.fireCooldown / (this.state.gameSpeed || 1);
+      if (now - silo.lastFireTime < effectiveCooldown) continue;
 
       // Find all radars that can see the missile
       const trackingRadarIds = this.findAllTrackingRadars(missile, playerId);
@@ -1909,6 +1983,17 @@ export class GameRoom {
     if (!connection) return;
 
     if (result.success && result.hack) {
+      const targetBuilding = getBuildings(this.state).find(b => b.id === targetId);
+
+      // Send hack_started with full info so client can initialize activeHack
+      this.connectionManager.send(connection, {
+        type: 'hack_started',
+        hackId: result.hack.id,
+        targetId: targetId,
+        targetName: targetBuilding?.id || 'Unknown',
+        hackType: hackType,
+      });
+
       // Send initial progress update
       this.connectionManager.send(connection, {
         type: 'hack_progress',
@@ -1994,5 +2079,126 @@ export class GameRoom {
    */
   getHackingSystem(): HackingSystem {
     return this.hackingSystem;
+  }
+
+  // ============ NETWORK WARFARE HANDLERS ============
+
+  /**
+   * Handle decoy missile launch
+   * Decoys cost 3 air defense ammo and do no damage
+   */
+  handleLaunchDecoy(
+    playerId: string,
+    siloId: string,
+    targetPosition: Vector2,
+    count: number = 1
+  ): void {
+    // Limit count to 3
+    const actualCount = Math.min(3, Math.max(1, count));
+
+    for (let i = 0; i < actualCount; i++) {
+      // Add slight position offset for each decoy
+      const offsetPosition = {
+        x: targetPosition.x + (Math.random() - 0.5) * 20,
+        y: targetPosition.y + (Math.random() - 0.5) * 20,
+      };
+      this.handleLaunchMissile(playerId, siloId, offsetPosition, undefined, true);
+    }
+
+    console.log(`[DECOY] ${playerId} launched ${actualCount} decoy missiles from ${siloId}`);
+  }
+
+  /**
+   * Handle setting silo target (for target_intel hack)
+   */
+  handleSetSiloTarget(
+    playerId: string,
+    siloId: string,
+    targetPosition: GeoPosition
+  ): void {
+    const silo = this.state.buildings[siloId] as Silo | undefined;
+    if (!silo || silo.type !== 'silo' || silo.ownerId !== playerId) return;
+    if (silo.destroyed) return;
+
+    silo.targetedPosition = targetPosition;
+    console.log(`[SILO TARGET] ${playerId} set silo ${siloId} target to (${targetPosition.lat.toFixed(2)}, ${targetPosition.lng.toFixed(2)})`);
+  }
+
+  /**
+   * Check if a player can see through a tapped radar
+   * Returns the radar's coverage area for fog-of-war
+   */
+  getTappedRadarCoverage(playerId: string): Array<{ radarId: string; position: GeoPosition; range: number }> {
+    const tappedRadarIds = this.hackingSystem.getRadarsTappedByPlayer(playerId);
+    const coverage: Array<{ radarId: string; position: GeoPosition; range: number }> = [];
+
+    for (const radarId of tappedRadarIds) {
+      const radar = this.state.buildings[radarId] as Radar | undefined;
+      if (!radar || radar.destroyed || !radar.geoPosition) continue;
+
+      // Check if radar is blinded - if so, tapped player also sees nothing
+      if (this.isRadarBlinded(radarId)) continue;
+
+      coverage.push({
+        radarId: radar.id,
+        position: radar.geoPosition,
+        range: (radar.range / 100) * 9, // Convert to degrees
+      });
+    }
+
+    return coverage;
+  }
+
+  /**
+   * Check if a player can see through a hijacked satellite
+   * Returns the satellite's vision area for fog-of-war
+   */
+  getHijackedSatelliteVision(playerId: string): Array<{ satelliteId: string; position: GeoPosition; range: number }> {
+    const hijackedSatIds = this.hackingSystem.getSatellitesHijackedByPlayer(playerId);
+    const vision: Array<{ satelliteId: string; position: GeoPosition; range: number }> = [];
+
+    for (const satId of hijackedSatIds) {
+      const satellite = this.state.satellites[satId];
+      if (!satellite || satellite.destroyed || !satellite.geoPosition) continue;
+
+      // Check if satellite is disabled - if so, hijacker also sees nothing
+      if (this.hackingSystem.isCompromised(`sat:${satId}`, 'disable_satellite')) continue;
+
+      vision.push({
+        satelliteId: satellite.id,
+        position: satellite.geoPosition,
+        range: 30, // Satellite vision range in degrees
+      });
+    }
+
+    return vision;
+  }
+
+  /**
+   * Get target intel for a silo (if attacker has completed target_intel hack)
+   */
+  getTargetIntel(siloId: string, attackerId: string): { targetPosition?: GeoPosition; targetCityName?: string } | null {
+    // Check if attacker has completed a target_intel hack on this silo
+    const compromise = this.hackingSystem.getCompromise(siloId, 'target_intel');
+    if (!compromise || compromise.attackerId !== attackerId) return null;
+
+    const silo = this.state.buildings[siloId] as Silo | undefined;
+    if (!silo) return null;
+
+    const targetPosition = silo.targetedPosition;
+    if (!targetPosition) return { targetPosition: undefined };
+
+    // Try to find the targeted city name
+    let targetCityName: string | undefined;
+    for (const city of Object.values(this.state.cities)) {
+      if (!city.geoPosition) continue;
+      const dist = greatCircleDistance(targetPosition, city.geoPosition);
+      if (dist < 0.05) { // Within ~5.5km
+        targetCityName = city.name;
+        break;
+      }
+    }
+
+    return { targetPosition, targetCityName };
   }
 }

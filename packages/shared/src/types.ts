@@ -138,6 +138,8 @@ export interface Silo extends BuildingBase {
   airDefenseAmmo: number;
   lastFireTime: number;
   fireCooldown: number;
+  // Network warfare: tracking the player's intended target
+  targetedPosition?: GeoPosition;
 }
 
 // Radar building
@@ -215,6 +217,11 @@ export interface Missile {
   missedTarget?: boolean;            // True if hit check failed (interceptor continues flying)
   maxFlightDuration?: number;        // Extended flight time for missed interceptors
   missDirection?: GeoPosition;       // Direction to continue flying after missing
+  // Decoy missiles (network warfare)
+  isDecoy?: boolean;                 // True if this is a decoy missile (no damage)
+  // Spoofed missiles (radar spoofing)
+  isSpoofed?: boolean;               // True if this missile only exists for the victim
+  victimPlayerId?: string;           // Player who sees this spoofed missile
 }
 
 
@@ -298,6 +305,9 @@ export function isInterceptor(m: Missile | GuidedInterceptor | null | undefined)
 // Combined missile type for game state
 export type AnyMissile = Missile | GuidedInterceptor;
 
+// Game speed multiplier type
+export type GameSpeed = 1 | 2 | 5;
+
 // Full game state
 export interface GameState {
   id: string;
@@ -307,6 +317,7 @@ export interface GameState {
   defconTimer: number;
   tick: number;
   timestamp: number;
+  gameSpeed: GameSpeed;
   players: Record<string, Player>;
   territories: Record<string, Territory>;
   cities: Record<string, City>;
@@ -488,7 +499,18 @@ export type HackType =
   | 'delay_silo'       // Silo fire cooldown increased
   | 'disable_satellite' // Satellite stops detecting launches
   | 'intercept_comms'  // Intercepted emails visible to attacker
-  | 'forge_alert';     // Send fake system alert to target
+  | 'forge_alert'      // Send fake system alert to target
+  // New Phase 1 hacks
+  | 'tap_radar'        // See what enemy radar sees
+  | 'ddos'             // Block enemy network node from initiating hacks
+  | 'compromise_node'  // Monitor/slow traffic through a network node
+  // New Phase 2 hacks
+  | 'target_intel'     // See what city a silo is targeting
+  | 'hijack_satellite' // Temporarily see through enemy satellite
+  | 'launch_warning'   // Get 5-second advance notice of enemy launches
+  // New Phase 3 hacks
+  | 'cut_cable'        // Sever undersea cable to disrupt routing
+  | 'false_flag';      // Make hacks appear to come from another player
 
 // Status of an active hack attempt
 export type HackStatus = 'connecting' | 'active' | 'completed' | 'traced' | 'disconnected';
@@ -566,6 +588,17 @@ export const HACK_DURATIONS: Record<HackType, number> = {
   disable_satellite: 120000, // 120 seconds
   intercept_comms: 0,      // Permanent until discovered
   forge_alert: 0,          // One-time effect
+  // New Phase 1 hacks
+  tap_radar: 90000,        // 90 seconds
+  ddos: 45000,             // 45 seconds
+  compromise_node: 120000, // 120 seconds
+  // New Phase 2 hacks
+  target_intel: 0,         // Instant (one-time info)
+  hijack_satellite: 60000, // 60 seconds
+  launch_warning: 300000,  // 5 minutes of monitoring
+  // New Phase 3 hacks
+  cut_cable: 180000,       // 3 minutes
+  false_flag: 120000,      // 2 minutes
 };
 
 // Detection risk levels (affects trace speed)
@@ -577,6 +610,17 @@ export const HACK_RISK_LEVELS: Record<HackType, number> = {
   disable_satellite: 1.5,  // High
   intercept_comms: 0.5,    // Low
   forge_alert: 2.0,        // Very High
+  // New Phase 1 hacks
+  tap_radar: 0.6,          // Subtle - hard to detect
+  ddos: 1.5,               // Obvious
+  compromise_node: 0.8,    // Medium
+  // New Phase 2 hacks
+  target_intel: 0.9,       // Medium-high
+  hijack_satellite: 1.2,   // High
+  launch_warning: 0.5,     // Very subtle
+  // New Phase 3 hacks
+  cut_cable: 1.8,          // Very obvious
+  false_flag: 0.8,         // Medium
 };
 
 // Time to complete each hack type (ms at base speed)
@@ -588,6 +632,17 @@ export const HACK_COMPLETION_TIME: Record<HackType, number> = {
   disable_satellite: 15000,
   intercept_comms: 5000,
   forge_alert: 20000,
+  // New Phase 1 hacks
+  tap_radar: 10000,        // 10 seconds
+  ddos: 8000,              // 8 seconds
+  compromise_node: 15000,  // 15 seconds
+  // New Phase 2 hacks
+  target_intel: 12000,     // 12 seconds
+  hijack_satellite: 18000, // 18 seconds
+  launch_warning: 10000,   // 10 seconds
+  // New Phase 3 hacks
+  cut_cable: 25000,        // 25 seconds
+  false_flag: 12000,       // 12 seconds
 };
 
 // Default game config

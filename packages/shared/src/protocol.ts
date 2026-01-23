@@ -19,6 +19,7 @@ import type {
   SystemCompromise,
   DetectedBuilding,
   IntrusionAlert,
+  GameSpeed,
 } from './types';
 
 // ============ CLIENT -> SERVER ============
@@ -35,6 +36,7 @@ export type ClientMessage =
   | LaunchSatelliteMessage
   | LaunchAircraftMessage
   | SetSiloModeMessage
+  | SetGameSpeedMessage
   | PingMessage
   | DebugCommandMessage
   | EnableAIMessage
@@ -47,7 +49,10 @@ export type ClientMessage =
   | HackStartMessage
   | HackDisconnectMessage
   | HackPurgeMessage
-  | HackTraceMessage;
+  | HackTraceMessage
+  // Network warfare messages
+  | LaunchDecoyMessage
+  | SetSiloTargetMessage;
 
 export interface CreateLobbyMessage {
   type: 'create_lobby';
@@ -110,6 +115,11 @@ export interface SetSiloModeMessage {
   type: 'set_silo_mode';
   siloId: string;
   mode: SiloMode;
+}
+
+export interface SetGameSpeedMessage {
+  type: 'set_game_speed';
+  speed: GameSpeed;
 }
 
 export interface PingMessage {
@@ -186,6 +196,23 @@ export interface HackTraceMessage {
   type: 'hack_trace';
 }
 
+// ============ NETWORK WARFARE CLIENT MESSAGES ============
+
+// Launch decoy missiles from a silo
+export interface LaunchDecoyMessage {
+  type: 'launch_decoy';
+  siloId: string;
+  targetPosition: Vector2;
+  count?: number;  // Number of decoys to launch (default 1, max 3)
+}
+
+// Set silo target (for target_intel hack)
+export interface SetSiloTargetMessage {
+  type: 'set_silo_target';
+  siloId: string;
+  targetPosition: GeoPosition;
+}
+
 // ============ SERVER -> CLIENT ============
 
 export type ServerMessage =
@@ -204,13 +231,21 @@ export type ServerMessage =
   | TerminalEmailReceivedMessage
   // Hacking messages
   | HackScanResultMessage
+  | HackStartedMessage
   | HackProgressMessage
   | HackCompleteMessage
   | HackTracedMessage
   | HackDisconnectedMessage
   | SystemCompromisedMessage
   | IntrusionAlertMessage
-  | IntrusionStatusMessage;
+  | IntrusionStatusMessage
+  // Network warfare messages
+  | TargetIntelResultMessage
+  | LaunchWarningMessage
+  | CableStatusMessage
+  | NodeCompromisedMessage
+  | TappedRadarUpdateMessage
+  | DdosStatusMessage;
 
 export interface LobbyListMessage {
   type: 'lobby_list';
@@ -338,6 +373,15 @@ export interface HackScanResultMessage {
   detectedBuildings: DetectedBuilding[];
 }
 
+// Hack has started (sent when hack begins, provides full info to set activeHack)
+export interface HackStartedMessage {
+  type: 'hack_started';
+  hackId: string;
+  targetId: string;
+  targetName: string;
+  hackType: HackType;
+}
+
 // Progress update for an active hack
 export interface HackProgressMessage {
   type: 'hack_progress';
@@ -391,6 +435,69 @@ export interface IntrusionStatusMessage {
   type: 'intrusion_status';
   activeIntrusions: IntrusionAlert[];
   compromisedBuildings: SystemCompromise[];
+}
+
+// ============ NETWORK WARFARE SERVER MESSAGES ============
+
+// Result of target_intel hack - reveals silo target
+export interface TargetIntelResultMessage {
+  type: 'target_intel_result';
+  siloId: string;
+  targetPosition?: GeoPosition;  // undefined if silo has no target set
+  targetCityName?: string;       // Name of targeted city if known
+}
+
+// Launch warning - 5 second advance notice of enemy launch
+export interface LaunchWarningMessage {
+  type: 'launch_warning';
+  fromPlayerId: string;           // Player launching the missile
+  fromPlayerName: string;         // Player name for display
+  siloId: string;                 // Silo being monitored
+  approximateDirection: number;   // Heading in degrees (0 = north)
+  countdown: number;              // Seconds until launch (5, 4, 3, 2, 1)
+}
+
+// Cable status update - when cables are cut or restored
+export interface CableStatusMessage {
+  type: 'cable_status';
+  cableId: string;
+  status: 'active' | 'cut';
+  cutByPlayerId?: string;         // Who cut it
+  expiresAt?: number;             // When it will be restored
+}
+
+// Node compromised - for compromise_node hack
+export interface NodeCompromisedMessage {
+  type: 'node_compromised';
+  nodeId: string;
+  compromisedBy: string;          // Player who compromised it
+  effects: {
+    traceSpeedMultiplier: number; // 1.5 for +50% trace speed
+    latencyMultiplier: number;    // 2.0 for 2x latency
+    trafficVisible: boolean;      // True if attacker sees traffic
+  };
+}
+
+// Tapped radar update - sends radar coverage data to attacker
+export interface TappedRadarUpdateMessage {
+  type: 'tapped_radar_update';
+  radarId: string;
+  radarPosition: GeoPosition;
+  radarRange: number;             // Range in degrees
+  detectedMissiles: Array<{
+    id: string;
+    position: GeoPosition;
+    heading: number;
+    progress: number;
+  }>;
+}
+
+// DDoS status - notify player their node is under DDoS
+export interface DdosStatusMessage {
+  type: 'ddos_status';
+  nodeId: string;
+  active: boolean;
+  expiresAt?: number;
 }
 
 // Helper to serialize messages

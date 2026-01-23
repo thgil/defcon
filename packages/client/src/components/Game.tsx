@@ -25,6 +25,7 @@ export default function Game() {
   const launchMissile = useNetworkStore((s) => s.launchMissile);
   const launchSatellite = useNetworkStore((s) => s.launchSatellite);
   const setSiloMode = useNetworkStore((s) => s.setSiloMode);
+  const setGameSpeed = useNetworkStore((s) => s.setGameSpeed);
   const sendDebugCommand = useNetworkStore((s) => s.sendDebugCommand);
   const enableAI = useNetworkStore((s) => s.enableAI);
   const disableAI = useNetworkStore((s) => s.disableAI);
@@ -54,8 +55,6 @@ export default function Game() {
   }));
   const toggleHackingNetworkVisible = useHackingStore((s) => s.toggleNetworkVisible);
   const startDemoHack = useHackingStore((s) => s.startDemoHack);
-  const updateHackProgress = useHackingStore((s) => s.updateHackProgress);
-  const getNetworkHackTracesArray = useHackingStore((s) => s.getNetworkHackTracesArray);
 
   // Background music
   useBackgroundMusic();
@@ -65,38 +64,8 @@ export default function Game() {
     initHackingNetwork();
   }, [initHackingNetwork]);
 
-  // Animate active hacks
-  useEffect(() => {
-    let lastTime = performance.now();
-    let animationFrame: number;
-
-    const animate = () => {
-      const now = performance.now();
-      const deltaTime = (now - lastTime) / 1000;
-      lastTime = now;
-
-      // Update progress for all active hacks
-      const activeHacks = getNetworkHackTracesArray();
-      for (const hack of activeHacks) {
-        if (hack.status === 'routing' || hack.status === 'active') {
-          // Calculate progress based on elapsed time and total latency
-          const elapsed = now - hack.startTime;
-          const newProgress = Math.min(1, elapsed / hack.route.totalLatency);
-          updateHackProgress(hack.id, newProgress);
-        }
-      }
-
-      animationFrame = requestAnimationFrame(animate);
-    };
-
-    animationFrame = requestAnimationFrame(animate);
-
-    return () => {
-      if (animationFrame) {
-        cancelAnimationFrame(animationFrame);
-      }
-    };
-  }, [getNetworkHackTracesArray, updateHackProgress]);
+  // NOTE: Hack progress is now driven by server messages (hack_progress) handled in networkStore.
+  // The old client-side animation loop was removed as it was overwriting server values.
 
   // Debug panel and keyboard toggles
   useEffect(() => {
@@ -317,7 +286,8 @@ export default function Game() {
         sendDebugCommand(command as any, value, targetRegion);
       },
       enableAI,
-      disableAI
+      disableAI,
+      setGameSpeed
     );
 
     // Subscribe directly to store for immediate updates (bypasses React render cycle)

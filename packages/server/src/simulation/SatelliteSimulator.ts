@@ -36,7 +36,8 @@ export class SatelliteSimulator {
     facility: SatelliteLaunchFacility,
     inclination: number,
     ownerId: string,
-    tick: number
+    tick: number,
+    gameSpeed: number = 1
   ): { satellite: Satellite; event: SatelliteLaunchEvent } | null {
     const now = Date.now();
 
@@ -46,8 +47,9 @@ export class SatelliteSimulator {
       return null;
     }
 
-    // Check cooldown
-    if (now - facility.lastLaunchTime < facility.launchCooldown) {
+    // Check cooldown (scaled by game speed)
+    const effectiveCooldown = facility.launchCooldown / gameSpeed;
+    if (now - facility.lastLaunchTime < effectiveCooldown) {
       console.log('[SATELLITE] Launch failed: on cooldown');
       return null;
     }

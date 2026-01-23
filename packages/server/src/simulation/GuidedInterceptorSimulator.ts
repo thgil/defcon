@@ -206,11 +206,11 @@ export class GuidedInterceptorSimulator {
       if (interceptor.hasGuidance && interceptor.trackingRadarIds.length > 0 && timeSinceLastUpdate >= updateInterval) {
         // Radar update received! Improve prediction based on number of tracking radars
         const radarCount = interceptor.trackingRadarIds.length;
-        // Each update reduces error significantly (15% per radar per update)
-        const errorReduction = 0.15 * radarCount;
+        // Each update reduces error by 15% per radar (multiplicative, not subtractive)
+        const errorRetention = Math.pow(0.85, radarCount);  // 0.85^radars
         interceptor.predictionError = Math.max(
           0.02,  // Minimum 2% error (never perfect)
-          interceptor.predictionError - errorReduction
+          interceptor.predictionError * errorRetention
         );
         interceptor.lastRadarUpdateTime = now;
       }
@@ -349,12 +349,12 @@ export class GuidedInterceptorSimulator {
     // Apply speed error: radar's estimate of ICBM speed
     // At 20% error with bias of +1, thinks ICBM is 20% faster than it is
     // This affects how far ahead we aim
-    const speedErrorFactor = 1 + (errorMagnitude * interceptor.speedErrorBias * 0.5);
+    const speedErrorFactor = 1 + (errorMagnitude * interceptor.speedErrorBias * 0.15);
     const perceivedIcbmFlightDuration = target.flightDuration / speedErrorFactor;
 
     // Apply progress error: radar's estimate of where ICBM currently is on its path
     // At 20% error with bias of +1, thinks ICBM is 0.07 (7%) further along than it is
-    const progressError = errorMagnitude * interceptor.progressErrorBias * 0.35;
+    const progressError = errorMagnitude * interceptor.progressErrorBias * 0.15;
     const perceivedIcbmProgress = Math.max(0, Math.min(1, target.progress + progressError));
 
     // Iteratively find intercept point using perceived (erroneous) values

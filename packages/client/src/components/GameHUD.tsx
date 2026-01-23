@@ -1,6 +1,6 @@
 import { useGameStore } from '../stores/gameStore';
 import { useNetworkStore } from '../stores/networkStore';
-import { type Silo, type Radar, type BuildingType, getBuildings, getPlayers } from '@defcon/shared';
+import { type Silo, type Radar, type BuildingType, type GameSpeed, getBuildings, getPlayers } from '@defcon/shared';
 
 const DEFCON_COLORS: Record<number, string> = {
   5: '#00ff00',
@@ -17,8 +17,11 @@ export default function GameHUD() {
   const setPlacementMode = useGameStore((s) => s.setPlacementMode);
   const selectedBuilding = useGameStore((s) => s.selectedBuilding);
   const setSiloMode = useNetworkStore((s) => s.setSiloMode);
+  const setGameSpeed = useNetworkStore((s) => s.setGameSpeed);
 
   if (!gameState || !playerId) return null;
+
+  const currentSpeed = gameState.gameSpeed || 1;
 
   const player = gameState.players[playerId];
   const defconColor = DEFCON_COLORS[gameState.defconLevel];
@@ -67,6 +70,24 @@ export default function GameHUD() {
           </div>
           <div style={{ color: '#888' }}>
             {String(minutes).padStart(2, '0')}:{String(seconds).padStart(2, '0')}
+          </div>
+          <div style={{ display: 'flex', gap: 4 }}>
+            {([1, 2, 5] as GameSpeed[]).map((speed) => (
+              <button
+                key={speed}
+                onClick={() => setGameSpeed(speed)}
+                style={{
+                  padding: '4px 8px',
+                  fontSize: 12,
+                  background: currentSpeed === speed ? 'rgba(0, 255, 136, 0.3)' : 'rgba(255, 255, 255, 0.1)',
+                  border: currentSpeed === speed ? '1px solid #00ff88' : '1px solid #444',
+                  color: currentSpeed === speed ? '#00ff88' : '#888',
+                  cursor: 'pointer',
+                }}
+              >
+                {speed}x
+              </button>
+            ))}
           </div>
         </div>
 
