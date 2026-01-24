@@ -945,6 +945,11 @@ export class GlobeRenderer {
       this.demoCameraTargets.targetLng = params.targetLng;
     }
     if (params.trackType !== undefined) {
+      // Reset rotation offset when track type changes to ensure fixed sections
+      // (like radar) return to their intended position
+      if (params.trackType !== this.demoCameraTargets.trackType) {
+        this.demoRotationOffset = 0;
+      }
       this.demoCameraTargets.trackType = params.trackType;
     }
     if (params.lerpFactor !== undefined) {
@@ -1001,13 +1006,11 @@ export class GlobeRenderer {
     if (!this.gameState) return null;
     const missiles = getMissiles(this.gameState);
 
-    // Filter for active ICBMs with valid geo data for 3D tracking
-    // Use very permissive progress range - we'll prefer mid-flight missiles via scoring
+    // Filter for active ICBMs - any missile that's flying is valid
     const activeMissiles = missiles.filter(m =>
       m.type === 'icbm' &&
       !m.detonated &&
       !m.intercepted &&
-      (m.progress ?? 0) > 0.02 && // Just needs to have launched
       (m.progress ?? 0) < 0.95 && // Not yet impacted
       m.geoLaunchPosition && // Required for 3D position calculation
       m.geoTargetPosition    // Required for 3D position calculation
@@ -1015,29 +1018,18 @@ export class GlobeRenderer {
 
     if (activeMissiles.length === 0) return null;
 
-    // Score missiles - prefer ones in good viewing position with flight time remaining
+    // If only one missile, just return it
+    if (activeMissiles.length === 1) {
+      return activeMissiles[0].id;
+    }
+
+    // Score missiles - simply prefer ones with more flight time remaining
     // Lower score = better
     const scoredMissiles = activeMissiles.map(m => {
-      const pos = m.geoCurrentPosition || m.geoLaunchPosition;
-      if (!pos) return { missile: m, score: 1000 }; // No position = bad score
-
       const progress = m.progress ?? 0;
-
-      // Prefer mid-flight missiles (not too early, not too late)
-      // Ideal progress is around 0.3-0.6
-      const progressScore = Math.abs(progress - 0.45) * 100;
-
-      // Prefer missiles with more flight time remaining
-      const timeRemaining = Math.max(0, 0.95 - progress) * 30;
-
-      // Small penalty for missiles on far side of globe (but don't exclude them)
-      let locationPenalty = 0;
-      if (pos.lng > 120 || pos.lng < -170) {
-        locationPenalty = 50; // Mild penalty, not exclusion
-      }
-
-      const score = progressScore + locationPenalty - timeRemaining;
-      return { missile: m, score };
+      // Just prefer missiles with more flight time remaining
+      // Earlier missiles get lower (better) scores
+      return { missile: m, score: progress };
     });
 
     // Sort by score (lowest = best) and return the best one
