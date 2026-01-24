@@ -46,6 +46,7 @@ import {
   createConnectionId,
   getRouteSegmentProgress,
   getIcbmAltitude,
+  calculateBearing,
 } from '@defcon/shared';
 import { HUDRenderer } from './HUDRenderer';
 
@@ -78,6 +79,16 @@ const COLORS = {
   hackingTraceGlow: 0x00ffaa,
 };
 
+// Player color mapping (for spectator/demo mode with multiple distinct players)
+const PLAYER_COLOR_MAP: Record<string, number> = {
+  green: 0x00ff88,
+  red: 0xff4444,
+  blue: 0x4488ff,
+  yellow: 0xffcc00,
+  cyan: 0x00ffff,
+  magenta: 0xff44ff,
+};
+
 const GLOBE_RADIUS = 100;
 const MISSILE_MIN_ALTITUDE = 8;  // Minimum altitude for very short flights
 const MISSILE_MAX_ALTITUDE = 50; // Maximum altitude for intercontinental flights (higher for more dramatic arcs)
@@ -93,6 +104,12 @@ const HACKING_CONNECTION_HEIGHT = 15;   // Height above globe for connection arc
 const HACKING_NODE_PULSE_SPEED = 2;     // Pulse animation speed
 const HACKING_TRACE_SEGMENTS = 64;      // Number of segments for curved paths
 const HACKING_TRACE_HEAD_LENGTH = 0.08; // Length of the trace head (0-1)
+
+// DDoS multi-trace configuration - network flooding simulation
+const DDOS_MAX_PARTICLES = 1024;        // Maximum particles (branches: 1->2->4->...->1024)
+const DDOS_TRACE_SIZE = 0.75;           // Size of trace dots
+const DDOS_TRACE_SPEED = 25;            // Constant speed in globe units per second
+const DDOS_COLOR = 0xffaa00;            // Bright orange for attack visualization
 
 // Calculate appropriate max altitude based on great-circle distance
 function calculateMissileAltitude(startGeo: GeoPosition, endGeo: GeoPosition): number {
@@ -141,6 +158,7 @@ export class GlobeRenderer {
 
   private animationFrame: number | null = null;
   private lastTime = 0;
+  private deltaTime = 0; // Current frame delta time in seconds
   private radarAngle = 0;
 
   // Object groups for different layers
@@ -209,6 +227,27 @@ export class GlobeRenderer {
   private hackingAnimationTime = 0;
   // Smoothed display progress for each hack (lerps toward server progress)
   private hackingDisplayProgress = new Map<string, { progress: number; traceProgress: number }>();
+  // DDoS multi-trace system for flood visualization
+  private ddosTraces = new Map<string, {
+    traceHeads: THREE.Mesh[];           // Array of small spheres (pool)
+    activeCount: number;                // How many particles are currently active
+    particleStates: Array<{
+      active: boolean;                  // Is this particle slot active?
+      currentNodeId: string;            // Node we're at/heading from
+      nextNodeId: string;               // Next destination
+      progress: number;                 // 0-1 along current edge
+      edgeDistance: number;             // Distance of current edge in globe units
+      speedMultiplier: number;          // Per-particle speed variation (0.5-1.5)
+      visitedNodes: Set<string>;        // Nodes this particle has visited (avoid backtracking)
+      routeIndex: number;               // Index in routeNodeIds (-1 = off-route particle)
+    }>;
+    sourceNodeId: string;
+    targetNodeId: string;
+    routeNodeIds: string[];             // The intended path to follow
+    geometry: THREE.SphereGeometry;     // Shared geometry
+    material: THREE.MeshBasicMaterial;  // Shared material template
+    lastSpawnTime: number;              // Last time a particle was spawned from source
+  }>();
 
   private territoryMeshes = new Map<string, THREE.Mesh>();
   private radarCoverageBeams = new Map<string, THREE.Group>();
@@ -246,10 +285,13 @@ export class GlobeRenderer {
     mesh: THREE.Group;
     trail: THREE.Line;
     startGeo: GeoPosition;
-    endGeo: GeoPosition;
-    maxAltitude: number;
+    startAltitude: number;       // Altitude at separation (globe units)
+    initialVelocityUp: number;   // Initial upward velocity (globe units/sec) - usually positive, then gravity takes over
+    initialVelocityForward: number; // Initial forward velocity (degrees/sec along great circle)
+    heading: number;             // Direction of forward movement (degrees)
     startTime: number;
-    duration: number;  // How long the arc takes (ms)
+    duration: number;            // How long until it hits the ground (ms)
+    trailHistory: THREE.Vector3[]; // Actual positions traveled
   }>();
 
   // Fading missiles after detonation/interception
@@ -347,6 +389,7 @@ export class GlobeRenderer {
   // Intercept prediction visualization (shown when interceptor is tracked)
   private interceptPredictionGroup: THREE.Group;
   private interceptMarker: THREE.Group | null = null;
+  private perceivedInterceptMarker: THREE.Group | null = null;
   private interceptChanceLabel: THREE.Sprite | null = null;
   private flameoutMarker: THREE.Group | null = null;
   private missileStatsLabel: THREE.Sprite | null = null;
@@ -356,12 +399,67 @@ export class GlobeRenderer {
   // Fog of war toggle (for debug mode)
   private fogOfWarDisabled: boolean = false;
 
+  // Fog of war expansion animation state
+  private radarAnimatedRanges: number[] = new Array(8).fill(0);
+  private satelliteAnimatedRanges: number[] = new Array(8).fill(0);
+  private radarTargetRanges: number[] = new Array(8).fill(0);
+  private satelliteTargetRanges: number[] = new Array(8).fill(0);
+  private lastRadarIds: Set<string> = new Set();
+  private lastSatelliteIds: Set<string> = new Set();
+  private readonly VISION_EXPAND_SPEED = 0.8; // Range units per second (~0.6s to full)
+
+  // Hero text for landing page (3D text that can be occluded by globe)
+  private heroTextGroup: THREE.Group | null = null;
+  private heroGlitchState: {
+    subtitleCanvas: HTMLCanvasElement | null;
+    subtitleCtx: CanvasRenderingContext2D | null;
+    subtitleTexture: THREE.CanvasTexture | null;
+    originalSubtitle: string;
+    lastGlitchTime: number;
+    isGlitching: boolean;
+    glitchEndTime: number;
+  } = {
+    subtitleCanvas: null,
+    subtitleCtx: null,
+    subtitleTexture: null,
+    originalSubtitle: 'GLOBAL THERMONUCLEAR WAR',
+    lastGlitchTime: 0,
+    isGlitching: false,
+    glitchEndTime: 0,
+  };
+
+  // Demo camera mode (for landing page smooth scroll-driven camera)
+  private demoCameraMode: boolean = false;
+  private demoCameraTargets = {
+    distance: 380,
+    verticalOffset: 180,
+    targetLat: 0,
+    targetLng: 0,
+    trackType: null as 'missile' | 'satellite' | 'radar' | null, // What to track (position-based, no selection)
+    lerpFactor: 0.08, // Higher = snappier response
+  };
+  // Current interpolated camera state for spherical interpolation (prevents through-globe lerping)
+  private demoCameraState = {
+    currentLat: 25,
+    currentLng: -90,
+    currentDistance: 550,
+  };
+  // Force radar visibility for demo
+  private forceRadarVisible: boolean = false;
+  // Auto-rotation for demo mode (gentle globe drift)
+  private demoAutoRotate: boolean = true;
+  private demoAutoRotateSpeed: number = 0.02; // Degrees per frame
+  private demoRotationOffset: number = 0; // Accumulated rotation offset
+
   constructor(container: HTMLElement) {
     this.container = container;
 
     // Scene setup
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(COLORS.background);
+
+    // Create star field for atmosphere
+    this.createStarField();
 
     // Camera
     const rect = container.getBoundingClientRect();
@@ -656,10 +754,606 @@ export class GlobeRenderer {
     if (this.fogOfWarMesh) {
       this.fogOfWarMesh.visible = enabled;
     }
+
+    // Reset animations when toggled on so visibility expands from sources
+    if (enabled) {
+      this.radarAnimatedRanges.fill(0);
+      this.satelliteAnimatedRanges.fill(0);
+      this.lastRadarIds.clear();
+      this.lastSatelliteIds.clear();
+    }
   }
 
   toggleDebugPanel(): void {
     this.hudRenderer.toggleDebugPanel();
+  }
+
+  // ============================================
+  // Landing page / Demo mode controls
+  // ============================================
+
+  /**
+   * Get color for a player by ownerId
+   * In spectator/demo mode (playerId is null), returns the player's actual color
+   * In game mode, returns friendly/enemy colors based on playerId
+   */
+  private getColorForOwner(ownerId: string | null): number {
+    if (!ownerId) return COLORS.neutral;
+
+    // In demo/spectator mode (no playerId), use actual player colors
+    if (this.playerId === null && this.gameState) {
+      const player = this.gameState.players[ownerId];
+      if (player?.color) {
+        return PLAYER_COLOR_MAP[player.color] || COLORS.neutral;
+      }
+    }
+
+    // In game mode, use friendly/enemy coloring
+    return ownerId === this.playerId ? COLORS.friendly : COLORS.enemy;
+  }
+
+  /**
+   * Enable/disable interactive orbit controls
+   * Used to lock the camera on the landing page
+   */
+  setInteractive(enabled: boolean): void {
+    this.controls.enabled = enabled;
+  }
+
+  /**
+   * Set camera distance from globe center
+   * Smoothly animates to the target distance
+   */
+  setCameraDistance(distance: number): void {
+    const currentPos = this.camera.position.clone();
+    const currentDist = currentPos.length();
+
+    if (Math.abs(currentDist - distance) < 1) return;
+
+    // Smoothly interpolate distance
+    const newDist = currentDist + (distance - currentDist) * 0.05;
+    currentPos.normalize().multiplyScalar(newDist);
+
+    this.camera.position.copy(currentPos);
+    this.camera.lookAt(0, 0, 0);
+  }
+
+  /**
+   * Set camera target to look at a specific geographic location
+   * Smoothly animates the camera to view that region
+   */
+  setCameraTarget(lat: number, lng: number): void {
+    // Convert lat/lng to 3D position on sphere surface
+    const phi = (90 - lat) * (Math.PI / 180);
+    const theta = (lng + 180) * (Math.PI / 180);
+
+    // Calculate target position on globe surface
+    const targetX = -GLOBE_RADIUS * Math.sin(phi) * Math.cos(theta);
+    const targetY = GLOBE_RADIUS * Math.cos(phi);
+    const targetZ = GLOBE_RADIUS * Math.sin(phi) * Math.sin(theta);
+
+    // Get current camera direction
+    const currentPos = this.camera.position.clone();
+    const currentDir = currentPos.clone().normalize();
+    const currentDist = currentPos.length();
+
+    // Target direction (looking at the target from outside)
+    const targetDir = new THREE.Vector3(targetX, targetY, targetZ).normalize();
+
+    // Smoothly interpolate camera direction
+    const newDir = currentDir.lerp(targetDir, 0.03).normalize();
+    const newPos = newDir.multiplyScalar(currentDist);
+
+    this.camera.position.copy(newPos);
+    this.camera.lookAt(0, 0, 0);
+  }
+
+  /**
+   * Set camera position with vertical offset while looking above globe center
+   * Used for landing page hero effect - camera looks above globe so globe appears at bottom
+   * @param distance - Distance from origin
+   * @param verticalOffset - Y offset (positive = look above globe, globe appears lower on screen)
+   */
+  setCameraPositionWithOffset(distance: number, verticalOffset: number): void {
+    // Position camera on Z axis
+    const targetPos = new THREE.Vector3(0, 0, distance);
+
+    // Smoothly interpolate to target position
+    this.camera.position.lerp(targetPos, 0.05);
+    // Look above the globe center - this makes the globe appear in the lower part of the view
+    this.camera.lookAt(0, verticalOffset, 0);
+  }
+
+  /**
+   * Force network visibility state (for scroll-triggered demos)
+   */
+  forceNetworkVisible(visible: boolean): void {
+    this.viewToggles.network = visible;
+    this.hackingNetworkGroup.visible = visible;
+    this.hudRenderer.setViewToggles(this.viewToggles);
+  }
+
+  /**
+   * Enable demo camera mode - disables orbit controls and uses lerped scroll-driven camera
+   */
+  setDemoCameraMode(enabled: boolean): void {
+    this.demoCameraMode = enabled;
+    if (enabled) {
+      this.controls.enabled = false;
+
+      // Set initial camera position to match hero section starting values
+      // This prevents the camera from lerping at startup
+      const startDistance = 550;
+      const startVerticalOffset = 180;
+      const startLat = 25;
+      const startLng = -90; // +Z axis (front of globe)
+
+      // Use the SAME formula as the render loop to calculate position
+      // This ensures no lerping is needed at startup
+      const phi = (90 - startLat) * (Math.PI / 180);
+      const theta = (startLng + 180) * (Math.PI / 180);
+
+      const targetX = -GLOBE_RADIUS * Math.sin(phi) * Math.cos(theta);
+      const targetY = GLOBE_RADIUS * Math.cos(phi);
+      const targetZ = GLOBE_RADIUS * Math.sin(phi) * Math.sin(theta);
+      const targetDir = new THREE.Vector3(targetX, targetY, targetZ).normalize();
+      const cameraPos = targetDir.clone().multiplyScalar(startDistance);
+
+      this.camera.position.copy(cameraPos);
+      this.camera.lookAt(0, startVerticalOffset, 0);
+
+      // Also initialize the demo camera targets to match
+      this.demoCameraTargets.distance = startDistance;
+      this.demoCameraTargets.verticalOffset = startVerticalOffset;
+      this.demoCameraTargets.targetLat = startLat;
+      this.demoCameraTargets.targetLng = startLng;
+
+      // Initialize demo camera state to match (for spherical interpolation)
+      this.demoCameraState.currentLat = startLat;
+      this.demoCameraState.currentLng = startLng;
+      this.demoCameraState.currentDistance = startDistance;
+
+      // Reset rotation offset so it doesn't affect initial position
+      this.demoRotationOffset = 0;
+    }
+  }
+
+  /**
+   * Set demo camera target parameters - camera will smoothly lerp to these
+   * Used for scroll-driven landing page cinematic camera
+   */
+  setDemoCameraTarget(params: {
+    distance?: number;
+    verticalOffset?: number;
+    targetLat?: number;
+    targetLng?: number;
+    trackType?: 'missile' | 'satellite' | 'radar' | null;
+    lerpFactor?: number;
+  }): void {
+    if (params.distance !== undefined) {
+      this.demoCameraTargets.distance = params.distance;
+    }
+    if (params.verticalOffset !== undefined) {
+      this.demoCameraTargets.verticalOffset = params.verticalOffset;
+    }
+    if (params.targetLat !== undefined) {
+      this.demoCameraTargets.targetLat = params.targetLat;
+    }
+    if (params.targetLng !== undefined) {
+      this.demoCameraTargets.targetLng = params.targetLng;
+    }
+    if (params.trackType !== undefined) {
+      this.demoCameraTargets.trackType = params.trackType;
+    }
+    if (params.lerpFactor !== undefined) {
+      this.demoCameraTargets.lerpFactor = params.lerpFactor;
+    }
+  }
+
+  /**
+   * Force radar coverage visibility for demo (independent of view toggles)
+   */
+  setForceRadarVisible(visible: boolean): void {
+    this.forceRadarVisible = visible;
+  }
+
+  /**
+   * Control demo auto-rotation
+   */
+  setDemoAutoRotate(enabled: boolean, speed?: number): void {
+    this.demoAutoRotate = enabled;
+    if (speed !== undefined) {
+      this.demoAutoRotateSpeed = speed;
+    }
+  }
+
+  /**
+   * Reset demo rotation offset (e.g., when entering a new section)
+   */
+  resetDemoRotationOffset(): void {
+    this.demoRotationOffset = 0;
+  }
+
+  /**
+   * Check if a missile is still valid for tracking
+   * Returns true if the missile exists, is still in flight, and has valid position data
+   */
+  isMissileValidForTracking(missileId: string): boolean {
+    if (!this.gameState) return false;
+    const missiles = getMissiles(this.gameState);
+    const missile = missiles.find(m => m.id === missileId);
+    if (!missile) return false;
+    // Check basic state
+    if (missile.detonated || missile.intercepted || (missile.progress ?? 0) >= 0.95) return false;
+    // Check for valid geo position data (required for 3D tracking)
+    if (!missile.geoLaunchPosition || !missile.geoTargetPosition) return false;
+    return true;
+  }
+
+  /**
+   * Get an active missile ID for demo tracking
+   * Returns an ICBM that is still in flight and in a good viewing position
+   * Prefers missiles in the North Atlantic area to avoid camera spinning around the globe
+   */
+  getActiveMissileIdForDemo(): string | null {
+    if (!this.gameState) return null;
+    const missiles = getMissiles(this.gameState);
+
+    // Filter for active ICBMs with valid geo data for 3D tracking
+    const activeMissiles = missiles.filter(m =>
+      m.type === 'icbm' &&
+      !m.detonated &&
+      !m.intercepted &&
+      m.progress > 0.1 && // Has left launch area
+      m.progress < 0.85 && // Not about to impact
+      m.geoLaunchPosition && // Required for 3D position calculation
+      m.geoTargetPosition    // Required for 3D position calculation
+    );
+
+    if (activeMissiles.length === 0) return null;
+
+    // Ideal viewing position for missile tracking (mid-Atlantic)
+    const idealLat = 50;
+    const idealLng = -50;
+
+    // Score missiles based on how close they are to the ideal viewing area
+    // Lower score = better
+    const scoredMissiles = activeMissiles.map(m => {
+      const pos = m.geoCurrentPosition;
+      if (!pos) return { missile: m, score: 1000 }; // No position = bad score
+
+      // Calculate angular distance from ideal position
+      const latDiff = Math.abs(pos.lat - idealLat);
+      const lngDiff = Math.abs(pos.lng - idealLng);
+      // Normalize longitude difference to handle wrap-around
+      const normalizedLngDiff = Math.min(lngDiff, 360 - lngDiff);
+
+      // Penalize missiles on the wrong side of the globe (lng > 90 or lng < -150)
+      // These would require camera to spin around
+      let penalty = 0;
+      if (pos.lng > 90 || pos.lng < -150) {
+        penalty = 500; // Heavy penalty for far side of globe
+      }
+
+      // Also prefer missiles with more flight time remaining
+      const timeBonus = (0.85 - (m.progress ?? 0)) * 50; // Up to 37.5 bonus for fresh missiles
+
+      const score = latDiff + normalizedLngDiff + penalty - timeBonus;
+      return { missile: m, score };
+    });
+
+    // Sort by score (lowest = best) and return the best one
+    scoredMissiles.sort((a, b) => a.score - b.score);
+    return scoredMissiles[0]?.missile.id || null;
+  }
+
+  /**
+   * Create star field background for atmospheric effect
+   */
+  private createStarField(): void {
+    const starCount = 2000;
+    const positions = new Float32Array(starCount * 3);
+    const sizes = new Float32Array(starCount);
+    const colors = new Float32Array(starCount * 3);
+
+    for (let i = 0; i < starCount; i++) {
+      // Distribute stars in a sphere around the scene
+      const radius = 1500 + Math.random() * 2000;
+      const theta = Math.random() * Math.PI * 2;
+      const phi = Math.acos(2 * Math.random() - 1);
+
+      positions[i * 3] = radius * Math.sin(phi) * Math.cos(theta);
+      positions[i * 3 + 1] = radius * Math.sin(phi) * Math.sin(theta);
+      positions[i * 3 + 2] = radius * Math.cos(phi);
+
+      // Vary star sizes
+      sizes[i] = 0.5 + Math.random() * 2;
+
+      // Subtle color variation (mostly white with hints of blue/yellow)
+      const colorVariation = Math.random();
+      if (colorVariation < 0.7) {
+        // White stars
+        colors[i * 3] = 0.8 + Math.random() * 0.2;
+        colors[i * 3 + 1] = 0.8 + Math.random() * 0.2;
+        colors[i * 3 + 2] = 0.8 + Math.random() * 0.2;
+      } else if (colorVariation < 0.85) {
+        // Slightly blue
+        colors[i * 3] = 0.6 + Math.random() * 0.2;
+        colors[i * 3 + 1] = 0.7 + Math.random() * 0.2;
+        colors[i * 3 + 2] = 0.9 + Math.random() * 0.1;
+      } else {
+        // Slightly yellow/orange
+        colors[i * 3] = 0.9 + Math.random() * 0.1;
+        colors[i * 3 + 1] = 0.8 + Math.random() * 0.15;
+        colors[i * 3 + 2] = 0.5 + Math.random() * 0.2;
+      }
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+    const material = new THREE.PointsMaterial({
+      size: 1.5,
+      sizeAttenuation: true,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.6,
+    });
+
+    const stars = new THREE.Points(geometry, material);
+    this.scene.add(stars);
+  }
+
+  /**
+   * Create 3D hero text for landing page
+   * Text is rendered to a canvas and applied to planes positioned in 3D space
+   */
+  createHeroText(): void {
+    if (this.heroTextGroup) return; // Already created
+
+    this.heroTextGroup = new THREE.Group();
+
+    // Create main title "DEFCON" - classic terminal style like the original game
+    const titleCanvas = document.createElement('canvas');
+    const titleCtx = titleCanvas.getContext('2d')!;
+    titleCanvas.width = 2048;
+    titleCanvas.height = 512;
+
+    titleCtx.clearRect(0, 0, titleCanvas.width, titleCanvas.height);
+
+    // Clean, stark typography - like the original DEFCON game
+    titleCtx.font = '900 280px "Helvetica Neue", "Arial", sans-serif';
+    titleCtx.textAlign = 'center';
+    titleCtx.textBaseline = 'middle';
+
+    // Subtle outer glow - understated
+    titleCtx.shadowColor = 'rgba(255, 255, 255, 0.15)';
+    titleCtx.shadowBlur = 60;
+    titleCtx.fillStyle = '#ffffff';
+    titleCtx.fillText('DEFCON', titleCanvas.width / 2, titleCanvas.height / 2);
+
+    // Main text - clean white with slight transparency
+    titleCtx.shadowColor = 'rgba(255, 255, 255, 0.3)';
+    titleCtx.shadowBlur = 8;
+    titleCtx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+    titleCtx.fillText('DEFCON', titleCanvas.width / 2, titleCanvas.height / 2);
+
+    const titleTexture = new THREE.CanvasTexture(titleCanvas);
+    titleTexture.needsUpdate = true;
+    const titleMaterial = new THREE.MeshBasicMaterial({
+      map: titleTexture,
+      transparent: true,
+      side: THREE.DoubleSide,
+      depthWrite: true,
+    });
+    const titleGeometry = new THREE.PlaneGeometry(200, 50);
+    const titleMesh = new THREE.Mesh(titleGeometry, titleMaterial);
+    titleMesh.position.set(0, -20, 0);
+    this.heroTextGroup.add(titleMesh);
+
+    // Create subtitle "GLOBAL THERMONUCLEAR WAR" - terminal style with glitch support
+    const subtitleCanvas = document.createElement('canvas');
+    const subtitleCtx = subtitleCanvas.getContext('2d')!;
+    subtitleCanvas.width = 2048;
+    subtitleCanvas.height = 128;
+
+    // Store for glitch updates
+    this.heroGlitchState.subtitleCanvas = subtitleCanvas;
+    this.heroGlitchState.subtitleCtx = subtitleCtx;
+    this.heroGlitchState.originalSubtitle = 'GLOBAL THERMONUCLEAR WAR';
+
+    this.drawSubtitleText(subtitleCtx, subtitleCanvas, this.heroGlitchState.originalSubtitle);
+
+    const subtitleTexture = new THREE.CanvasTexture(subtitleCanvas);
+    this.heroGlitchState.subtitleTexture = subtitleTexture;
+    const subtitleMaterial = new THREE.MeshBasicMaterial({
+      map: subtitleTexture,
+      transparent: true,
+      side: THREE.DoubleSide,
+      depthWrite: true,
+    });
+    const subtitleGeometry = new THREE.PlaneGeometry(200, 14);
+    const subtitleMesh = new THREE.Mesh(subtitleGeometry, subtitleMaterial);
+    subtitleMesh.position.set(0, -55, 0);
+    this.heroTextGroup.add(subtitleMesh);
+
+    // Create warning tagline - more ominous
+    const taglineCanvas = document.createElement('canvas');
+    const taglineCtx = taglineCanvas.getContext('2d')!;
+    taglineCanvas.width = 2048;
+    taglineCanvas.height = 128;
+
+    taglineCtx.clearRect(0, 0, taglineCanvas.width, taglineCanvas.height);
+    taglineCtx.font = '36px "Courier New", monospace';
+    taglineCtx.textAlign = 'center';
+    taglineCtx.textBaseline = 'middle';
+    taglineCtx.fillStyle = '#ff4444';
+    taglineCtx.fillText('« EVERYBODY DIES »', taglineCanvas.width / 2, taglineCanvas.height / 2);
+
+    const taglineTexture = new THREE.CanvasTexture(taglineCanvas);
+    const taglineMaterial = new THREE.MeshBasicMaterial({
+      map: taglineTexture,
+      transparent: true,
+      side: THREE.DoubleSide,
+      depthWrite: true,
+    });
+    const taglineGeometry = new THREE.PlaneGeometry(140, 10);
+    const taglineMesh = new THREE.Mesh(taglineGeometry, taglineMaterial);
+    taglineMesh.position.set(0, -78, 0);
+    this.heroTextGroup.add(taglineMesh);
+
+    // Create scroll hint - subtle
+    const hintCanvas = document.createElement('canvas');
+    const hintCtx = hintCanvas.getContext('2d')!;
+    hintCanvas.width = 512;
+    hintCanvas.height = 128;
+
+    hintCtx.clearRect(0, 0, hintCanvas.width, hintCanvas.height);
+    hintCtx.font = '28px "Courier New", monospace';
+    hintCtx.textAlign = 'center';
+    hintCtx.textBaseline = 'middle';
+    hintCtx.fillStyle = '#00aa66';
+    hintCtx.fillText('▼', hintCanvas.width / 2, 30);
+    hintCtx.font = '20px "Courier New", monospace';
+    hintCtx.fillStyle = '#446655';
+    hintCtx.fillText('SCROLL TO INITIATE', hintCanvas.width / 2, 80);
+
+    const hintTexture = new THREE.CanvasTexture(hintCanvas);
+    const hintMaterial = new THREE.MeshBasicMaterial({
+      map: hintTexture,
+      transparent: true,
+      side: THREE.DoubleSide,
+      depthWrite: true,
+    });
+    const hintGeometry = new THREE.PlaneGeometry(50, 12);
+    const hintMesh = new THREE.Mesh(hintGeometry, hintMaterial);
+    hintMesh.position.set(0, -115, 0);
+    this.heroTextGroup.add(hintMesh);
+
+    // Position the text above and in front of globe (2.5 radii up)
+    this.heroTextGroup.position.set(0, GLOBE_RADIUS * 2.5, GLOBE_RADIUS * 0.8);
+
+    this.scene.add(this.heroTextGroup);
+  }
+
+  /**
+   * Draw subtitle text (used for normal and glitched states)
+   */
+  private drawSubtitleText(ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement, text: string, glitchOffset: number = 0): void {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Terminal-style monospace font
+    ctx.font = '500 52px "Courier New", monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.letterSpacing = '8px';
+
+    const y = canvas.height / 2;
+
+    // Chromatic aberration effect during glitch
+    if (glitchOffset > 0) {
+      // Red channel offset left
+      ctx.fillStyle = 'rgba(255, 0, 0, 0.7)';
+      ctx.fillText(text, canvas.width / 2 - glitchOffset, y);
+
+      // Cyan channel offset right
+      ctx.fillStyle = 'rgba(0, 255, 255, 0.7)';
+      ctx.fillText(text, canvas.width / 2 + glitchOffset, y);
+    }
+
+    // Main text
+    ctx.fillStyle = '#aaaaaa';
+    ctx.fillText(text, canvas.width / 2, y);
+
+    // Add subtle scanlines - only on existing text pixels
+    ctx.globalCompositeOperation = 'source-atop';
+    for (let i = 0; i < canvas.height; i += 3) {
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
+      ctx.fillRect(0, i, canvas.width, 1);
+    }
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  /**
+   * Update hero text glitch effect - call from render loop
+   */
+  updateHeroGlitch(): void {
+    if (!this.heroGlitchState.subtitleCtx || !this.heroGlitchState.subtitleCanvas || !this.heroGlitchState.subtitleTexture) return;
+
+    const now = performance.now();
+    const glitchChars = '!@#$%^&*()_+-=[]{}|;:,.<>?/\\~`░▒▓█▀▄■□●○◆◇';
+
+    // Check if we should start a new glitch - more frequent for visibility
+    if (!this.heroGlitchState.isGlitching && now - this.heroGlitchState.lastGlitchTime > 1500 + Math.random() * 2000) {
+      // 60% chance to glitch
+      if (Math.random() < 0.6) {
+        this.heroGlitchState.isGlitching = true;
+        this.heroGlitchState.glitchEndTime = now + 150 + Math.random() * 350;
+      }
+      this.heroGlitchState.lastGlitchTime = now;
+    }
+
+    // Handle active glitch
+    if (this.heroGlitchState.isGlitching) {
+      if (now > this.heroGlitchState.glitchEndTime) {
+        // End glitch - restore original
+        this.heroGlitchState.isGlitching = false;
+        this.drawSubtitleText(
+          this.heroGlitchState.subtitleCtx,
+          this.heroGlitchState.subtitleCanvas,
+          this.heroGlitchState.originalSubtitle
+        );
+      } else {
+        // Generate glitched text
+        const original = this.heroGlitchState.originalSubtitle;
+        let glitched = '';
+        const glitchIntensity = 0.25 + Math.random() * 0.3; // More intense glitch
+
+        for (let i = 0; i < original.length; i++) {
+          if (original[i] === ' ') {
+            glitched += ' ';
+          } else if (Math.random() < glitchIntensity) {
+            glitched += glitchChars[Math.floor(Math.random() * glitchChars.length)];
+          } else {
+            glitched += original[i];
+          }
+        }
+
+        const chromaOffset = Math.random() * 8;
+        this.drawSubtitleText(
+          this.heroGlitchState.subtitleCtx,
+          this.heroGlitchState.subtitleCanvas,
+          glitched,
+          chromaOffset
+        );
+      }
+
+      this.heroGlitchState.subtitleTexture.needsUpdate = true;
+    }
+  }
+
+  /**
+   * Show or hide the hero text
+   */
+  setHeroTextVisible(visible: boolean): void {
+    if (this.heroTextGroup) {
+      this.heroTextGroup.visible = visible;
+    }
+  }
+
+  /**
+   * Update hero text opacity based on scroll progress
+   */
+  setHeroTextOpacity(opacity: number): void {
+    if (!this.heroTextGroup) return;
+
+    this.heroTextGroup.traverse((child) => {
+      if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshBasicMaterial) {
+        child.material.opacity = opacity;
+      }
+    });
   }
 
   private clearPlacementPreview(): void {
@@ -867,10 +1561,10 @@ export class GlobeRenderer {
     const fragmentShader = `
       uniform vec3 radarPositions[8];
       uniform int radarCount;
-      uniform float radarRange;
+      uniform float radarRanges[8];
       uniform vec3 satellitePositions[8];
       uniform int satelliteCount;
-      uniform float satelliteRange;
+      uniform float satelliteRanges[8];
       varying vec3 vWorldPosition;
       varying float vEdgeFade;
 
@@ -878,21 +1572,23 @@ export class GlobeRenderer {
         float visibility = 0.0;
         vec3 normalizedPos = normalize(vWorldPosition);
 
-        // Check radar coverage
+        // Check radar coverage (per-source animated ranges)
         for (int i = 0; i < 8; i++) {
           if (i >= radarCount) break;
           vec3 radarDir = normalize(radarPositions[i]);
           float dist = acos(clamp(dot(normalizedPos, radarDir), -1.0, 1.0));
-          float coverage = 1.0 - smoothstep(radarRange * 0.7, radarRange, dist);
+          float range = radarRanges[i];
+          float coverage = 1.0 - smoothstep(range * 0.7, range, dist);
           visibility = max(visibility, coverage);
         }
 
-        // Check satellite coverage
+        // Check satellite coverage (per-source animated ranges)
         for (int i = 0; i < 8; i++) {
           if (i >= satelliteCount) break;
           vec3 satDir = normalize(satellitePositions[i]);
           float dist = acos(clamp(dot(normalizedPos, satDir), -1.0, 1.0));
-          float coverage = 1.0 - smoothstep(satelliteRange * 0.7, satelliteRange, dist);
+          float range = satelliteRanges[i];
+          float coverage = 1.0 - smoothstep(range * 0.7, range, dist);
           visibility = max(visibility, coverage);
         }
 
@@ -915,10 +1611,10 @@ export class GlobeRenderer {
       uniforms: {
         radarPositions: { value: new Array(8).fill(null).map(() => new THREE.Vector3(0, -1, 0)) },
         radarCount: { value: 0 },
-        radarRange: { value: 0.5 }, // ~30 degrees in radians
+        radarRanges: { value: new Array(8).fill(0) }, // Per-source animated ranges
         satellitePositions: { value: new Array(8).fill(null).map(() => new THREE.Vector3(0, -1, 0)) },
         satelliteCount: { value: 0 },
-        satelliteRange: { value: SATELLITE_VISION_RANGE_DEGREES * (Math.PI / 180) },
+        satelliteRanges: { value: new Array(8).fill(0) }, // Per-source animated ranges
         uCameraPos: { value: new THREE.Vector3(0, 0, 300) },
       },
       transparent: true,
@@ -934,59 +1630,161 @@ export class GlobeRenderer {
   private updateFogOfWar(): void {
     if (!this.fogOfWarMaterial || !this.gameState) return;
 
-    // Collect radar positions (ground stations)
-    const radarPositions: THREE.Vector3[] = [];
+    // Target range constants
+    const RADAR_TARGET_RANGE = 0.5; // ~30 degrees in radians
+    const SATELLITE_TARGET_RANGE = SATELLITE_VISION_RANGE_DEGREES * (Math.PI / 180);
+
+    // Collect radar positions and IDs (ground stations)
+    const radarData: { id: string; position: THREE.Vector3 }[] = [];
     for (const building of getBuildings(this.gameState)) {
       if (building.type !== 'radar' || building.destroyed) continue;
       if (building.ownerId !== this.playerId) continue;
 
       const geoPos = building.geoPosition || this.pixelToGeoFallback(building.position);
       const pos = geoToSphere(geoPos, GLOBE_RADIUS);
-      radarPositions.push(new THREE.Vector3(pos.x, pos.y, pos.z));
+      radarData.push({
+        id: building.id,
+        position: new THREE.Vector3(pos.x, pos.y, pos.z),
+      });
 
-      if (radarPositions.length >= 8) break;
+      if (radarData.length >= 8) break;
     }
 
     // Add AWACS aircraft radar coverage
-    if (radarPositions.length < 8) {
+    if (radarData.length < 8) {
       for (const aircraft of getAircraft(this.gameState)) {
         if (aircraft.ownerId !== this.playerId) continue;
         if (aircraft.type !== 'radar' || aircraft.status !== 'flying') continue;
 
         const pos = geoToSphere(aircraft.geoPosition, GLOBE_RADIUS);
-        radarPositions.push(new THREE.Vector3(pos.x, pos.y, pos.z));
+        radarData.push({
+          id: aircraft.id,
+          position: new THREE.Vector3(pos.x, pos.y, pos.z),
+        });
 
-        if (radarPositions.length >= 8) break;
+        if (radarData.length >= 8) break;
       }
     }
 
-    // Store actual count before padding
-    const actualRadarCount = radarPositions.length;
+    // Detect new radars and set target ranges
+    const currentRadarIds = new Set(radarData.map(r => r.id));
+    for (let i = 0; i < 8; i++) {
+      if (i < radarData.length) {
+        this.radarTargetRanges[i] = RADAR_TARGET_RANGE;
+        // If this is a new radar, start animated range from 0
+        if (!this.lastRadarIds.has(radarData[i].id)) {
+          this.radarAnimatedRanges[i] = 0;
+        }
+      } else {
+        // No radar at this slot
+        this.radarTargetRanges[i] = 0;
+        this.radarAnimatedRanges[i] = 0;
+      }
+    }
+    this.lastRadarIds = currentRadarIds;
 
-    // Pad radar positions (use far-away position that won't affect visibility)
+    // Animate radar ranges toward targets
+    for (let i = 0; i < 8; i++) {
+      const diff = this.radarTargetRanges[i] - this.radarAnimatedRanges[i];
+      if (Math.abs(diff) > 0.001) {
+        const step = this.VISION_EXPAND_SPEED * this.deltaTime;
+        if (diff > 0) {
+          this.radarAnimatedRanges[i] = Math.min(
+            this.radarTargetRanges[i],
+            this.radarAnimatedRanges[i] + step
+          );
+        } else {
+          this.radarAnimatedRanges[i] = Math.max(
+            this.radarTargetRanges[i],
+            this.radarAnimatedRanges[i] - step
+          );
+        }
+      } else {
+        this.radarAnimatedRanges[i] = this.radarTargetRanges[i];
+      }
+    }
+
+    // Build radar positions array (padded)
+    const radarPositions: THREE.Vector3[] = radarData.map(r => r.position);
     while (radarPositions.length < 8) {
       radarPositions.push(new THREE.Vector3(0, -1, 0)); // South pole, unused
     }
 
-    // Collect connected satellite positions
-    const satellitePositions: THREE.Vector3[] = [];
-    const connectedSatGeoPositions = this.getPlayerSatelliteVisionPositions();
-    for (const geoPos of connectedSatGeoPositions) {
-      const pos = geoToSphere(geoPos, GLOBE_RADIUS);
-      satellitePositions.push(new THREE.Vector3(pos.x, pos.y, pos.z));
+    // Collect connected satellite positions with actual satellite IDs
+    const satelliteData: { id: string; position: THREE.Vector3 }[] = [];
+    const now = Date.now();
+    for (const satellite of getSatellites(this.gameState)) {
+      if (satellite.ownerId !== this.playerId || satellite.destroyed) continue;
+      if (!this.satelliteHasGroundLink(satellite)) continue;
 
-      if (satellitePositions.length >= 8) break;
+      const orbitalParams: SatelliteOrbitalParams = {
+        launchTime: satellite.launchTime,
+        orbitalPeriod: satellite.orbitalPeriod,
+        orbitalAltitude: satellite.orbitalAltitude,
+        inclination: satellite.inclination,
+        startingLongitude: satellite.startingLongitude,
+      };
+      const geoPos = getSatelliteGroundPosition(orbitalParams, now, GLOBE_RADIUS);
+      const pos = geoToSphere(geoPos, GLOBE_RADIUS);
+      satelliteData.push({
+        id: satellite.id, // Use actual satellite ID for stable tracking
+        position: new THREE.Vector3(pos.x, pos.y, pos.z),
+      });
+
+      if (satelliteData.length >= 8) break;
     }
 
-    // Pad satellite positions (use far-away position that won't affect visibility)
+    // Detect new satellites and set target ranges
+    const currentSatelliteIds = new Set(satelliteData.map(s => s.id));
+    for (let i = 0; i < 8; i++) {
+      if (i < satelliteData.length) {
+        this.satelliteTargetRanges[i] = SATELLITE_TARGET_RANGE;
+        // If this is a new satellite, start animated range from 0
+        if (!this.lastSatelliteIds.has(satelliteData[i].id)) {
+          this.satelliteAnimatedRanges[i] = 0;
+        }
+      } else {
+        // No satellite at this slot
+        this.satelliteTargetRanges[i] = 0;
+        this.satelliteAnimatedRanges[i] = 0;
+      }
+    }
+    this.lastSatelliteIds = currentSatelliteIds;
+
+    // Animate satellite ranges toward targets
+    for (let i = 0; i < 8; i++) {
+      const diff = this.satelliteTargetRanges[i] - this.satelliteAnimatedRanges[i];
+      if (Math.abs(diff) > 0.001) {
+        const step = this.VISION_EXPAND_SPEED * this.deltaTime;
+        if (diff > 0) {
+          this.satelliteAnimatedRanges[i] = Math.min(
+            this.satelliteTargetRanges[i],
+            this.satelliteAnimatedRanges[i] + step
+          );
+        } else {
+          this.satelliteAnimatedRanges[i] = Math.max(
+            this.satelliteTargetRanges[i],
+            this.satelliteAnimatedRanges[i] - step
+          );
+        }
+      } else {
+        this.satelliteAnimatedRanges[i] = this.satelliteTargetRanges[i];
+      }
+    }
+
+    // Build satellite positions array (padded)
+    const satellitePositions: THREE.Vector3[] = satelliteData.map(s => s.position);
     while (satellitePositions.length < 8) {
       satellitePositions.push(new THREE.Vector3(0, -1, 0)); // South pole, unused
     }
 
+    // Update shader uniforms
     this.fogOfWarMaterial.uniforms.radarPositions.value = radarPositions;
-    this.fogOfWarMaterial.uniforms.radarCount.value = actualRadarCount;
+    this.fogOfWarMaterial.uniforms.radarCount.value = radarData.length;
+    this.fogOfWarMaterial.uniforms.radarRanges.value = [...this.radarAnimatedRanges];
     this.fogOfWarMaterial.uniforms.satellitePositions.value = satellitePositions;
-    this.fogOfWarMaterial.uniforms.satelliteCount.value = connectedSatGeoPositions.length;
+    this.fogOfWarMaterial.uniforms.satelliteCount.value = satelliteData.length;
+    this.fogOfWarMaterial.uniforms.satelliteRanges.value = [...this.satelliteAnimatedRanges];
     this.fogOfWarMaterial.uniforms.uCameraPos.value.copy(this.camera.position);
   }
 
@@ -1795,7 +2593,7 @@ export class GlobeRenderer {
       if (!territory.ownerId || !territory.geoBoundary) continue;
 
       const isMine = territory.ownerId === this.playerId;
-      const color = isMine ? COLORS.friendly : COLORS.enemy;
+      const color = this.getColorForOwner(territory.ownerId);
 
       // Create a highlight for owned territories
       const points: THREE.Vector3[] = [];
@@ -1858,10 +2656,8 @@ export class GlobeRenderer {
         let color: number;
         if (destroyed) {
           color = COLORS.cityDestroyed;
-        } else if (isMine) {
-          color = COLORS.friendly;
-        } else if (isEnemy) {
-          color = COLORS.enemy;
+        } else if (hasOwner) {
+          color = this.getColorForOwner(territory.ownerId);
         } else {
           color = COLORS.neutral; // Gray for unowned cities
         }
@@ -2089,7 +2885,7 @@ export class GlobeRenderer {
 
   private createBuildingMarker(building: Building, isMine: boolean): THREE.Group {
     const group = new THREE.Group();
-    const color = isMine ? COLORS.friendly : COLORS.enemy;
+    const color = this.getColorForOwner(building.ownerId);
 
     switch (building.type) {
       case 'silo': {
@@ -2428,13 +3224,17 @@ export class GlobeRenderer {
       existingIds.delete(missile.id);
 
       // Color based on ownership: player = blue, enemy = red, interceptors = cyan
+      // In demo/spectator mode, use distinct player colors
       // Apply uncertainty tint for unclear contacts
       const isInterceptor = isInterceptorType(missile);
       let color: number;
       if (isInterceptor) {
-        color = COLORS.interceptor; // Cyan
+        color = COLORS.interceptor; // Cyan for all interceptors
+      } else if (this.playerId === null) {
+        // Demo/spectator mode: use player's actual color
+        color = this.getColorForOwner(missile.ownerId);
       } else if (isMine) {
-        color = 0x2266ff; // Blue for player
+        color = 0x2266ff; // Blue for player's own missiles
       } else {
         // Enemy missile color varies by classification
         if (classification === 'confirmed') {
@@ -2804,16 +3604,37 @@ export class GlobeRenderer {
             const booster = this.createDroppedBooster(boosterColor);
             booster.position.copy(becoVec);
 
-            // Calculate booster arc trajectory
-            // Start: BECO position (in geo coordinates)
-            const becoAltitudeValue = getIcbmAltitude(0.20, maxAltitude, 0.6);
-            const becoGeo = sphereToGeo(becoVec, GLOBE_RADIUS + becoAltitudeValue);
-            // End: A point ~30% along the original path (booster falls forward a bit)
-            const boosterEndGeo = geoInterpolate(startGeo, targetGeo, 0.30);
-            // Max altitude: current altitude at BECO (lower arc than main missile)
-            const becoAltitude = getIcbmAltitude(0.20, maxAltitude, 0.6);  // Ballistic altitude at 20%
-            const boosterMaxAlt = becoAltitude * 0.6;  // Slightly lower arc
-            const boosterDuration = 6000;  // 6 seconds to fall
+            // Calculate booster falling trajectory
+            // Start: BECO position (in geo coordinates) at current altitude
+            const becoAltitude = getIcbmAltitude(0.20, maxAltitude, 0.6);
+            const becoGeo = sphereToGeo(becoVec, GLOBE_RADIUS + becoAltitude);
+
+            // Calculate ICBM's velocity at BECO to give booster initial momentum
+            // At 20% progress during boost, ICBM is still climbing
+            // Vertical velocity: derivative of altitude curve at progress=0.20
+            // The altitude curve peaks at 60% progress, so at 20% we're still ascending
+            const altitudeDerivative = this.getAltitudeDerivative(0.20, maxAltitude, 0.6);
+            // Convert to globe units per second based on flight duration
+            const flightDurationSec = (objects.flightDuration || 60000) / 1000;
+            const initialVelocityUp = altitudeDerivative / flightDurationSec * 0.3; // Reduced - booster is heavy
+
+            // Forward velocity: ICBM's ground speed at BECO
+            // Great circle distance / flight duration gives average speed in degrees/sec
+            const totalDistance = greatCircleDistance(startGeo, targetGeo) * (180 / Math.PI);
+            const avgSpeed = totalDistance / flightDurationSec;
+            const initialVelocityForward = avgSpeed * 0.4; // Booster maintains some forward momentum
+
+            // Heading: direction from start to target
+            const heading = calculateBearing(startGeo, targetGeo);
+
+            // Duration: time to fall from becoAltitude to surface
+            // Using simple physics: h = v0*t - 0.5*g*t^2, solve for t when h=0
+            // With air resistance, it falls slower, so we use a longer duration
+            const gravity = 2.0; // globe units per second^2 (tuned for visual effect)
+            // Quadratic formula: t = (v0 + sqrt(v0^2 + 2*g*h)) / g
+            const discriminant = initialVelocityUp * initialVelocityUp + 2 * gravity * becoAltitude;
+            const fallTime = (initialVelocityUp + Math.sqrt(Math.max(0, discriminant))) / gravity;
+            const boosterDuration = Math.max(8000, fallTime * 1000 * 1.5); // At least 8 seconds, with drag factor
 
             // Create trail for booster (fainter than missile trail)
             const trailGeom = new THREE.BufferGeometry();
@@ -2829,10 +3650,13 @@ export class GlobeRenderer {
               mesh: booster,
               trail,
               startGeo: becoGeo,
-              endGeo: boosterEndGeo,
-              maxAltitude: boosterMaxAlt,
+              startAltitude: becoAltitude,
+              initialVelocityUp,
+              initialVelocityForward,
+              heading,
               startTime: Date.now(),
               duration: boosterDuration,
+              trailHistory: [becoVec.clone()],
             });
             this.missileGroup.add(booster);
 
@@ -2919,12 +3743,29 @@ export class GlobeRenderer {
       }
     }
 
-    // Update dropped boosters - they follow their own arc trajectory
+    // Update dropped boosters - they fall with physics-based trajectory
     for (const [missileId, booster] of this.droppedBoosters) {
-      const elapsed = Date.now() - booster.startTime;
-      const progress = Math.min(1.0, elapsed / booster.duration);
+      const elapsedMs = Date.now() - booster.startTime;
+      const elapsedSec = elapsedMs / 1000;
 
-      if (progress >= 1.0) {
+      // Physics constants (tuned for visual effect)
+      const gravity = 1.5;        // Globe units per second^2
+      const dragCoefficient = 0.3; // Air resistance factor
+
+      // Calculate current vertical velocity with drag
+      // v(t) = v0 * e^(-drag*t) - (g/drag) * (1 - e^(-drag*t))
+      const expDecay = Math.exp(-dragCoefficient * elapsedSec);
+      const currentVerticalVelocity = booster.initialVelocityUp * expDecay -
+        (gravity / dragCoefficient) * (1 - expDecay);
+
+      // Calculate altitude using integral of velocity
+      // h(t) = h0 + (v0/drag) * (1 - e^(-drag*t)) - (g/drag) * (t - (1-e^(-drag*t))/drag)
+      const altitude = booster.startAltitude +
+        (booster.initialVelocityUp / dragCoefficient) * (1 - expDecay) -
+        (gravity / dragCoefficient) * (elapsedSec - (1 - expDecay) / dragCoefficient);
+
+      // Check if booster has hit the ground
+      if (altitude <= 0) {
         // Booster has landed - remove it
         this.missileGroup.remove(booster.mesh);
         this.missileGroup.remove(booster.trail);
@@ -2935,74 +3776,78 @@ export class GlobeRenderer {
         continue;
       }
 
-      // Calculate position along arc (same system as missiles)
-      const pos3d = getMissilePosition3D(
-        booster.startGeo,
-        booster.endGeo,
-        progress,
-        booster.maxAltitude,
-        GLOBE_RADIUS,
-        booster.duration
-      );
+      // Calculate horizontal position with decaying forward velocity
+      // Forward velocity decays due to drag: vf(t) = vf0 * e^(-drag*t)
+      // Distance traveled: integral = (vf0/drag) * (1 - e^(-drag*t))
+      const forwardDistance = (booster.initialVelocityForward / dragCoefficient) * (1 - expDecay);
+
+      // Move forward along the heading direction from start position
+      const headingRad = booster.heading * (Math.PI / 180);
+      const currentGeo = {
+        lat: booster.startGeo.lat + forwardDistance * Math.cos(headingRad),
+        lng: booster.startGeo.lng + forwardDistance * Math.sin(headingRad) / Math.cos(booster.startGeo.lat * Math.PI / 180),
+      };
+
+      // Convert to 3D position
+      const pos3d = geoToSphere(currentGeo, GLOBE_RADIUS + altitude);
       booster.mesh.position.set(pos3d.x, pos3d.y, pos3d.z);
 
-      // Orient booster along trajectory (calculate tangent)
-      if (progress < 0.99) {
-        const nextPos = getMissilePosition3D(
-          booster.startGeo,
-          booster.endGeo,
-          Math.min(1.0, progress + 0.02),
-          booster.maxAltitude,
-          GLOBE_RADIUS,
-          booster.duration
-        );
-        const direction = new THREE.Vector3(
-          nextPos.x - pos3d.x,
-          nextPos.y - pos3d.y,
-          nextPos.z - pos3d.z
-        ).normalize();
-        // Point the booster along its trajectory
-        const targetPos = new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z).add(direction);
-        booster.mesh.lookAt(targetPos);
+      // Orient booster along its falling trajectory (nose pointing in direction of motion)
+      // Calculate velocity direction in 3D
+      const currentForwardVelocity = booster.initialVelocityForward * expDecay;
+
+      // Get the surface normal at current position (points "up" from globe center)
+      const surfaceNormal = new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z).normalize();
+
+      // Calculate forward direction on the surface (tangent to globe in heading direction)
+      const north = new THREE.Vector3(0, 1, 0);
+      const east = new THREE.Vector3().crossVectors(north, surfaceNormal).normalize();
+      const northTangent = new THREE.Vector3().crossVectors(surfaceNormal, east).normalize();
+
+      // Forward direction based on heading
+      const forwardDir = new THREE.Vector3()
+        .addScaledVector(northTangent, Math.cos(headingRad))
+        .addScaledVector(east, Math.sin(headingRad))
+        .normalize();
+
+      // Combine forward and downward velocity to get overall direction
+      // Vertical component (negative = falling)
+      const velocityDir = new THREE.Vector3()
+        .addScaledVector(forwardDir, currentForwardVelocity)
+        .addScaledVector(surfaceNormal, currentVerticalVelocity)
+        .normalize();
+
+      // Point the booster along its velocity vector
+      const lookTarget = new THREE.Vector3().copy(booster.mesh.position).add(velocityDir);
+      booster.mesh.lookAt(lookTarget);
+
+      // Add current position to trail history (limit to 50 points)
+      const currentPos = new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z);
+      booster.trailHistory.push(currentPos);
+      if (booster.trailHistory.length > 50) {
+        booster.trailHistory.shift();
       }
 
-      // Tumble rotation for visual effect (added on top of orientation)
-      booster.mesh.rotateZ(0.03);
-
-      // Update trail (shows path traveled)
-      const trailPoints: THREE.Vector3[] = [];
-      const trailSteps = Math.max(5, Math.floor(30 * progress));
-      for (let i = 0; i <= trailSteps; i++) {
-        const t = (i / trailSteps) * progress;
-        const trailPos = getMissilePosition3D(
-          booster.startGeo,
-          booster.endGeo,
-          t,
-          booster.maxAltitude,
-          GLOBE_RADIUS,
-          booster.duration
-        );
-        trailPoints.push(new THREE.Vector3(trailPos.x, trailPos.y, trailPos.z));
-      }
-      const positions = new Float32Array(trailPoints.length * 3);
-      for (let i = 0; i < trailPoints.length; i++) {
-        positions[i * 3] = trailPoints[i].x;
-        positions[i * 3 + 1] = trailPoints[i].y;
-        positions[i * 3 + 2] = trailPoints[i].z;
+      // Update trail geometry from history
+      const positions = new Float32Array(booster.trailHistory.length * 3);
+      for (let i = 0; i < booster.trailHistory.length; i++) {
+        positions[i * 3] = booster.trailHistory[i].x;
+        positions[i * 3 + 1] = booster.trailHistory[i].y;
+        positions[i * 3 + 2] = booster.trailHistory[i].z;
       }
       booster.trail.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
 
-      // Fade out in the last 30% of flight
-      const fadeStart = 0.7;
-      if (progress > fadeStart) {
-        const fadeProgress = (progress - fadeStart) / (1.0 - fadeStart);
+      // Fade out when close to the ground (last 30% of altitude)
+      const fadeStartAltitude = booster.startAltitude * 0.3;
+      if (altitude < fadeStartAltitude) {
+        const fadeProgress = 1 - (altitude / fadeStartAltitude);
         const opacity = 1 - fadeProgress;
         booster.mesh.traverse((child) => {
           if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshBasicMaterial) {
-            child.material.opacity = opacity;
+            child.material.opacity = Math.max(0.1, opacity);
           }
         });
-        (booster.trail.material as THREE.LineBasicMaterial).opacity = 0.2 * opacity;
+        (booster.trail.material as THREE.LineBasicMaterial).opacity = 0.2 * Math.max(0.1, opacity);
       }
     }
 
@@ -3210,6 +4055,19 @@ export class GlobeRenderer {
     group.add(glow);
 
     return group;
+  }
+
+  /**
+   * Calculate the derivative of the ICBM altitude curve at a given progress.
+   * Used to determine the vertical velocity component for dropped boosters.
+   */
+  private getAltitudeDerivative(progress: number, maxAltitude: number, apexProgress: number): number {
+    // The altitude curve is: sin(pi * (progress / apexProgress)^0.7)^1.3 * maxAltitude for progress < apex
+    // We'll use numerical differentiation for simplicity
+    const epsilon = 0.001;
+    const alt1 = getIcbmAltitude(progress - epsilon, maxAltitude, apexProgress);
+    const alt2 = getIcbmAltitude(progress + epsilon, maxAltitude, apexProgress);
+    return (alt2 - alt1) / (2 * epsilon); // Derivative in altitude units per progress unit
   }
 
   /**
@@ -4241,41 +5099,44 @@ export class GlobeRenderer {
       const icbm = targetIcbm as Missile;
 
       if (icbm.geoLaunchPosition && icbm.geoTargetPosition && icbm.geoCurrentPosition && icbm.flightDuration) {
-        // Iteratively estimate intercept point
-        const interceptorSpeed = guidedMissile.speed || 0.8; // degrees per second
-        let timeToIntercept = 10; // initial guess in seconds
+        const icbmApex = icbm.apexHeight || 30;
+        // Read tracking error from the ICBM itself (shared across all interceptors targeting it)
+        const errorMagnitude = icbm.radarTrackingError ?? 0.1;
 
-        // Refine estimate
-        for (let i = 0; i < 3; i++) {
-          // Where will ICBM be in timeToIntercept seconds?
-          const progressDelta = (timeToIntercept * 1000) / icbm.flightDuration;
-          const futureProgress = Math.min(0.98, icbm.progress + progressDelta);
-          const futureGeo = geoInterpolate(icbm.geoLaunchPosition, icbm.geoTargetPosition, futureProgress);
+        // Use server-provided aim point if available (this is the actual aim point with errors)
+        if (guidedMissile.predictedInterceptGeo && guidedMissile.predictedInterceptAltitude !== undefined) {
+          // Create marker for where interceptor is ACTUALLY aiming (from server)
+          const aimMarkerPos = geoToSphere(guidedMissile.predictedInterceptGeo, GLOBE_RADIUS + guidedMissile.predictedInterceptAltitude);
+          const aimMarkerPosition = new THREE.Vector3(aimMarkerPos.x, aimMarkerPos.y, aimMarkerPos.z);
+          this.createPerceivedInterceptMarker(aimMarkerPosition, errorMagnitude);
 
-          // How long to reach that point?
-          const distToFuture = greatCircleDistance(guidedMissile.geoPosition, futureGeo);
-          const distDegrees = distToFuture * (180 / Math.PI);
-          timeToIntercept = distDegrees / interceptorSpeed;
+          // Get interceptor's current 3D position and create projected path to aim point
+          if (guidedMissile.geoPosition) {
+            const altitude = guidedMissile.altitude || 0;
+            const interceptorPos3D = geoToSphere(guidedMissile.geoPosition, GLOBE_RADIUS + altitude);
+            const interceptorPosition = new THREE.Vector3(interceptorPos3D.x, interceptorPos3D.y, interceptorPos3D.z);
+            this.createInterceptorProjectedPath(interceptorPosition, aimMarkerPosition);
+          }
         }
 
-        // Final predicted position
-        const progressDelta = (timeToIntercept * 1000) / icbm.flightDuration;
-        const interceptProgress = Math.min(0.95, icbm.progress + progressDelta);
-        const interceptGeo = geoInterpolate(icbm.geoLaunchPosition, icbm.geoTargetPosition, interceptProgress);
-        const icbmApex = icbm.apexHeight || 30;
-        const icbmAltitude = getIcbmAltitude(interceptProgress, icbmApex, 0.6);
+        // Calculate where ICBM will actually be at the same time (for comparison)
+        // Use the interceptor's estimated time to reach its aim point
+        if (guidedMissile.geoPosition && guidedMissile.predictedInterceptGeo) {
+          const interceptorSpeed = guidedMissile.speed || 0.8;
+          const distToAim = greatCircleDistance(guidedMissile.geoPosition, guidedMissile.predictedInterceptGeo);
+          const distDegrees = distToAim * (180 / Math.PI);
+          const timeToIntercept = distDegrees / interceptorSpeed;
 
-        const markerPos = geoToSphere(interceptGeo, GLOBE_RADIUS + icbmAltitude);
-        const markerPosition = new THREE.Vector3(markerPos.x, markerPos.y, markerPos.z);
-        const chance = guidedMissile.hasGuidance ? 0.75 : 0.15;
-        this.createInterceptMarker(markerPosition, chance);
+          // Where will ICBM actually be at that time?
+          const actualProgressDelta = (timeToIntercept * 1000) / icbm.flightDuration;
+          const actualInterceptProgress = Math.min(0.95, icbm.progress + actualProgressDelta);
+          const actualInterceptGeo = geoInterpolate(icbm.geoLaunchPosition, icbm.geoTargetPosition, actualInterceptProgress);
+          const actualAltitude = getIcbmAltitude(actualInterceptProgress, icbmApex, 0.6);
 
-        // Get interceptor's current 3D position and create projected path
-        if (guidedMissile.geoPosition) {
-          const altitude = guidedMissile.altitude || 0;
-          const interceptorPos3D = geoToSphere(guidedMissile.geoPosition, GLOBE_RADIUS + altitude);
-          const interceptorPosition = new THREE.Vector3(interceptorPos3D.x, interceptorPos3D.y, interceptorPos3D.z);
-          this.createInterceptorProjectedPath(interceptorPosition, markerPosition);
+          const actualMarkerPos = geoToSphere(actualInterceptGeo, GLOBE_RADIUS + actualAltitude);
+          const actualMarkerPosition = new THREE.Vector3(actualMarkerPos.x, actualMarkerPos.y, actualMarkerPos.z);
+          const chance = guidedMissile.hasGuidance ? 0.75 : 0.15;
+          this.createInterceptMarker(actualMarkerPosition, chance);
         }
 
         // Render target ICBM's projected path if this interceptor is selected
@@ -4450,6 +5311,55 @@ export class GlobeRenderer {
     markerGroup.add(diamond);
 
     this.interceptMarker = markerGroup;
+    this.interceptPredictionGroup.add(markerGroup);
+  }
+
+  /**
+   * Create a marker showing where the interceptor THINKS the ICBM will be (with tracking errors).
+   * Yellow/orange color to distinguish from the actual intercept point.
+   */
+  private createPerceivedInterceptMarker(position: THREE.Vector3, errorMagnitude: number): void {
+    const markerGroup = new THREE.Group();
+    markerGroup.position.copy(position);
+
+    // Smaller diamond shape for perceived position
+    const geometry = new THREE.OctahedronGeometry(0.4, 0);
+    // Color based on error magnitude: more error = more orange/red
+    const errorLevel = Math.min(1, errorMagnitude * 10); // 0.1 error = full intensity
+    const r = 1.0;
+    const g = 1.0 - errorLevel * 0.5; // Yellow to orange
+    const b = 0;
+    const material = new THREE.MeshBasicMaterial({
+      color: new THREE.Color(r, g, b),
+      transparent: true,
+      opacity: 0.8,
+      wireframe: true,
+    });
+    const diamond = new THREE.Mesh(geometry, material);
+    markerGroup.add(diamond);
+
+    // Add a small label "AIM"
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d')!;
+    canvas.width = 32;
+    canvas.height = 12;
+    ctx.fillStyle = '#ffaa00';
+    ctx.font = 'bold 10px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('AIM', canvas.width / 2, 10);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    const spriteMaterial = new THREE.SpriteMaterial({
+      map: texture,
+      transparent: true,
+      depthTest: false,
+    });
+    const sprite = new THREE.Sprite(spriteMaterial);
+    sprite.position.set(0, 0.8, 0);
+    sprite.scale.set(1.5, 0.5, 1);
+    markerGroup.add(sprite);
+
+    this.perceivedInterceptMarker = markerGroup;
     this.interceptPredictionGroup.add(markerGroup);
   }
 
@@ -4826,6 +5736,23 @@ export class GlobeRenderer {
         }
       });
       this.interceptMarker = null;
+    }
+
+    if (this.perceivedInterceptMarker) {
+      this.interceptPredictionGroup.remove(this.perceivedInterceptMarker);
+      this.perceivedInterceptMarker.traverse((child) => {
+        if (child instanceof THREE.Mesh) {
+          child.geometry.dispose();
+          if (child.material instanceof THREE.Material) {
+            child.material.dispose();
+          }
+        }
+        if (child instanceof THREE.Sprite && child.material instanceof THREE.SpriteMaterial) {
+          child.material.map?.dispose();
+          child.material.dispose();
+        }
+      });
+      this.perceivedInterceptMarker = null;
     }
 
     if (this.interceptChanceLabel) {
@@ -5325,7 +6252,7 @@ export class GlobeRenderer {
       if (satellite.destroyed) continue;
 
       const isMine = satellite.ownerId === this.playerId;
-      const color = isMine ? COLORS.friendly : COLORS.enemy;
+      const color = this.getColorForOwner(satellite.ownerId);
 
       // Create orbital params
       const orbitalParams: SatelliteOrbitalParams = {
@@ -5570,13 +6497,19 @@ export class GlobeRenderer {
     // Check if a radar is selected
     const selectedRadar = this.selectedBuilding?.type === 'radar' ? this.selectedBuilding as Radar : null;
 
-    // Only show communication links when a satellite or radar is selected
-    if (!this.selectedSatelliteId && !selectedRadar) return;
-
     const now = Date.now();
     const satellites = getSatellites(this.gameState).filter(
       s => s.ownerId === this.playerId && !s.destroyed
     );
+
+    // Auto-select when there's only one satellite
+    if (!this.selectedSatelliteId && !selectedRadar) {
+      if (satellites.length === 1) {
+        this.selectedSatelliteId = satellites[0].id;
+      } else {
+        return; // No auto-selection possible, and nothing manually selected
+      }
+    }
 
     // Get player's radar positions
     const radarPositions = this.getPlayerRadarPositions();
@@ -5795,7 +6728,7 @@ export class GlobeRenderer {
 
       if (!objects) {
         // Create new aircraft mesh
-        const mesh = this.createAircraftMesh(aircraft.type, isMine);
+        const mesh = this.createAircraftMesh(aircraft.type, aircraft.ownerId);
         mesh.scale.setScalar(0.8);
         mesh.userData = { type: 'aircraft', id: aircraft.id, aircraft };
         this.aircraftGroup.add(mesh);
@@ -5886,9 +6819,9 @@ export class GlobeRenderer {
   /**
    * Create an aircraft mesh based on type.
    */
-  private createAircraftMesh(type: string, isMine: boolean): THREE.Group {
+  private createAircraftMesh(type: string, ownerId: string): THREE.Group {
     const group = new THREE.Group();
-    const color = isMine ? COLORS.friendly : COLORS.enemy;
+    const color = this.getColorForOwner(ownerId);
 
     if (type === 'fighter') {
       // Small triangle for fighter
@@ -6664,12 +7597,132 @@ export class GlobeRenderer {
 
   private startRenderLoop(): void {
     const render = (time: number) => {
-      const deltaTime = (time - this.lastTime) / 1000;
+      this.deltaTime = (time - this.lastTime) / 1000;
       this.lastTime = time;
+      const deltaTime = this.deltaTime; // Local alias for existing code
 
-      // Follow tracked missile if one is selected
+      // Demo camera mode - smooth spherical interpolation for landing page
+      // Uses lat/lng/distance interpolation to always rotate around the globe (never through it)
+      if (this.demoCameraMode) {
+        const targets = this.demoCameraTargets;
+        const state = this.demoCameraState;
+
+        // Frame-rate independent lerp factor
+        const baseLerp = targets.lerpFactor;
+        const lerp = 1 - Math.pow(1 - baseLerp, deltaTime * 60);
+
+        // Determine target lat/lng based on trackType (no object selection, just position following)
+        let targetLat = targets.targetLat;
+        let targetLng = targets.targetLng;
+        let targetDistance = targets.distance;
+        let lookAtTarget: THREE.Vector3 | null = null; // For missile/satellite, look at the object itself
+
+        // Apply gentle auto-rotation when enabled and not tracking an object
+        if (this.demoAutoRotate && targets.trackType !== 'missile' && targets.trackType !== 'satellite') {
+          this.demoRotationOffset += this.demoAutoRotateSpeed * deltaTime * 60;
+          // Normalize to prevent unbounded growth
+          while (this.demoRotationOffset > 180) this.demoRotationOffset -= 360;
+          while (this.demoRotationOffset < -180) this.demoRotationOffset += 360;
+        }
+
+        // Resolve trackType to lat/lng (get position from tracked object)
+        if (targets.trackType === 'missile' && this.gameState) {
+          // Find the best missile to track
+          const missileId = this.getActiveMissileIdForDemo();
+          if (missileId) {
+            const missiles = getMissiles(this.gameState);
+            const missile = missiles.find(m => m.id === missileId);
+            if (missile && !missile.detonated && !missile.intercepted) {
+              const missile3DPos = this.getMissile3DPositionForTracking(missile);
+              if (missile3DPos && missile3DPos.length() > GLOBE_RADIUS * 0.5) {
+                // Convert 3D position to lat/lng for spherical interpolation
+                const missileGeo = sphereToGeo(missile3DPos, GLOBE_RADIUS);
+                targetLat = missileGeo.lat;
+                targetLng = missileGeo.lng;
+                lookAtTarget = missile3DPos; // Look at the missile itself
+              }
+            }
+          }
+        } else if (targets.trackType === 'satellite' && this.gameState) {
+          // Find any visible satellite
+          const satellites = getSatellites(this.gameState);
+          const activeSat = satellites.find(s => !s.destroyed);
+          if (activeSat) {
+            const now = Date.now();
+            const orbitalParams: SatelliteOrbitalParams = {
+              launchTime: activeSat.launchTime,
+              orbitalPeriod: activeSat.orbitalPeriod,
+              orbitalAltitude: activeSat.orbitalAltitude,
+              inclination: activeSat.inclination,
+              startingLongitude: activeSat.startingLongitude,
+            };
+            const satPos3d = getSatellitePosition3D(orbitalParams, now, GLOBE_RADIUS);
+            const satVec = new THREE.Vector3(satPos3d.x, satPos3d.y, satPos3d.z);
+            // Convert satellite 3D position to lat/lng for spherical interpolation
+            const satGeo = sphereToGeo(satPos3d, GLOBE_RADIUS);
+            targetLat = satGeo.lat;
+            targetLng = satGeo.lng;
+            lookAtTarget = satVec; // Look at the satellite itself
+          }
+        }
+        // For trackType === 'radar' or null, just use targetLat/targetLng from targets
+
+        // Apply auto-rotation offset to longitude (except during hero zoom)
+        const isHeroZoom = targets.verticalOffset > 50;
+        if (!isHeroZoom && targets.trackType !== 'missile' && targets.trackType !== 'satellite') {
+          targetLng = (targetLng ?? 0) + this.demoRotationOffset;
+        }
+
+        // Spherical interpolation: lerp lat, lng (with angle wrapping), and distance separately
+        // This ensures the camera always rotates around the globe, never through it
+
+        // Helper for angle lerping (handles -180/+180 wrap)
+        const lerpAngle = (current: number, target: number, t: number): number => {
+          let delta = target - current;
+          // Take shortest path around the circle (use while to handle any delta magnitude)
+          while (delta > 180) delta -= 360;
+          while (delta < -180) delta += 360;
+          return current + delta * t;
+        };
+
+        // Interpolate spherical coordinates
+        state.currentLat = state.currentLat + ((targetLat ?? state.currentLat) - state.currentLat) * lerp;
+        state.currentLng = lerpAngle(state.currentLng, targetLng ?? state.currentLng, lerp);
+        // Normalize currentLng to [-180, 180] range
+        while (state.currentLng > 180) state.currentLng -= 360;
+        while (state.currentLng < -180) state.currentLng += 360;
+        state.currentDistance = state.currentDistance + (targetDistance - state.currentDistance) * lerp;
+
+        // Calculate camera position from interpolated spherical coordinates
+        const phi = (90 - state.currentLat) * (Math.PI / 180);
+        const theta = (state.currentLng + 180) * (Math.PI / 180);
+        const cameraX = -state.currentDistance * Math.sin(phi) * Math.cos(theta);
+        const cameraY = state.currentDistance * Math.cos(phi);
+        const cameraZ = state.currentDistance * Math.sin(phi) * Math.sin(theta);
+
+        this.camera.position.set(cameraX, cameraY, cameraZ);
+
+        // Determine what to look at
+        if (lookAtTarget) {
+          // Look at the tracked object (missile or satellite)
+          this.camera.lookAt(lookAtTarget);
+        } else if (targets.verticalOffset > 1) {
+          // Look above globe center for hero section (globe appears lower on screen)
+          this.camera.lookAt(0, targets.verticalOffset, 0);
+        } else {
+          // Look at globe center
+          this.camera.lookAt(0, 0, 0);
+        }
+
+        // Force radar visible if set
+        if (this.forceRadarVisible) {
+          this.radarCoverageGroup.visible = true;
+        }
+      }
+
+      // Follow tracked missile if one is selected (non-demo mode)
       // Update both orbit target AND camera position to follow the missile
-      if (this.trackedMissileId && this.gameState && !this.cameraAnimating) {
+      if (!this.demoCameraMode && this.trackedMissileId && this.gameState && !this.cameraAnimating) {
         const missiles = getMissiles(this.gameState);
         const trackedMissile = missiles.find(m => m.id === this.trackedMissileId);
         if (trackedMissile && !trackedMissile.detonated && !trackedMissile.intercepted) {
@@ -6695,9 +7748,9 @@ export class GlobeRenderer {
         }
       }
 
-      // Update camera to follow selected satellite
+      // Update camera to follow selected satellite (non-demo mode)
       // Update both orbit target AND camera position to follow the satellite
-      if (this.selectedSatelliteId && this.gameState && !this.cameraAnimating) {
+      if (!this.demoCameraMode && this.selectedSatelliteId && this.gameState && !this.cameraAnimating) {
         const selectedSatellite = getSatellites(this.gameState).find(s => s.id === this.selectedSatelliteId);
         if (selectedSatellite && !selectedSatellite.destroyed) {
           const now = Date.now();
@@ -6730,8 +7783,8 @@ export class GlobeRenderer {
         }
       }
 
-      // Update camera to follow selected aircraft
-      if (this.selectedAircraftId && this.gameState && !this.cameraAnimating) {
+      // Update camera to follow selected aircraft (non-demo mode)
+      if (!this.demoCameraMode && this.selectedAircraftId && this.gameState && !this.cameraAnimating) {
         const selectedAircraft = getAircraft(this.gameState).find(a => a.id === this.selectedAircraftId);
         if (selectedAircraft && selectedAircraft.status === 'flying') {
           const aircraftPos = geoToSphere(selectedAircraft.geoPosition, GLOBE_RADIUS + selectedAircraft.altitude);
@@ -6755,8 +7808,8 @@ export class GlobeRenderer {
         }
       }
 
-      // Skip all orbit controls updates during camera animation
-      if (!this.cameraAnimating) {
+      // Skip all orbit controls updates during camera animation or demo mode
+      if (!this.cameraAnimating && !this.demoCameraMode) {
         // Return orbit target to globe center when nothing is being tracked
         const isTrackingAnything = this.trackedMissileId || this.selectedSatelliteId || this.selectedAircraftId;
         if (!isTrackingAnything && !this.controls.target.equals(new THREE.Vector3(0, 0, 0))) {
@@ -6825,6 +7878,9 @@ export class GlobeRenderer {
       // Animate hacking network
       this.animateHackingNetwork(deltaTime);
 
+      // Update hero text glitch effect
+      this.updateHeroGlitch();
+
       // Apply view toggle visibility
       this.applyViewToggles();
 
@@ -6838,8 +7894,10 @@ export class GlobeRenderer {
       // Render 3D scene
       this.renderer.render(this.scene, this.camera);
 
-      // Render HUD (canvas overlay)
-      this.hudRenderer.render();
+      // Render HUD (canvas overlay) - skip in demo mode
+      if (!this.demoCameraMode) {
+        this.hudRenderer.render();
+      }
 
       this.animationFrame = requestAnimationFrame(render);
     };
@@ -7185,10 +8243,24 @@ export class GlobeRenderer {
     if (!this.hackingNetworkState) return;
 
     const currentHackIds = new Set(Object.keys(this.hackingNetworkState.activeHacks));
+    if (currentHackIds.size > 0) {
+      console.log('[GlobeRenderer] updateHackingTraces - activeHacks:', currentHackIds.size,
+        Object.values(this.hackingNetworkState.activeHacks).map(h => ({ id: h.id, hackType: h.hackType })));
+    }
     const existingTraceIds = new Set(this.hackingActiveTraces.keys());
+    const existingDDoSIds = new Set(this.ddosTraces.keys());
 
     // Create traces for new hacks
     for (const hack of Object.values(this.hackingNetworkState.activeHacks)) {
+      // For DDoS hacks, create multi-trace system only when hack succeeds
+      if (hack.hackType === 'ddos' && hack.status === 'complete') {
+        if (!this.ddosTraces.has(hack.id)) {
+          console.log('[DDoS] Creating multi-trace system for hack', hack.id);
+          this.createDDoSTraces(hack);
+        }
+      }
+
+      // Also create regular trace for all hacks (DDoS will have both)
       if (!this.hackingActiveTraces.has(hack.id)) {
         const trace = this.createHackingTrace(hack);
         if (trace) {
@@ -7225,6 +8297,39 @@ export class GlobeRenderer {
         }
       }
     }
+
+    // Remove DDoS traces for completed/removed hacks
+    for (const id of existingDDoSIds) {
+      if (!currentHackIds.has(id)) {
+        this.removeDDoSTraces(id);
+      }
+    }
+  }
+
+  /**
+   * Calculate route points for a hack (extracted for reuse)
+   */
+  private calculateRoutePoints(hack: NetworkHackTrace): THREE.Vector3[] {
+    if (!this.hackingNetworkState || hack.route.nodeIds.length < 2) return [];
+
+    const allPoints: THREE.Vector3[] = [];
+
+    for (let i = 0; i < hack.route.nodeIds.length - 1; i++) {
+      const fromNode = this.hackingNetworkState.nodes[hack.route.nodeIds[i]];
+      const toNode = this.hackingNetworkState.nodes[hack.route.nodeIds[i + 1]];
+
+      if (!fromNode || !toNode) continue;
+
+      const segmentPoints = this.calculateCurvedPath(fromNode.position, toNode.position);
+
+      if (i > 0) {
+        segmentPoints.shift();
+      }
+
+      allPoints.push(...segmentPoints);
+    }
+
+    return allPoints;
   }
 
   /**
@@ -7341,6 +8446,143 @@ export class GlobeRenderer {
       counterTraceLine,
       counterGlowLine,
     };
+  }
+
+  /**
+   * Create DDoS multi-trace visualization - starts with 1 particle, branches out exponentially
+   */
+  private createDDoSTraces(hack: NetworkHackTrace): void {
+    if (!this.hackingNetworkState || hack.route.nodeIds.length < 2) return;
+
+    const sourceNodeId = hack.route.nodeIds[0];
+    const targetNodeId = hack.route.nodeIds[hack.route.nodeIds.length - 1];
+
+    // Create shared geometry and material
+    const geometry = new THREE.SphereGeometry(DDOS_TRACE_SIZE, 8, 8);
+    const material = new THREE.MeshBasicMaterial({
+      color: DDOS_COLOR,
+      transparent: false,
+      depthTest: true,
+    });
+
+    // Create pool of trace head meshes (all invisible initially)
+    const traceHeads: THREE.Mesh[] = [];
+    const particleStates: Array<{
+      active: boolean;
+      currentNodeId: string;
+      nextNodeId: string;
+      progress: number;
+      edgeDistance: number;
+      speedMultiplier: number;
+      visitedNodes: Set<string>;
+      routeIndex: number;
+    }> = [];
+
+    for (let i = 0; i < DDOS_MAX_PARTICLES; i++) {
+      const head = new THREE.Mesh(geometry, material.clone());
+      head.visible = false;
+      this.hackingNetworkGroup.add(head);
+      traceHeads.push(head);
+
+      // Initialize all particles as inactive
+      particleStates.push({
+        active: false,
+        currentNodeId: sourceNodeId,
+        nextNodeId: sourceNodeId,
+        progress: 0,
+        edgeDistance: 10,
+        speedMultiplier: 1,
+        visitedNodes: new Set(),
+        routeIndex: 0,
+      });
+    }
+
+    // Activate first particle at source, heading to next node on route
+    const firstNext = hack.route.nodeIds[1]; // Follow the route, not random
+
+    particleStates[0].active = true;
+    particleStates[0].currentNodeId = sourceNodeId;
+    particleStates[0].nextNodeId = firstNext;
+    particleStates[0].progress = 0;
+    particleStates[0].edgeDistance = this.getNodeDistance(sourceNodeId, firstNext);
+    particleStates[0].speedMultiplier = 0.5 + Math.random() * 1.0;
+    particleStates[0].visitedNodes.add(sourceNodeId);
+    particleStates[0].routeIndex = 1; // Now heading to route node index 1
+
+    // Set initial position for first particle
+    const sourceNode = this.hackingNetworkState.nodes[sourceNodeId];
+    if (sourceNode) {
+      const pos = geoToSphere(sourceNode.position, GLOBE_RADIUS + 3);
+      traceHeads[0].position.set(pos.x, pos.y, pos.z);
+      traceHeads[0].visible = true;
+    }
+
+    console.log('[DDoS] Created particle pool with 1 active particle, max', DDOS_MAX_PARTICLES);
+
+    this.ddosTraces.set(hack.id, {
+      traceHeads,
+      activeCount: 1,
+      particleStates,
+      sourceNodeId,
+      targetNodeId,
+      routeNodeIds: hack.route.nodeIds,
+      geometry,
+      material,
+      lastSpawnTime: 0,
+    });
+  }
+
+  /**
+   * Get 3D distance between two nodes in globe units
+   */
+  private getNodeDistance(nodeId1: string, nodeId2: string): number {
+    if (!this.hackingNetworkState) return 10; // Default distance
+    const node1 = this.hackingNetworkState.nodes[nodeId1];
+    const node2 = this.hackingNetworkState.nodes[nodeId2];
+    if (!node1 || !node2) return 10;
+
+    const pos1 = geoToSphere(node1.position, GLOBE_RADIUS + 3);
+    const pos2 = geoToSphere(node2.position, GLOBE_RADIUS + 3);
+
+    const dx = pos2.x - pos1.x;
+    const dy = pos2.y - pos1.y;
+    const dz = pos2.z - pos1.z;
+
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+  }
+
+  /**
+   * Remove DDoS traces when hack completes
+   */
+  private removeDDoSTraces(hackId: string): void {
+    const ddos = this.ddosTraces.get(hackId);
+    if (ddos) {
+      for (const head of ddos.traceHeads) {
+        this.hackingNetworkGroup.remove(head);
+        (head.material as THREE.Material).dispose();
+      }
+      ddos.geometry.dispose();
+      ddos.material.dispose();
+      this.ddosTraces.delete(hackId);
+      console.log('[DDoS] Removed traces for hack', hackId);
+    }
+  }
+
+  /**
+   * Get nodes connected to a given node
+   */
+  private getConnectedNodeIds(nodeId: string): string[] {
+    if (!this.hackingNetworkState) return [];
+
+    const connected: string[] = [];
+    for (const conn of Object.values(this.hackingNetworkState.connections)) {
+      if (conn.fromNodeId === nodeId) {
+        connected.push(conn.toNodeId);
+      } else if (conn.toNodeId === nodeId) {
+        connected.push(conn.fromNodeId);
+      }
+    }
+    return connected;
   }
 
   /**
@@ -7498,6 +8740,174 @@ export class GlobeRenderer {
       } else {
         material.color.setHex(COLORS.hackingConnection);
         material.opacity = conn.encrypted ? 0.3 : 0.5;
+      }
+    }
+
+    // Animate DDoS multi-traces - branching network flood
+    for (const [hackId, ddos] of this.ddosTraces) {
+      const hack = this.hackingNetworkState.activeHacks[hackId];
+      if (!hack) continue;
+
+      // Continuous spawning from source at intervals
+      const currentTime = this.hackingAnimationTime * 1000; // Convert to ms
+      const spawnInterval = 200; // Spawn new particle every 200ms
+      if (ddos.activeCount < DDOS_MAX_PARTICLES / 2 &&
+          currentTime - ddos.lastSpawnTime > spawnInterval) {
+        // Find an inactive slot and spawn at source
+        for (let j = 0; j < DDOS_MAX_PARTICLES; j++) {
+          if (!ddos.particleStates[j].active) {
+            const newState = ddos.particleStates[j];
+            newState.active = true;
+            newState.currentNodeId = ddos.sourceNodeId;
+            newState.nextNodeId = ddos.routeNodeIds[1]; // Head to first route node
+            newState.progress = Math.random() * 0.3; // Staggered start
+            newState.edgeDistance = this.getNodeDistance(ddos.sourceNodeId, ddos.routeNodeIds[1]);
+            newState.speedMultiplier = 0.5 + Math.random() * 1.0;
+            newState.visitedNodes = new Set([ddos.sourceNodeId]);
+            newState.routeIndex = 1;
+
+            // Position at source
+            const sourceNode = this.hackingNetworkState!.nodes[ddos.sourceNodeId];
+            if (sourceNode) {
+              const pos = geoToSphere(sourceNode.position, GLOBE_RADIUS + 3);
+              ddos.traceHeads[j].position.set(pos.x, pos.y, pos.z);
+            }
+
+            ddos.activeCount++;
+            ddos.lastSpawnTime = currentTime;
+            break;
+          }
+        }
+      }
+
+      // Process each active particle
+      for (let i = 0; i < DDOS_MAX_PARTICLES; i++) {
+        const state = ddos.particleStates[i];
+        const head = ddos.traceHeads[i];
+
+        if (!state.active) {
+          head.visible = false;
+          continue;
+        }
+
+        head.visible = true;
+
+        // Move along edge at constant speed
+        const progressIncrement = (DDOS_TRACE_SPEED * state.speedMultiplier * deltaTime) / state.edgeDistance;
+        state.progress += progressIncrement;
+
+        if (state.progress >= 1) {
+          // Arrived at node
+          state.progress = 0;
+          state.currentNodeId = state.nextNodeId;
+          state.visitedNodes.add(state.currentNodeId);
+
+          const routeNodeIds = ddos.routeNodeIds;
+          const routeIndex = state.routeIndex;
+
+          // Check if this is an on-route particle that can advance
+          if (routeIndex >= 0 && routeIndex < routeNodeIds.length - 1 &&
+              state.currentNodeId === routeNodeIds[routeIndex]) {
+            // On route - advance to next route node
+            state.routeIndex = routeIndex + 1;
+            state.nextNodeId = routeNodeIds[state.routeIndex];
+            state.edgeDistance = this.getNodeDistance(state.currentNodeId, state.nextNodeId);
+            state.speedMultiplier = 0.5 + Math.random() * 1.0;
+
+            // Branch: spawn particles to off-route nodes for visual diversity
+            const allConnected = this.getConnectedNodeIds(state.currentNodeId)
+              .filter(id => this.hackingNetworkState!.nodes[id]);
+            const offRouteNodes = allConnected.filter(id =>
+              id !== state.nextNodeId && !state.visitedNodes.has(id)
+            );
+
+            // Spawn some particles to off-route branches (limited for performance)
+            for (let b = 0; b < Math.min(offRouteNodes.length, 2) && ddos.activeCount < DDOS_MAX_PARTICLES; b++) {
+              // Find an inactive slot
+              for (let j = 0; j < DDOS_MAX_PARTICLES; j++) {
+                if (!ddos.particleStates[j].active) {
+                  const newState = ddos.particleStates[j];
+                  newState.active = true;
+                  newState.currentNodeId = state.currentNodeId;
+                  newState.nextNodeId = offRouteNodes[b];
+                  newState.progress = Math.random() * 0.3; // Staggered start to reduce clumping
+                  newState.edgeDistance = this.getNodeDistance(state.currentNodeId, offRouteNodes[b]);
+                  newState.speedMultiplier = 0.5 + Math.random() * 1.0;
+                  newState.visitedNodes = new Set(state.visitedNodes);
+                  newState.routeIndex = -1; // Off-route marker
+
+                  // Position new particle at current node
+                  const nodeData = this.hackingNetworkState!.nodes[state.currentNodeId];
+                  if (nodeData) {
+                    const pos = geoToSphere(nodeData.position, GLOBE_RADIUS + 3);
+                    ddos.traceHeads[j].position.set(pos.x, pos.y, pos.z);
+                  }
+
+                  ddos.activeCount++;
+                  break;
+                }
+              }
+            }
+          } else if (routeIndex >= 0 && state.currentNodeId === routeNodeIds[routeNodeIds.length - 1]) {
+            // Reached target - deactivate this particle
+            state.active = false;
+            head.visible = false;
+            ddos.activeCount--;
+          } else {
+            // Off-route particle - wander randomly or die
+            const allConnected = this.getConnectedNodeIds(state.currentNodeId)
+              .filter(id => this.hackingNetworkState!.nodes[id]);
+            const unvisited = allConnected.filter(id => !state.visitedNodes.has(id));
+
+            if (unvisited.length > 0) {
+              // Pick a random unvisited neighbor
+              state.nextNodeId = unvisited[Math.floor(Math.random() * unvisited.length)];
+              state.edgeDistance = this.getNodeDistance(state.currentNodeId, state.nextNodeId);
+              state.speedMultiplier = 0.5 + Math.random() * 1.0;
+            } else if (allConnected.length > 0) {
+              // Dead end - pick any neighbor (even visited) to continue exploring
+              state.nextNodeId = allConnected[Math.floor(Math.random() * allConnected.length)];
+              state.edgeDistance = this.getNodeDistance(state.currentNodeId, state.nextNodeId);
+              state.speedMultiplier = 0.5 + Math.random() * 1.0;
+              state.visitedNodes.clear(); // Reset visited so particle can explore again
+            } else {
+              // Truly isolated node - deactivate this particle
+              state.active = false;
+              head.visible = false;
+              ddos.activeCount--;
+            }
+          }
+        }
+
+        // Calculate 3D position by interpolating between nodes
+        const fromNode = this.hackingNetworkState?.nodes[state.currentNodeId];
+        const toNode = this.hackingNetworkState?.nodes[state.nextNodeId];
+
+        if (fromNode && toNode) {
+          const t = state.progress;
+
+          // Use geoInterpolate for great-circle path (same as connection lines)
+          const geoPos = geoInterpolate(fromNode.position, toNode.position, t);
+
+          // Calculate distance-dependent arc height (same formula as calculateCurvedPath)
+          const distance = greatCircleDistance(fromNode.position, toNode.position);
+          const distanceDegrees = distance * (180 / Math.PI);
+          const maxHeight = HACKING_CONNECTION_HEIGHT * Math.min(1, distanceDegrees / 90);
+          const heightFactor = 4 * t * (1 - t); // Parabola peaking at t=0.5
+          const height = maxHeight * heightFactor;
+
+          // Convert to 3D with elevation (particles slightly higher than connection lines)
+          const pos = geoToSphere(geoPos, GLOBE_RADIUS + 3 + height);
+          head.position.set(pos.x, pos.y, pos.z);
+        }
+      }
+
+      // Pulse active heads
+      const pulse = 0.9 + Math.sin(this.hackingAnimationTime * 5) * 0.1;
+      for (let i = 0; i < DDOS_MAX_PARTICLES; i++) {
+        if (ddos.particleStates[i].active) {
+          ddos.traceHeads[i].scale.setScalar(pulse);
+        }
       }
     }
   }
