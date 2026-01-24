@@ -1002,45 +1002,41 @@ export class GlobeRenderer {
     const missiles = getMissiles(this.gameState);
 
     // Filter for active ICBMs with valid geo data for 3D tracking
+    // Use very permissive progress range - we'll prefer mid-flight missiles via scoring
     const activeMissiles = missiles.filter(m =>
       m.type === 'icbm' &&
       !m.detonated &&
       !m.intercepted &&
-      m.progress > 0.1 && // Has left launch area
-      m.progress < 0.85 && // Not about to impact
+      (m.progress ?? 0) > 0.02 && // Just needs to have launched
+      (m.progress ?? 0) < 0.95 && // Not yet impacted
       m.geoLaunchPosition && // Required for 3D position calculation
       m.geoTargetPosition    // Required for 3D position calculation
     );
 
     if (activeMissiles.length === 0) return null;
 
-    // Ideal viewing position for missile tracking (mid-Atlantic)
-    const idealLat = 50;
-    const idealLng = -50;
-
-    // Score missiles based on how close they are to the ideal viewing area
+    // Score missiles - prefer ones in good viewing position with flight time remaining
     // Lower score = better
     const scoredMissiles = activeMissiles.map(m => {
-      const pos = m.geoCurrentPosition;
+      const pos = m.geoCurrentPosition || m.geoLaunchPosition;
       if (!pos) return { missile: m, score: 1000 }; // No position = bad score
 
-      // Calculate angular distance from ideal position
-      const latDiff = Math.abs(pos.lat - idealLat);
-      const lngDiff = Math.abs(pos.lng - idealLng);
-      // Normalize longitude difference to handle wrap-around
-      const normalizedLngDiff = Math.min(lngDiff, 360 - lngDiff);
+      const progress = m.progress ?? 0;
 
-      // Penalize missiles on the wrong side of the globe (lng > 90 or lng < -150)
-      // These would require camera to spin around
-      let penalty = 0;
-      if (pos.lng > 90 || pos.lng < -150) {
-        penalty = 500; // Heavy penalty for far side of globe
+      // Prefer mid-flight missiles (not too early, not too late)
+      // Ideal progress is around 0.3-0.6
+      const progressScore = Math.abs(progress - 0.45) * 100;
+
+      // Prefer missiles with more flight time remaining
+      const timeRemaining = Math.max(0, 0.95 - progress) * 30;
+
+      // Small penalty for missiles on far side of globe (but don't exclude them)
+      let locationPenalty = 0;
+      if (pos.lng > 120 || pos.lng < -170) {
+        locationPenalty = 50; // Mild penalty, not exclusion
       }
 
-      // Also prefer missiles with more flight time remaining
-      const timeBonus = (0.85 - (m.progress ?? 0)) * 50; // Up to 37.5 bonus for fresh missiles
-
-      const score = latDiff + normalizedLngDiff + penalty - timeBonus;
+      const score = progressScore + locationPenalty - timeRemaining;
       return { missile: m, score };
     });
 
