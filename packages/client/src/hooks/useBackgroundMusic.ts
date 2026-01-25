@@ -12,7 +12,7 @@ const MIN_DELAY = 5000;  // 5 seconds
 const MAX_DELAY = 30000; // 30 seconds
 const FADE_DURATION = 5000; // 5 seconds fade in for gradual volume ramp
 const FADE_OUT_BEFORE_END = 3000; // Start fade out 3 seconds before track ends
-const INITIAL_MUSIC_DELAY = 15000; // 15 seconds before first track starts
+const INITIAL_MUSIC_DELAY = 5000; // 5 seconds before first track starts
 
 export function useBackgroundMusic() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -197,14 +197,20 @@ export function useBackgroundMusic() {
       }
       document.removeEventListener('click', scheduleMusic);
       document.removeEventListener('keydown', scheduleMusic);
+      document.removeEventListener('wheel', scheduleMusic);
+      document.removeEventListener('touchstart', scheduleMusic);
     };
 
     document.addEventListener('click', scheduleMusic);
     document.addEventListener('keydown', scheduleMusic);
+    document.addEventListener('wheel', scheduleMusic, { passive: true });
+    document.addEventListener('touchstart', scheduleMusic, { passive: true });
 
     return () => {
       document.removeEventListener('click', scheduleMusic);
       document.removeEventListener('keydown', scheduleMusic);
+      document.removeEventListener('wheel', scheduleMusic);
+      document.removeEventListener('touchstart', scheduleMusic);
       if (startupTimer) {
         clearTimeout(startupTimer);
       }

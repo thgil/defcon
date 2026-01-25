@@ -446,6 +446,7 @@ export class GlobeRenderer {
   };
   // Persistent missile tracking for demo mode (avoids switching missiles mid-flight)
   private demoTrackedMissileId: string | null = null;
+  private demoMissileSelectedTime: number = 0; // When current missile was selected
   // Force radar visibility for demo
   private forceRadarVisible: boolean = false;
   // Auto-rotation for demo mode (gentle globe drift)
@@ -3588,8 +3589,8 @@ export class GlobeRenderer {
           this.addStageMarker(missile.id, becoVec, 'BECO', 0xff8800);
           markerSet.add('BECO');
 
-          // Create dropped booster visual at BECO
-          if (!this.droppedBoosters.has(missile.id)) {
+          // Create dropped booster visual at BECO (skip in demo mode for cleaner visuals)
+          if (!this.demoCameraMode && !this.droppedBoosters.has(missile.id)) {
             const boosterColor = missile.ownerId === this.playerId ? 0x113388 : 0x881100;
             const booster = this.createDroppedBooster(boosterColor);
             booster.position.copy(becoVec);
@@ -7618,22 +7619,27 @@ export class GlobeRenderer {
         // Resolve trackType to lat/lng (get position from tracked object)
         if (targets.trackType === 'missile' && this.gameState) {
           const missiles = getMissiles(this.gameState);
+          const now = performance.now();
 
           // Check if current tracked missile is still valid
           let currentMissile = this.demoTrackedMissileId
             ? missiles.find(m => m.id === this.demoTrackedMissileId)
             : null;
 
-          const isMissileValid = currentMissile &&
-            !currentMissile.detonated &&
-            !currentMissile.intercepted &&
-            (currentMissile.progress ?? 0) > 0.05 &&
-            (currentMissile.progress ?? 0) < 0.9;
+          // Only invalid if truly gone (detonated/intercepted/completed)
+          // Don't invalidate based on low progress - stick with our selection
+          const isMissileGone = !currentMissile ||
+            currentMissile.detonated ||
+            currentMissile.intercepted ||
+            (currentMissile.progress ?? 0) >= 0.95;
 
-          if (!isMissileValid) {
-            // Current missile is invalid - find a new one
+          if (!this.demoTrackedMissileId || isMissileGone) {
+            // Need to pick a new missile
             const newMissileId = this.getActiveMissileIdForDemo();
-            this.demoTrackedMissileId = newMissileId;
+            if (newMissileId !== this.demoTrackedMissileId) {
+              this.demoTrackedMissileId = newMissileId;
+              this.demoMissileSelectedTime = now; // Track when we selected this missile
+            }
             currentMissile = newMissileId ? missiles.find(m => m.id === newMissileId) : null;
           }
 
@@ -7645,12 +7651,18 @@ export class GlobeRenderer {
               const missileGeo = sphereToGeo(missile3DPos, GLOBE_RADIUS);
               targetLat = missileGeo.lat;
               targetLng = missileGeo.lng;
-              lookAtTarget = missile3DPos; // Look at the missile itself
+              // Delay lookAt for 500ms after selection to let camera position lerp first
+              // This prevents the camera from snapping its rotation before moving
+              const timeSinceSelection = now - this.demoMissileSelectedTime;
+              if (timeSinceSelection > 500) {
+                lookAtTarget = missile3DPos; // Look at the missile itself
+              }
             }
           }
         } else if (targets.trackType === 'satellite' && this.gameState) {
           // Clear missile tracking when in satellite mode
           this.demoTrackedMissileId = null;
+          this.demoMissileSelectedTime = 0;
           // Find any visible satellite
           const satellites = getSatellites(this.gameState);
           const activeSat = satellites.find(s => !s.destroyed);
@@ -7674,6 +7686,7 @@ export class GlobeRenderer {
         } else {
           // For trackType === 'radar' or null, clear missile tracking
           this.demoTrackedMissileId = null;
+          this.demoMissileSelectedTime = 0;
         }
         // For trackType === 'radar' or null, just use targetLat/targetLng from targets
 
@@ -8253,10 +8266,6 @@ export class GlobeRenderer {
     if (!this.hackingNetworkState) return;
 
     const currentHackIds = new Set(Object.keys(this.hackingNetworkState.activeHacks));
-    if (currentHackIds.size > 0) {
-      console.log('[GlobeRenderer] updateHackingTraces - activeHacks:', currentHackIds.size,
-        Object.values(this.hackingNetworkState.activeHacks).map(h => ({ id: h.id, hackType: h.hackType })));
-    }
     const existingTraceIds = new Set(this.hackingActiveTraces.keys());
     const existingDDoSIds = new Set(this.ddosTraces.keys());
 

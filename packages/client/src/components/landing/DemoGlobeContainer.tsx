@@ -13,11 +13,15 @@ interface DemoGlobeContainerProps {
 // AI player ID to use as perspective during combat section (USA)
 const COMBAT_PERSPECTIVE_PLAYER_ID = 'demo-player-1';
 
+// View modes for CTA section
+type ViewMode = 'normal' | 'network' | 'fogOfWar';
+
 export function DemoGlobeContainer({ scrollState }: DemoGlobeContainerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<GlobeRenderer | null>(null);
   const simulatorRef = useRef<DemoSimulator | null>(null);
   const [isInitialized, setIsInitialized] = useState(false);
+  const [viewMode, setViewMode] = useState<ViewMode>('normal');
 
   // Track the last section to detect changes
   const lastSectionRef = useRef<string | null>(null);

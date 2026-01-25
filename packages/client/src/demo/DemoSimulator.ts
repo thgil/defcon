@@ -57,6 +57,7 @@ export class DemoSimulator {
 
   // Missile tracking
   private missileSeeds: Map<string, number> = new Map();
+  private missileDetonationTimes: Map<string, number> = new Map(); // Track when missiles detonated for delayed removal
 
   // Running state
   private running: boolean = false;
@@ -237,7 +238,7 @@ export class DemoSimulator {
       if (missile.progress >= 1 && !missile.intercepted && !missile.detonated) {
         missile.detonated = true;
         this.handleMissileImpact(missile);
-        missilesToRemove.add(missile.id);
+        this.missileDetonationTimes.set(missile.id, gameTime);
       }
     }
 
@@ -249,10 +250,10 @@ export class DemoSimulator {
       // Find target ICBM
       const targetIcbm = missile.targetId ? this.gameState.missiles[missile.targetId] : null;
 
-      // If target no longer exists or is already destroyed, remove this interceptor immediately
+      // If target no longer exists or is already destroyed, mark interceptor as detonated
       if (!targetIcbm || targetIcbm.intercepted || targetIcbm.detonated) {
         missile.detonated = true;
-        missilesToRemove.add(missile.id);
+        this.missileDetonationTimes.set(missile.id, gameTime);
         continue;
       }
 
@@ -281,8 +282,8 @@ export class DemoSimulator {
         if (distToTarget < 2 && missile.progress > 0.2) {
           targetIcbm.intercepted = true;
           missile.detonated = true;
-          missilesToRemove.add(targetIcbm.id);
-          missilesToRemove.add(missile.id);
+          this.missileDetonationTimes.set(targetIcbm.id, gameTime);
+          this.missileDetonationTimes.set(missile.id, gameTime);
         }
       }
 
@@ -291,14 +292,22 @@ export class DemoSimulator {
       const flightTime = gameTime - missile.launchTime;
       if (flightTime > missile.flightDuration * 1.5 && !missile.detonated) {
         missile.detonated = true;
-        missilesToRemove.add(missile.id);
+        this.missileDetonationTimes.set(missile.id, gameTime);
       }
     }
 
-    // Remove processed missiles
+    // Remove missiles that have been detonated for at least 500ms (allows renderer to see them)
+    const DETONATION_LINGER_TIME = 500;
+    for (const [id, detonationTime] of this.missileDetonationTimes) {
+      if (gameTime - detonationTime > DETONATION_LINGER_TIME) {
+        delete this.gameState.missiles[id];
+        this.missileSeeds.delete(id);
+        missilesToRemove.add(id);
+      }
+    }
+    // Clean up tracking for removed missiles
     missilesToRemove.forEach(id => {
-      delete this.gameState.missiles[id];
-      this.missileSeeds.delete(id);
+      this.missileDetonationTimes.delete(id);
     });
   }
 

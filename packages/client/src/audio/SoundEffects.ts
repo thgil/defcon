@@ -32,10 +32,14 @@ class SoundEffectsManager {
       }
       document.removeEventListener('click', initAudio);
       document.removeEventListener('keydown', initAudio);
+      document.removeEventListener('wheel', initAudio);
+      document.removeEventListener('touchstart', initAudio);
     };
 
     document.addEventListener('click', initAudio);
     document.addEventListener('keydown', initAudio);
+    document.addEventListener('wheel', initAudio, { passive: true });
+    document.addEventListener('touchstart', initAudio, { passive: true });
   }
 
   private async preloadSounds() {
@@ -65,6 +69,11 @@ class SoundEffectsManager {
     if (!buffer) {
       console.warn(`Sound not loaded: ${name}`);
       return;
+    }
+
+    // Resume audio context if suspended (happens when tab loses focus)
+    if (this.audioContext.state === 'suspended') {
+      this.audioContext.resume();
     }
 
     const { volume = 1, pan = 0 } = options;

@@ -612,6 +612,17 @@
   .feature-title {
     font-size: 1.25rem;
     letter-spacing: 0.15em;
+    margin-bottom: 0;
+  }
+
+  /* Hide description and details on mobile - show title only */
+  .feature-description,
+  .feature-details {
+    display: none;
+  }
+
+  .feature-content {
+    padding: 1rem 1.25rem;
   }
 
   .hero-title {

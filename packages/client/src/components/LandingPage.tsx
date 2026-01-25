@@ -3,12 +3,16 @@ import { useScrollController, LANDING_SECTIONS, getTotalScrollHeight, type Scrol
 import { DemoGlobeContainer } from './landing/DemoGlobeContainer';
 import { FeatureSection, FEATURES } from './landing/FeatureSection';
 import { useTerminalStore } from '../stores/terminalStore';
+import { useBackgroundMusic } from '../hooks/useBackgroundMusic';
 import '../styles/landing.css';
 
 // HeroSection removed - now rendered as 3D text in the globe scene
 
 export function LandingPage() {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+
+  // Background music for demo
+  useBackgroundMusic();
 
   // Glitch state from terminal store
   const glitchActive = useTerminalStore((s) => s.glitchActive);
@@ -31,7 +35,7 @@ export function LandingPage() {
   });
 
   // Discord invite link
-  const DISCORD_INVITE_URL = 'https://discord.gg/your-invite-code';
+  const DISCORD_INVITE_URL = 'https://discord.gg/YK8bezkADc';
 
   // Check if CTA should be visible - show when in CTA section
   const showCTA = scrollState.activeSection?.id === 'cta';
