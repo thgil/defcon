@@ -1142,9 +1142,9 @@ export class GlobeRenderer {
       side: THREE.DoubleSide,
       depthWrite: true,
     });
-    const titleGeometry = new THREE.PlaneGeometry(200, 50);
+    const titleGeometry = new THREE.PlaneGeometry(280, 70);
     const titleMesh = new THREE.Mesh(titleGeometry, titleMaterial);
-    titleMesh.position.set(0, -20, 0);
+    titleMesh.position.set(0, -10, 0);
     this.heroTextGroup.add(titleMesh);
 
     // Create subtitle "GLOBAL THERMONUCLEAR WAR" - terminal style with glitch support
@@ -1173,21 +1173,21 @@ export class GlobeRenderer {
     subtitleMesh.position.set(0, -55, 0);
     this.heroTextGroup.add(subtitleMesh);
 
-    // Create scroll hint - subtle
+    // Create scroll hint - more readable
     const hintCanvas = document.createElement('canvas');
     const hintCtx = hintCanvas.getContext('2d')!;
-    hintCanvas.width = 512;
-    hintCanvas.height = 128;
+    hintCanvas.width = 1024;
+    hintCanvas.height = 256;
 
     hintCtx.clearRect(0, 0, hintCanvas.width, hintCanvas.height);
-    hintCtx.font = '28px "Courier New", monospace';
+    hintCtx.font = '56px "Courier New", monospace';
     hintCtx.textAlign = 'center';
     hintCtx.textBaseline = 'middle';
     hintCtx.fillStyle = '#00aa66';
-    hintCtx.fillText('▼', hintCanvas.width / 2, 30);
-    hintCtx.font = '20px "Courier New", monospace';
+    hintCtx.fillText('▼', hintCanvas.width / 2, 60);
+    hintCtx.font = '42px "Courier New", monospace';
     hintCtx.fillStyle = '#446655';
-    hintCtx.fillText('SCROLL TO INITIATE', hintCanvas.width / 2, 80);
+    hintCtx.fillText('SCROLL TO INITIATE', hintCanvas.width / 2, 160);
 
     const hintTexture = new THREE.CanvasTexture(hintCanvas);
     const hintMaterial = new THREE.MeshBasicMaterial({
@@ -1196,9 +1196,9 @@ export class GlobeRenderer {
       side: THREE.DoubleSide,
       depthWrite: true,
     });
-    const hintGeometry = new THREE.PlaneGeometry(50, 12);
+    const hintGeometry = new THREE.PlaneGeometry(100, 25);
     const hintMesh = new THREE.Mesh(hintGeometry, hintMaterial);
-    hintMesh.position.set(0, -78, 0);
+    hintMesh.position.set(0, -85, 0);
     this.heroTextGroup.add(hintMesh);
 
     // Position the text above and in front of globe (2.5 radii up)
