@@ -918,6 +918,10 @@ export class GlobeRenderer {
       this.demoCameraState.currentLat = startLat;
       this.demoCameraState.currentLng = startLng;
       this.demoCameraState.currentDistance = startDistance;
+      // Initialize lookAt to match initial camera orientation (prevents jarring lerp at start)
+      this.demoCameraState.lookAtX = 0;
+      this.demoCameraState.lookAtY = startVerticalOffset;
+      this.demoCameraState.lookAtZ = 0;
 
       // Reset rotation offset so it doesn't affect initial position
       this.demoRotationOffset = 0;
