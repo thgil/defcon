@@ -8121,14 +8121,15 @@ export class GlobeRenderer {
     const ring = marker.getObjectByName('selectionRing') as THREE.Mesh | undefined;
     if (!ring) return;
 
-    // Pulse scale between 0.9 and 1.1
-    const pulseSpeed = 3; // Pulses per second
-    const scale = 1 + 0.1 * Math.sin(time * pulseSpeed);
+    // Pulse scale between 0.95 and 1.05 (time is in ms, so divide by 1000)
+    const pulseSpeed = 2; // Pulses per second
+    const timeInSeconds = time / 1000;
+    const scale = 1 + 0.05 * Math.sin(timeInSeconds * pulseSpeed * Math.PI * 2);
     ring.scale.setScalar(scale);
 
     // Also pulse opacity slightly
     if (ring.material instanceof THREE.MeshBasicMaterial) {
-      ring.material.opacity = 0.5 + 0.3 * Math.sin(time * pulseSpeed);
+      ring.material.opacity = 0.5 + 0.2 * Math.sin(timeInSeconds * pulseSpeed * Math.PI * 2);
     }
   }
 
