@@ -593,6 +593,8 @@
     /* Use fixed value instead of % to prevent jumping when mobile browser chrome shows/hides */
     bottom: calc(80px + env(safe-area-inset-bottom, 0px));
     transform: none;
+    /* Disable slide animation on mobile - it conflicts with the fixed positioning */
+    animation: none;
   }
 
   .feature-section--left,
