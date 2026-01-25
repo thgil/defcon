@@ -74,7 +74,7 @@ export class DemoSimulator {
 
     // Initialize AI timers for each player
     const playerIds = getDemoPlayerIds(this.gameState);
-    playerIds.forEach(id => {
+    playerIds.forEach((id: string) => {
       this.lastAttackTime.set(id, 0);
       this.nextAttackDelay.set(id, this.randomAttackDelay());
     });
@@ -92,7 +92,7 @@ export class DemoSimulator {
   private initializeSiloModes(): void {
     const playerIds = getDemoPlayerIds(this.gameState);
 
-    playerIds.forEach(playerId => {
+    playerIds.forEach((playerId: string) => {
       const silos = Object.values(this.gameState.buildings).filter(
         (b): b is Silo => b.type === 'silo' && b.ownerId === playerId
       );
@@ -112,7 +112,7 @@ export class DemoSimulator {
     const playerIds = getDemoPlayerIds(this.gameState);
 
     // Each player launches a salvo
-    playerIds.forEach(playerId => {
+    playerIds.forEach((playerId: string) => {
       this.launchAttack(playerId);
     });
   }
@@ -352,7 +352,7 @@ export class DemoSimulator {
   private updateAIAttacks(now: number): void {
     const playerIds = getDemoPlayerIds(this.gameState);
 
-    playerIds.forEach(playerId => {
+    playerIds.forEach((playerId: string) => {
       const lastAttack = this.lastAttackTime.get(playerId) || 0;
       let nextDelay = this.nextAttackDelay.get(playerId);
       if (nextDelay === undefined) {
@@ -481,7 +481,7 @@ export class DemoSimulator {
 
     const playerIds = getDemoPlayerIds(this.gameState);
 
-    playerIds.forEach(playerId => {
+    playerIds.forEach((playerId: string) => {
       // Find incoming missiles from actual enemies targeting this player's territory
       const playerTerritoryId = this.gameState.players[playerId]?.territoryId;
       if (!playerTerritoryId) return;
@@ -659,7 +659,7 @@ export class DemoSimulator {
    */
   triggerMissileSalvo(): void {
     const playerIds = getDemoPlayerIds(this.gameState);
-    playerIds.forEach(playerId => {
+    playerIds.forEach((playerId: string) => {
       this.launchAttack(playerId);
     });
   }
@@ -672,7 +672,7 @@ export class DemoSimulator {
     this.initializeSiloModes();
 
     const playerIds = getDemoPlayerIds(this.gameState);
-    playerIds.forEach(id => {
+    playerIds.forEach((id: string) => {
       this.lastAttackTime.set(id, 0);
       this.nextAttackDelay.set(id, this.randomAttackDelay());
     });
