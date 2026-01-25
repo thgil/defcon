@@ -502,11 +502,102 @@
   transform: scale(0.98);
 }
 
-/* Discord button variant */
+/* Discord button variant with glitch effect */
 .cta-button--discord {
   background: linear-gradient(180deg, #5865F2 0%, #4752C4 100%);
   box-shadow: 0 0 30px rgba(88, 101, 242, 0.4);
   color: #fff;
+  position: relative;
+  animation: discord-glitch 4s infinite;
+}
+
+.cta-button--discord::before,
+.cta-button--discord::after {
+  content: 'Join Discord';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding-left: 32px; /* Account for icon */
+  opacity: 0;
+  pointer-events: none;
+}
+
+.cta-button--discord::before {
+  color: #ff0040;
+  animation: discord-glitch-before 4s infinite;
+}
+
+.cta-button--discord::after {
+  color: #00ffff;
+  animation: discord-glitch-after 4s infinite;
+}
+
+@keyframes discord-glitch {
+  0%, 90%, 100% {
+    text-shadow: none;
+  }
+  91% {
+    text-shadow: -2px 0 #ff0040, 2px 0 #00ffff;
+    transform: scale(1) translate(1px, 0);
+  }
+  92% {
+    text-shadow: 2px 0 #ff0040, -2px 0 #00ffff;
+    transform: scale(1) translate(-1px, 0);
+  }
+  93% {
+    text-shadow: none;
+    transform: scale(1);
+  }
+  94% {
+    text-shadow: -1px 0 #ff0040, 1px 0 #00ffff;
+    transform: scale(1) translate(0, 1px);
+  }
+  95% {
+    text-shadow: none;
+    transform: scale(1);
+  }
+}
+
+@keyframes discord-glitch-before {
+  0%, 90%, 100% {
+    opacity: 0;
+    transform: translate(-50%, -50%);
+  }
+  91%, 92% {
+    opacity: 0.8;
+    transform: translate(calc(-50% - 3px), -50%);
+  }
+  93%, 94% {
+    opacity: 0;
+  }
+  95% {
+    opacity: 0.5;
+    transform: translate(calc(-50% + 2px), calc(-50% + 1px));
+  }
+}
+
+@keyframes discord-glitch-after {
+  0%, 90%, 100% {
+    opacity: 0;
+    transform: translate(-50%, -50%);
+  }
+  91%, 92% {
+    opacity: 0.8;
+    transform: translate(calc(-50% + 3px), -50%);
+  }
+  93%, 94% {
+    opacity: 0;
+  }
+  95% {
+    opacity: 0.5;
+    transform: translate(calc(-50% - 2px), calc(-50% - 1px));
+  }
 }
 
 .cta-button--discord:hover {
@@ -515,6 +606,7 @@
 
 .discord-icon {
   flex-shrink: 0;
+  z-index: 1;
 }
 
 /* CTA Glitch Effect */
