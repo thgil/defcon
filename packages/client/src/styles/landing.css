@@ -35,27 +35,25 @@
 
 .mute-button {
   position: fixed;
-  top: 20px;
+  bottom: 20px;
   right: 20px;
   z-index: 250; /* Above scroll container (200) */
-  width: 48px;
-  height: 48px;
-  border-radius: 6px;
-  background: rgba(0, 20, 15, 0.8);
-  border: 1px solid rgba(0, 170, 102, 0.4);
-  color: #00aa66;
+  width: 36px;
+  height: 36px;
+  border-radius: 4px;
+  background: transparent;
+  border: 1px solid rgba(68, 102, 85, 0.4);
+  color: #446655;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   transition: all 0.2s ease;
-  backdrop-filter: blur(4px);
 }
 
 .mute-button:hover {
-  background: rgba(0, 40, 30, 0.8);
-  border-color: rgba(0, 170, 102, 0.6);
-  transform: scale(1.05);
+  border-color: rgba(0, 170, 102, 0.5);
+  color: #00aa66;
 }
 
 .mute-button:active {
@@ -63,7 +61,7 @@
 }
 
 .mute-button svg {
-  opacity: 0.8;
+  opacity: 0.6;
 }
 
 .mute-button:hover svg {
