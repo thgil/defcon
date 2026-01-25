@@ -81,6 +81,9 @@ export const GUIDED_INTERCEPTOR_CONFIG = {
   // Altitude profile
   cruiseAltitude: 15,    // Target altitude during cruise phase (lower than ICBMs)
   terminalAltitude: 10,  // Start terminal guidance when above this altitude
+
+  // Terminal guidance - interceptor's own sensors take over at close range
+  terminalGuidanceRange: 3.0,  // Globe units (~200km) - perfect tracking within this range
 };
 
 export class GuidedInterceptorSimulator {
@@ -142,15 +145,9 @@ export class GuidedInterceptorSimulator {
       intercepted: false,
       detonated: false,
 
-      // Prediction accuracy (starts with significant error, improves with radar)
-      predictionError: 0.08 + Math.random() * 0.07,  // 8-15% initial error
-      lastRadarUpdateTime: now,
-
-      // Error biases - random per interceptor, constant during flight
-      // Biased forward (95%) because interceptors need to aim ahead of ICBMs
-      progressErrorBias: this.generateBiasedError(0.95),  // 95% forward, 5% behind
-      altitudeErrorBias: (Math.random() - 0.5) * 2,       // Keep uniform (no bias needed)
-      speedErrorBias: this.generateBiasedError(0.95),     // 95% overspeed, 5% underspeed
+      // Note: Prediction accuracy is now stored on the target ICBM itself
+      // (radarTrackingError, radarProgressErrorBias, etc.)
+      // This way all interceptors targeting the same ICBM share the same tracking data
 
       // Cached position
       geoCurrentPosition: { ...siloGeo },
@@ -175,6 +172,10 @@ export class GuidedInterceptorSimulator {
     const events: GameEvent[] = [];
     const now = Date.now();
 
+    // Update radar tracking state for all ICBMs first
+    // This ensures all interceptors targeting the same ICBM share tracking accuracy
+    this.updateMissileTracking(state, now);
+
     for (const missile of getMissiles(state)) {
       if (!isGuidedInterceptor(missile)) continue;
 
@@ -196,25 +197,8 @@ export class GuidedInterceptorSimulator {
       const target = state.missiles[interceptor.targetId] as Missile | undefined;
 
       // Update radar tracking (check which radars can see target)
+      // Note: Prediction error is now updated in updateMissileTracking() on the ICBM itself
       this.updateRadarTracking(interceptor, target, state, now);
-
-      // Improve prediction only when radar sends an update (every 5 seconds)
-      // This creates tension - interceptor works with stale data between updates
-      const timeSinceLastUpdate = now - interceptor.lastRadarUpdateTime;
-      const updateInterval = GUIDED_INTERCEPTOR_CONFIG.radarUpdateInterval;
-
-      if (interceptor.hasGuidance && interceptor.trackingRadarIds.length > 0 && timeSinceLastUpdate >= updateInterval) {
-        // Radar update received! Improve prediction based on number of tracking radars
-        const radarCount = interceptor.trackingRadarIds.length;
-        // Each update reduces error by 15% per radar (multiplicative, not subtractive)
-        const errorRetention = Math.pow(0.85, radarCount);  // 0.85^radars
-        interceptor.predictionError = Math.max(
-          0.02,  // Minimum 2% error (never perfect)
-          interceptor.predictionError * errorRetention
-        );
-        interceptor.lastRadarUpdateTime = now;
-      }
-      // If no guidance or between updates, error stays frozen
 
       // Update guidance and movement
       if (target && !target.detonated && !target.intercepted) {
@@ -252,6 +236,82 @@ export class GuidedInterceptorSimulator {
   }
 
   /**
+   * Update radar tracking state for all ICBMs.
+   * This centralizes tracking error on the ICBM itself, so all interceptors
+   * targeting the same ICBM share the same tracking accuracy.
+   */
+  updateMissileTracking(state: GameState, now: number): void {
+    const config = GUIDED_INTERCEPTOR_CONFIG;
+
+    // Get all radars grouped by their ability to track
+    const allRadars = getBuildings(state).filter(
+      (b): b is Radar => b.type === 'radar' && !b.destroyed && b.active
+    );
+
+    // Process each missile
+    for (const missile of getMissiles(state)) {
+      // Only track ICBMs (not interceptors)
+      if (missile.type !== 'icbm' || isGuidedInterceptor(missile)) continue;
+
+      const icbm = missile as Missile;
+      if (icbm.detonated || icbm.intercepted) continue;
+      if (!icbm.geoCurrentPosition) continue;
+
+      // Find all radars that can see this ICBM
+      const trackingRadarIds: string[] = [];
+
+      for (const radar of allRadars) {
+        const radarGeo = radar.geoPosition || pixelToGeo(radar.position, MAP_WIDTH, MAP_HEIGHT);
+        const angularDistanceRadians = greatCircleDistance(radarGeo, icbm.geoCurrentPosition);
+        const angularDistanceDegrees = angularDistanceRadians * (180 / Math.PI);
+        const radarRangeDegrees = (radar.range / 100) * 9;
+
+        if (angularDistanceDegrees <= radarRangeDegrees) {
+          trackingRadarIds.push(radar.id);
+        }
+      }
+
+      // Update tracking radar IDs on the ICBM
+      icbm.radarTrackingRadarIds = trackingRadarIds;
+
+      if (trackingRadarIds.length === 0) {
+        // No radars tracking - reset tracking state if it was previously tracked
+        // Keep the biases though, in case it comes back into range
+        continue;
+      }
+
+      // First detection: initialize tracking state
+      if (icbm.radarTrackingError === undefined) {
+        icbm.radarTrackingError = 0.15;  // 15% initial error
+        icbm.radarLastUpdateTime = now;
+
+        // Generate error biases (biased forward since interceptors aim ahead)
+        icbm.radarProgressErrorBias = this.generateBiasedError(0.95);  // 95% forward
+        icbm.radarAltitudeErrorBias = (Math.random() - 0.5) * 2;       // Uniform
+        icbm.radarSpeedErrorBias = this.generateBiasedError(0.95);     // 95% overspeed
+
+        console.log(`[RADAR TRACKING] First detection of ICBM ${icbm.id.substring(0, 8)}, error=15%, biases: progress=${icbm.radarProgressErrorBias.toFixed(2)}, altitude=${icbm.radarAltitudeErrorBias.toFixed(2)}, speed=${icbm.radarSpeedErrorBias.toFixed(2)}`);
+      }
+
+      // Check if it's time for a radar update (every 5 seconds)
+      const timeSinceLastUpdate = now - (icbm.radarLastUpdateTime || now);
+      const updateInterval = config.radarUpdateInterval;
+
+      if (timeSinceLastUpdate >= updateInterval) {
+        // Radar update! Reduce error based on number of tracking radars
+        const radarCount = trackingRadarIds.length;
+        // Each update reduces error by 15% per radar (multiplicative)
+        const errorRetention = Math.pow(0.85, radarCount);
+        const previousError = icbm.radarTrackingError;
+        icbm.radarTrackingError = Math.max(0.02, icbm.radarTrackingError * errorRetention);
+        icbm.radarLastUpdateTime = now;
+
+        console.log(`[RADAR TRACKING] ICBM ${icbm.id.substring(0, 8)} radar update: ${radarCount} radar(s) tracking, error ${(previousError * 100).toFixed(1)}% -> ${(icbm.radarTrackingError * 100).toFixed(1)}%`);
+      }
+    }
+  }
+
+  /**
    * Update guidance using proportional navigation.
    * Continuously adjusts heading toward predicted intercept point.
    */
@@ -275,6 +335,10 @@ export class GuidedInterceptorSimulator {
       this.updateBallisticFlight(interceptor, deltaSeconds);
       return;
     }
+
+    // Store predicted intercept point for client visualization
+    interceptor.predictedInterceptGeo = predictedIntercept.geo;
+    interceptor.predictedInterceptAltitude = predictedIntercept.altitude;
 
     // Calculate desired heading toward predicted intercept point
     const desiredHeading = calculateBearing(interceptor.geoPosition, predictedIntercept.geo);
@@ -344,41 +408,80 @@ export class GuidedInterceptorSimulator {
       return null;
     }
 
-    const errorMagnitude = interceptor.predictionError;
+    const config = GUIDED_INTERCEPTOR_CONFIG;
+
+    // Calculate current distance to ICBM for terminal guidance check
+    let inTerminalGuidance = false;
+    if (target.geoCurrentPosition) {
+      const targetAltitude = getIcbmAltitude(target.progress, target.apexHeight || 30, 0.6);
+      const interceptorPos3D = geoToCartesian(interceptor.geoPosition, interceptor.altitude, GLOBE_RADIUS);
+      const targetPos3D = geoToCartesian(target.geoCurrentPosition, targetAltitude, GLOBE_RADIUS);
+      const currentDistance = vec3Magnitude(vec3Subtract(interceptorPos3D, targetPos3D));
+
+      // Within terminal guidance range - interceptor's own sensors provide perfect tracking
+      if (currentDistance <= config.terminalGuidanceRange) {
+        inTerminalGuidance = true;
+      }
+    }
+
+    // Read radar tracking state from the ICBM itself (shared across all interceptors)
+    // If in terminal guidance range, use perfect tracking (0 error)
+    // Otherwise, if no radar tracking data, use default high error values
+    const errorMagnitude = inTerminalGuidance ? 0 : (target.radarTrackingError ?? 0.15);
+    const progressErrorBias = target.radarProgressErrorBias ?? 0.5;
+    const altitudeErrorBias = target.radarAltitudeErrorBias ?? 0;
+    const speedErrorBias = target.radarSpeedErrorBias ?? 0.5;
 
     // Apply speed error: radar's estimate of ICBM speed
     // At 20% error with bias of +1, thinks ICBM is 20% faster than it is
     // This affects how far ahead we aim
-    const speedErrorFactor = 1 + (errorMagnitude * interceptor.speedErrorBias * 0.15);
+    const speedErrorFactor = 1 + (errorMagnitude * speedErrorBias * 0.15);
     const perceivedIcbmFlightDuration = target.flightDuration / speedErrorFactor;
 
     // Apply progress error: radar's estimate of where ICBM currently is on its path
     // At 20% error with bias of +1, thinks ICBM is 0.07 (7%) further along than it is
-    const progressError = errorMagnitude * interceptor.progressErrorBias * 0.15;
+    const progressError = errorMagnitude * progressErrorBias * 0.15;
     const perceivedIcbmProgress = Math.max(0, Math.min(1, target.progress + progressError));
 
     // Iteratively find intercept point using perceived (erroneous) values
-    const currentDistance = greatCircleDistance(interceptor.geoPosition, target.geoCurrentPosition!);
-    const distanceDegrees = currentDistance * (180 / Math.PI);
-    let timeToIntercept = distanceDegrees / interceptor.speed;
+    // Use 3D Cartesian coordinates for accurate distance calculation
+    let timeToIntercept = 10; // Initial guess in seconds
+    let prevTimeToIntercept = 0;
+
+    // Convert interceptor speed from degrees/sec to globe units/sec
+    const interceptorSpeed3D = interceptor.speed * GLOBE_RADIUS * (Math.PI / 180);
+
+    // Interceptor's current 3D position (doesn't change during iteration)
+    const interceptorPos3D = geoToCartesian(interceptor.geoPosition, interceptor.altitude, GLOBE_RADIUS);
 
     // Refine estimate through iteration
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 10; i++) {
       // Where will ICBM be after timeToIntercept? (using perceived speed)
       const icbmProgress = Math.min(1, perceivedIcbmProgress + (timeToIntercept * 1000 / perceivedIcbmFlightDuration));
       const icbmFutureGeo = geoInterpolate(target.geoLaunchPosition, target.geoTargetPosition, icbmProgress);
 
-      // How long to reach that point?
-      const distToFuture = greatCircleDistance(interceptor.geoPosition, icbmFutureGeo);
-      const distToFutureDegrees = distToFuture * (180 / Math.PI);
-      timeToIntercept = distToFutureDegrees / interceptor.speed;
+      // Calculate ICBM's altitude at that progress point
+      const icbmFutureAltitude = getIcbmAltitude(icbmProgress, target.apexHeight || 30, 0.6);
 
-      // Early termination if converged
-      if (i > 0 && Math.abs(distToFutureDegrees - distanceDegrees) < 0.1) break;
+      // Get ICBM's future 3D position
+      const icbmFuturePos3D = geoToCartesian(icbmFutureGeo, icbmFutureAltitude, GLOBE_RADIUS);
+
+      // Calculate true 3D Euclidean distance
+      const distance3D = vec3Magnitude(vec3Subtract(icbmFuturePos3D, interceptorPos3D));
+
+      prevTimeToIntercept = timeToIntercept;
+      timeToIntercept = distance3D / interceptorSpeed3D;
+
+      // Converge when time estimate stabilizes (within 0.5 seconds)
+      if (Math.abs(timeToIntercept - prevTimeToIntercept) < 0.5) break;
     }
 
     // Final predicted position (using perceived values)
     const predictedIcbmProgress = Math.min(1, perceivedIcbmProgress + (timeToIntercept * 1000 / perceivedIcbmFlightDuration));
+
+    // Debug logging
+    const guidanceMode = inTerminalGuidance ? 'TERMINAL' : 'RADAR';
+    console.log(`[INTERCEPT PREDICT] ${guidanceMode} actualProgress=${target.progress.toFixed(3)}, perceivedProgress=${perceivedIcbmProgress.toFixed(3)}, predictedProgress=${predictedIcbmProgress.toFixed(3)}, timeToIntercept=${timeToIntercept.toFixed(1)}s, errorMag=${errorMagnitude.toFixed(3)}`);
 
     // Check if we can reach it before ICBM hits target
     if (predictedIcbmProgress >= 0.98) {
@@ -392,7 +495,7 @@ export class GuidedInterceptorSimulator {
     // True altitude at this progress point
     const trueAltitude = getIcbmAltitude(predictedIcbmProgress, target.apexHeight, 0.6);
     // Apply altitude error: at 20% error with bias of +1, thinks ICBM is 20% of apex higher
-    const altitudeError = errorMagnitude * interceptor.altitudeErrorBias * (target.apexHeight || 30) * 0.3;
+    const altitudeError = errorMagnitude * altitudeErrorBias * (target.apexHeight || 30) * 0.3;
     const perceivedAltitude = Math.max(0, trueAltitude + altitudeError);
 
     return { geo: interceptGeo, altitude: perceivedAltitude };

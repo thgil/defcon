@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-type Screen = 'menu' | 'lobby_browser' | 'lobby_room' | 'game';
+type Screen = 'landing' | 'menu' | 'lobby_browser' | 'lobby_room' | 'game';
 
 interface AppState {
   screen: Screen;
@@ -10,7 +10,7 @@ interface AppState {
 }
 
 export const useAppStore = create<AppState>((set) => ({
-  screen: 'menu',
+  screen: 'landing',
   playerName: '',
   setScreen: (screen) => set({ screen }),
   setPlayerName: (playerName) => set({ playerName }),

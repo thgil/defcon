@@ -75,6 +75,8 @@ export function generateNetworkConnections(
           latency,
           bandwidth,
           encrypted: Math.random() > 0.7, // 30% chance of encrypted
+          status: 'active',
+          isIntercontinental: false,
         };
       }
     }
@@ -84,15 +86,30 @@ export function generateNetworkConnections(
 }
 
 /**
+ * Options for route finding
+ */
+export interface FindRouteOptions {
+  skipCutCables?: boolean;          // Skip connections with status 'cut' (default: true)
+  applyNodeLatencyMultiplier?: boolean; // Apply latency multiplier for compromised nodes (default: true)
+}
+
+/**
  * Find a route between two nodes using BFS
  * Returns the shortest path by number of hops
+ *
+ * When skipCutCables is true (default), routes will not use cut cables.
+ * When applyNodeLatencyMultiplier is true (default), routes through compromised nodes
+ * will have increased latency (2x).
  */
 export function findRoute(
   nodes: Record<string, HackingNode>,
   connections: Record<string, HackingConnection>,
   sourceId: string,
-  targetId: string
+  targetId: string,
+  options: FindRouteOptions = {}
 ): HackingRoute | null {
+  const { skipCutCables = true, applyNodeLatencyMultiplier = true } = options;
+
   if (!nodes[sourceId] || !nodes[targetId]) return null;
   if (sourceId === targetId) {
     return {
@@ -109,6 +126,9 @@ export function findRoute(
   }
 
   for (const conn of Object.values(connections)) {
+    // Skip cut cables if option is enabled
+    if (skipCutCables && conn.status === 'cut') continue;
+
     adjacency.get(conn.fromNodeId)?.push({ nodeId: conn.toNodeId, connection: conn });
     adjacency.get(conn.toNodeId)?.push({ nodeId: conn.fromNodeId, connection: conn });
   }
@@ -126,8 +146,17 @@ export function findRoute(
     for (const { nodeId: neighborId, connection } of neighbors) {
       if (visited.has(neighborId)) continue;
 
+      // Calculate latency, applying multiplier for compromised nodes
+      let connectionLatency = connection.latency;
+      if (applyNodeLatencyMultiplier) {
+        const neighborNode = nodes[neighborId];
+        if (neighborNode?.compromisedBy) {
+          connectionLatency *= 2; // 2x latency through compromised nodes
+        }
+      }
+
       const newPath = [...current.path, neighborId];
-      const newLatency = current.latency + connection.latency;
+      const newLatency = current.latency + connectionLatency;
 
       if (neighborId === targetId) {
         return {
@@ -196,11 +225,64 @@ export function getRouteSegmentProgress(
 }
 
 /**
+ * Add explicit intercontinental deep sea cable connections
+ * These connect continents that are otherwise isolated by the distance limit
+ */
+export function addInterconnectCables(
+  nodes: Record<string, HackingNode>,
+  connections: Record<string, HackingConnection>
+): void {
+  // Define intercontinental cable routes (city pairs)
+  const cables = [
+    // Atlantic cables (Americas ↔ Europe)
+    { from: 'north_america:new_york', to: 'europe:london', name: 'TAT-14' },
+    { from: 'north_america:new_york', to: 'europe:paris', name: 'AC-1' },
+    { from: 'europe:madrid', to: 'south_america:sao_paulo', name: 'EllaLink' },
+    { from: 'europe:london', to: 'south_america:rio_de_janeiro', name: 'SAm-1' },
+    // Pacific cables (Americas ↔ Asia)
+    { from: 'north_america:los_angeles', to: 'asia:tokyo', name: 'PC-1' },
+    { from: 'north_america:san_francisco', to: 'asia:tokyo', name: 'Unity' },
+    { from: 'north_america:los_angeles', to: 'asia:shanghai', name: 'TPE' },
+    { from: 'north_america:seattle', to: 'asia:hong_kong', name: 'NCP' },
+    // Asia ↔ Australia
+    { from: 'asia:hong_kong', to: 'australia:sydney', name: 'AAG' },
+    { from: 'asia:tokyo', to: 'australia:sydney', name: 'SJC' },
+    // Europe ↔ Middle East/Asia (via Med)
+    { from: 'europe:rome', to: 'middle_east:mumbai', name: 'SEA-ME-WE' },
+  ];
+
+  for (const cable of cables) {
+    const fromNode = nodes[cable.from];
+    const toNode = nodes[cable.to];
+    if (!fromNode || !toNode) continue;
+
+    const connectionId = createConnectionId(fromNode.id, toNode.id);
+    if (connections[connectionId]) continue; // Already exists
+
+    // Intercontinental cables have higher latency but good bandwidth
+    const distance = greatCircleDistance(fromNode.position, toNode.position);
+    const distanceDegrees = distance * (180 / Math.PI);
+
+    connections[connectionId] = {
+      id: connectionId,
+      fromNodeId: fromNode.id,
+      toNodeId: toNode.id,
+      latency: 800 + distanceDegrees * 15, // Higher base latency for undersea
+      bandwidth: 0.7, // Good bandwidth (fiber)
+      encrypted: true, // Undersea cables are encrypted
+      status: 'active',
+      isIntercontinental: true, // Can be cut by cable cutting hack
+    };
+  }
+}
+
+/**
  * Initialize a default hacking network state
  */
 export function createDefaultHackingNetwork(): HackingNetworkState {
   const nodes = generateNetworkNodes();
   const connections = generateNetworkConnections(nodes);
+  addInterconnectCables(nodes, connections);
 
   return {
     nodes,
@@ -209,4 +291,127 @@ export function createDefaultHackingNetwork(): HackingNetworkState {
     playerSourceNodeId: null,
     networkVisible: false,
   };
+}
+
+// ============ NETWORK WARFARE UTILITIES ============
+
+/**
+ * Check if a node is currently under DDoS attack
+ */
+export function isNodeUnderDdos(node: HackingNode, now: number = Date.now()): boolean {
+  if (!node.ddosActive) return false;
+  if (node.ddosExpiresAt && now > node.ddosExpiresAt) return false;
+  return true;
+}
+
+/**
+ * Check if a node is currently compromised
+ */
+export function isNodeCompromised(node: HackingNode, now: number = Date.now()): boolean {
+  if (!node.compromisedBy) return false;
+  if (node.compromiseExpiresAt && now > node.compromiseExpiresAt) return false;
+  return true;
+}
+
+/**
+ * Check if a connection (cable) is currently cut
+ */
+export function isCableCut(connection: HackingConnection, now: number = Date.now()): boolean {
+  if (connection.status !== 'cut') return false;
+  if (connection.cutExpiresAt && now > connection.cutExpiresAt) return false;
+  return true;
+}
+
+/**
+ * Get all intercontinental cables (undersea cables that can be cut)
+ */
+export function getIntercontinentalCables(
+  connections: Record<string, HackingConnection>
+): HackingConnection[] {
+  return Object.values(connections).filter(c => c.isIntercontinental);
+}
+
+/**
+ * Apply DDoS to a node
+ */
+export function applyDdos(
+  node: HackingNode,
+  attackerId: string,
+  durationMs: number
+): void {
+  node.ddosActive = true;
+  node.ddosBy = attackerId;
+  node.ddosExpiresAt = Date.now() + durationMs;
+}
+
+/**
+ * Apply compromise to a node
+ */
+export function applyNodeCompromise(
+  node: HackingNode,
+  attackerId: string,
+  durationMs: number
+): void {
+  node.compromisedBy = attackerId;
+  node.compromiseExpiresAt = Date.now() + durationMs;
+}
+
+/**
+ * Cut a cable
+ */
+export function cutCable(
+  connection: HackingConnection,
+  attackerId: string,
+  durationMs: number
+): void {
+  connection.status = 'cut';
+  connection.cutBy = attackerId;
+  connection.cutExpiresAt = Date.now() + durationMs;
+}
+
+/**
+ * Apply false flag to a node (makes hacks appear to come from another player)
+ */
+export function applyFalseFlag(
+  node: HackingNode,
+  impersonatePlayerId: string,
+  durationMs: number
+): void {
+  node.falseFlagAs = impersonatePlayerId;
+  node.falseFlagExpiresAt = Date.now() + durationMs;
+}
+
+/**
+ * Clean up expired network warfare effects
+ */
+export function cleanupExpiredEffects(
+  nodes: Record<string, HackingNode>,
+  connections: Record<string, HackingConnection>,
+  now: number = Date.now()
+): void {
+  // Clean up node effects
+  for (const node of Object.values(nodes)) {
+    if (node.ddosExpiresAt && now > node.ddosExpiresAt) {
+      node.ddosActive = false;
+      node.ddosBy = undefined;
+      node.ddosExpiresAt = undefined;
+    }
+    if (node.compromiseExpiresAt && now > node.compromiseExpiresAt) {
+      node.compromisedBy = undefined;
+      node.compromiseExpiresAt = undefined;
+    }
+    if (node.falseFlagExpiresAt && now > node.falseFlagExpiresAt) {
+      node.falseFlagAs = undefined;
+      node.falseFlagExpiresAt = undefined;
+    }
+  }
+
+  // Clean up cable effects
+  for (const conn of Object.values(connections)) {
+    if (conn.cutExpiresAt && now > conn.cutExpiresAt) {
+      conn.status = 'active';
+      conn.cutBy = undefined;
+      conn.cutExpiresAt = undefined;
+    }
+  }
 }

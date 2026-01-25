@@ -5,6 +5,10 @@ import { LobbyManager } from './lobby/LobbyManager';
 import { initializeLandDetection } from './game/landDetection';
 import * as fs from 'fs';
 import * as path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const PORT = parseInt(process.env.PORT || '4002', 10);
 const HOST = '0.0.0.0';

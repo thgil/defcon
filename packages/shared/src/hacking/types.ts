@@ -1,4 +1,5 @@
 import type { GeoCoordinate } from '../geography/types';
+import type { HackType } from '../types';
 
 /**
  * A node in the hacking network - typically a city or server location
@@ -9,6 +10,16 @@ export interface HackingNode {
   position: GeoCoordinate;
   type: 'server' | 'relay' | 'target' | 'source';
   status: 'available' | 'compromised' | 'secured' | 'offline';
+  // Network warfare: node compromise state
+  compromisedBy?: string;           // Player ID who compromised this node
+  compromiseExpiresAt?: number;     // When the compromise expires
+  // Network warfare: DDoS state
+  ddosActive?: boolean;             // True if node is under DDoS
+  ddosBy?: string;                  // Player ID who is DDoS'ing
+  ddosExpiresAt?: number;           // When the DDoS expires
+  // Network warfare: false flag impersonation
+  falseFlagAs?: string;             // Player ID to impersonate in traces
+  falseFlagExpiresAt?: number;      // When the false flag expires
 }
 
 /**
@@ -21,6 +32,11 @@ export interface HackingConnection {
   latency: number;  // Affects trace speed (ms for the trace to travel this segment)
   bandwidth: number; // 0-1, affects visual thickness
   encrypted: boolean;
+  // Network warfare: cable status
+  status: 'active' | 'cut';         // Whether the cable is operational
+  cutBy?: string;                   // Player ID who cut the cable
+  cutExpiresAt?: number;            // When the cut expires (cable restored)
+  isIntercontinental?: boolean;     // True for undersea cables (can be cut)
 }
 
 /**
@@ -44,6 +60,7 @@ export interface NetworkHackTrace {
   color: string;      // Hex color for the trace
   status: 'routing' | 'active' | 'complete' | 'traced' | 'failed';
   traceProgress?: number;  // If being traced, how far the trace-back has progressed
+  hackType?: HackType;  // Type of hack (for special visualizations like DDoS)
 }
 
 /**

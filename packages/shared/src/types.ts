@@ -222,6 +222,16 @@ export interface Missile {
   // Spoofed missiles (radar spoofing)
   isSpoofed?: boolean;               // True if this missile only exists for the victim
   victimPlayerId?: string;           // Player who sees this spoofed missile
+
+  // Radar tracking state (shared across all interceptors targeting this ICBM)
+  radarTrackingError?: number;       // Current error magnitude (0.02-0.15)
+  radarLastUpdateTime?: number;      // Last radar update timestamp
+  radarTrackingRadarIds?: string[];  // Which radars are currently tracking
+
+  // Error biases (generated on first radar detection, shared by all interceptors)
+  radarProgressErrorBias?: number;   // Direction of progress error
+  radarAltitudeErrorBias?: number;   // Direction of altitude error
+  radarSpeedErrorBias?: number;      // Direction of speed error
 }
 
 
@@ -250,15 +260,9 @@ export interface GuidedInterceptor {
   hasGuidance: boolean;        // False = ballistic (lost radar lock)
   trackingRadarIds: string[];  // Radars currently providing guidance
 
-  // Prediction accuracy (radar-guided improvement over time)
-  predictionError: number;        // Current error magnitude (0 = perfect, starts ~0.15-0.25)
-  lastRadarUpdateTime: number;    // When prediction was last improved
-
-  // Error biases (random per-interceptor, stay constant during flight)
-  // These determine the direction of error for each component
-  progressErrorBias: number;      // -1 to 1: thinks ICBM is ahead (+) or behind (-) on path
-  altitudeErrorBias: number;      // -1 to 1: thinks ICBM is higher (+) or lower (-)
-  speedErrorBias: number;         // -1 to 1: thinks ICBM is faster (+) or slower (-)
+  // Current aim point (where interceptor thinks ICBM will be - updated each tick)
+  predictedInterceptGeo?: GeoPosition;
+  predictedInterceptAltitude?: number;
 
   // Fuel/timing
   launchTime: number;

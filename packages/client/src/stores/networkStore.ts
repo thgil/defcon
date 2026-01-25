@@ -13,7 +13,7 @@ import type {
   HackType,
   GameSpeed,
 } from '@defcon/shared';
-import { getBuildings } from '@defcon/shared';
+import { getBuildings, TERRITORY_GEO_DATA } from '@defcon/shared';
 import { useAppStore } from './appStore';
 import { useGameStore } from './gameStore';
 import { useTerminalStore } from './terminalStore';
@@ -266,6 +266,7 @@ export const useNetworkStore = create<NetworkState>((set, get) => ({
   },
 
   hackStart: (targetId: string, hackType: HackType, proxyRoute?: string[]) => {
+    console.log('[NetworkStore] hackStart sending:', { targetId, hackType, proxyRoute });
     send({ type: 'hack_start', targetId, hackType, proxyRoute });
   },
 
@@ -383,18 +384,53 @@ function handleMessage(message: ServerMessage) {
       // Create network trace for 3D visualization
       const hackGameState = gameStore.gameState;
       const hackPlayerId = networkStore.playerId;
+      console.log('[NetworkStore] hack_started received, hackType:', message.hackType);
+      console.log('[NetworkStore] hackPlayerId:', hackPlayerId);
       if (hackGameState && hackPlayerId) {
-        const targetBuilding = terminalStore.detectedBuildings.find(b => b.id === message.targetId);
-        const sourceBuilding = getBuildings(hackGameState).find(b => b.ownerId === hackPlayerId && !b.destroyed);
+        const allBuildings = getBuildings(hackGameState);
+        console.log('[NetworkStore] All buildings:', allBuildings.map(b => ({ id: b.id, ownerId: b.ownerId, destroyed: b.destroyed })));
+        const sourceBuilding = allBuildings.find(b => b.ownerId === hackPlayerId && !b.destroyed);
 
-        if (targetBuilding?.geoPosition && sourceBuilding?.geoPosition) {
+        // Find target position - either from detected building or from player's buildings (for player: targets)
+        let targetGeoPosition = terminalStore.detectedBuildings.find(b => b.id === message.targetId)?.geoPosition;
+
+        // For player targets (DDoS), find any building belonging to that player
+        if (!targetGeoPosition && message.targetId.startsWith('player:')) {
+          const targetPlayerId = message.targetId.substring(7);
+          const targetPlayerBuilding = getBuildings(hackGameState).find(b => b.ownerId === targetPlayerId && !b.destroyed);
+          targetGeoPosition = targetPlayerBuilding?.geoPosition;
+          console.log('[NetworkStore] DDoS target player building:', targetPlayerBuilding?.id, 'pos:', targetGeoPosition);
+        }
+
+        // Get source position - from building or territory centroid as fallback
+        let sourceGeoPosition = sourceBuilding?.geoPosition;
+        if (!sourceGeoPosition) {
+          // Fallback: use player's territory centroid
+          const player = hackGameState.players[hackPlayerId];
+          if (player?.territoryId) {
+            const territory = TERRITORY_GEO_DATA[player.territoryId];
+            if (territory?.centroid) {
+              sourceGeoPosition = { lat: territory.centroid.lat, lng: territory.centroid.lng };
+              console.log('[NetworkStore] Using territory centroid as source:', player.territoryId, sourceGeoPosition);
+            }
+          }
+        } else {
+          console.log('[NetworkStore] sourceBuilding:', sourceBuilding?.id, 'pos:', sourceGeoPosition);
+        }
+
+        if (targetGeoPosition && sourceGeoPosition) {
+          console.log('[NetworkStore] Creating hack trace...');
           const hackingStore = useHackingStore.getState();
           hackingStore.startHackFromGeo(
-            sourceBuilding.geoPosition,
-            targetBuilding.geoPosition,
-            message.hackId
+            sourceGeoPosition,
+            targetGeoPosition,
+            message.hackId,
+            undefined,  // Use default color
+            message.hackType  // Pass hack type for special visualizations
           );
           hackingStore.setNetworkVisible(true);
+        } else {
+          console.warn('[NetworkStore] Missing position data, cannot create trace', { targetGeoPosition, sourceGeoPosition });
         }
       }
       break;
@@ -416,7 +452,12 @@ function handleMessage(message: ServerMessage) {
       break;
 
     case 'hack_complete':
-      useHackingStore.getState().removeHack(message.hackId);
+      // For DDoS hacks, mark complete instead of removing - the visual flood effect needs to spawn
+      if (message.hackType === 'ddos') {
+        useHackingStore.getState().completeHack(message.hackId);
+      } else {
+        useHackingStore.getState().removeHack(message.hackId);
+      }
       useTerminalStore.getState().setActiveHack(null);
       useTerminalStore.getState().addCompromise(message.compromise);
       // Add success email

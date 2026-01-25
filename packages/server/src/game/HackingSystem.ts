@@ -4,6 +4,7 @@ import {
   Building,
   Radar,
   Silo,
+  Satellite,
   SatelliteLaunchFacility,
   DefconLevel,
   HackType,
@@ -19,6 +20,16 @@ import {
   getSatellites,
   GeoPosition,
   greatCircleDistance,
+  HackingNode,
+  HackingConnection,
+  createDefaultHackingNetwork,
+  isNodeUnderDdos,
+  applyDdos,
+  applyNodeCompromise,
+  cutCable,
+  applyFalseFlag,
+  cleanupExpiredEffects,
+  getIntercontinentalCables,
 } from '@defcon/shared';
 
 // Result of a hack tick update
@@ -26,6 +37,8 @@ export interface HackTickResult {
   completedHacks: { hack: ActiveHack; compromise: SystemCompromise }[];
   tracedHacks: ActiveHack[];
   progressUpdates: { hackId: string; progress: number; traceProgress: number }[];
+  // Network warfare events
+  targetIntelResults?: { hackId: string; siloId: string; targetPosition?: GeoPosition; targetCityName?: string }[];
 }
 
 // Result of starting a hack
@@ -47,6 +60,34 @@ export class HackingSystem {
 
   // Detected buildings per player
   private detectedBuildings: Map<string, DetectedBuilding[]> = new Map();
+
+  // ============ NETWORK WARFARE STATE ============
+
+  // Tapped radars: radarId -> attackerId (who is seeing through it)
+  private tappedRadars: Map<string, { attackerId: string; expiresAt: number }> = new Map();
+
+  // DDoS'd player source nodes: playerId -> { attackerId, expiresAt }
+  private ddosTargets: Map<string, { attackerId: string; expiresAt: number }> = new Map();
+
+  // Monitored silos: siloId -> { attackerId, expiresAt } (for launch warnings)
+  private monitoredSilos: Map<string, { attackerId: string; expiresAt: number }> = new Map();
+
+  // Hijacked satellites: satelliteId -> { attackerId, expiresAt }
+  private hijackedSatellites: Map<string, { attackerId: string; expiresAt: number }> = new Map();
+
+  // False flag nodes: nodeId -> { impersonatePlayerId, expiresAt }
+  private falseFlagNodes: Map<string, { impersonatePlayerId: string; ownerId: string; expiresAt: number }> = new Map();
+
+  // Network state for cable cutting
+  private networkNodes: Record<string, HackingNode> = {};
+  private networkConnections: Record<string, HackingConnection> = {};
+
+  constructor() {
+    // Initialize network for cable cutting
+    const network = createDefaultHackingNetwork();
+    this.networkNodes = network.nodes;
+    this.networkConnections = network.connections;
+  }
 
   /**
    * Get the hacking configuration for the current DEFCON level
@@ -151,13 +192,23 @@ export class HackingSystem {
 
   /**
    * Get vulnerabilities for a building type
+   * Returns hack types available based on building type and DEFCON level
    */
-  private getVulnerabilities(building: Building): HackType[] {
+  private getVulnerabilities(building: Building, defconLevel?: DefconLevel): HackType[] {
     switch (building.type) {
       case 'radar':
-        return ['blind_radar', 'spoof_radar'];
+        // tap_radar available at DEFCON 3+
+        return ['blind_radar', 'spoof_radar', 'tap_radar'];
       case 'silo':
-        return ['lock_silo', 'delay_silo'];
+        // target_intel only at DEFCON 1, launch_warning at DEFCON 2+
+        const siloHacks: HackType[] = ['lock_silo', 'delay_silo'];
+        if (!defconLevel || defconLevel <= 2) {
+          siloHacks.push('launch_warning');
+        }
+        if (!defconLevel || defconLevel === 1) {
+          siloHacks.push('target_intel');
+        }
+        return siloHacks;
       case 'satellite_launch_facility':
         return ['disable_satellite', 'intercept_comms'];
       case 'airfield':
@@ -168,6 +219,27 @@ export class HackingSystem {
   }
 
   /**
+   * Get vulnerabilities for satellites (special target type)
+   */
+  getVulnerabilitiesForSatellite(): HackType[] {
+    return ['hijack_satellite'];
+  }
+
+  /**
+   * Get vulnerabilities for network nodes
+   */
+  getVulnerabilitiesForNode(): HackType[] {
+    return ['ddos', 'compromise_node', 'false_flag'];
+  }
+
+  /**
+   * Get vulnerabilities for network cables
+   */
+  getVulnerabilitiesForCable(): HackType[] {
+    return ['cut_cable'];
+  }
+
+  /**
    * Start a new hack attempt
    */
   startHack(
@@ -175,7 +247,8 @@ export class HackingSystem {
     attackerId: string,
     targetId: string,
     hackType: HackType,
-    proxyRoute?: string[]
+    proxyRoute?: string[],
+    impersonatePlayerId?: string  // For false_flag hack
   ): HackStartResult {
     const config = this.getConfig(state.defconLevel);
 
@@ -184,26 +257,9 @@ export class HackingSystem {
       return { success: false, error: 'Hacking not available at this DEFCON level' };
     }
 
-    // Find target building
-    const target = state.buildings[targetId];
-    if (!target || target.destroyed) {
-      return { success: false, error: 'Target not found' };
-    }
-
-    // Check if target type is allowed at this DEFCON level
-    if (!config.allowedTargets.includes(target.type)) {
-      return { success: false, error: `Cannot hack ${target.type} at this DEFCON level` };
-    }
-
-    // Check if player is trying to hack own building
-    if (target.ownerId === attackerId) {
-      return { success: false, error: 'Cannot hack your own buildings' };
-    }
-
-    // Check if hack type is valid for this building
-    const validHacks = this.getVulnerabilities(target);
-    if (!validHacks.includes(hackType)) {
-      return { success: false, error: `Invalid hack type for ${target.type}` };
+    // Check if attacker is under DDoS
+    if (this.isPlayerUnderDdos(attackerId)) {
+      return { success: false, error: 'Your network is under DDoS attack - cannot initiate hacks' };
     }
 
     // Check if attacker already has an active hack
@@ -212,6 +268,86 @@ export class HackingSystem {
     );
     if (existingHack) {
       return { success: false, error: 'Already have an active hack in progress' };
+    }
+
+    // Handle special target types
+    let targetOwnerId: string;
+    let validHacks: HackType[];
+
+    // Check for satellite target (sat:<id> format)
+    if (targetId.startsWith('sat:')) {
+      const satId = targetId.substring(4);
+      const satellite = state.satellites[satId];
+      if (!satellite || satellite.destroyed) {
+        return { success: false, error: 'Satellite not found' };
+      }
+      if (satellite.ownerId === attackerId) {
+        return { success: false, error: 'Cannot hack your own satellite' };
+      }
+      targetOwnerId = satellite.ownerId;
+      validHacks = this.getVulnerabilitiesForSatellite();
+    }
+    // Check for player target (player:<id> format) - for DDoS attacks
+    else if (targetId.startsWith('player:')) {
+      const targetPlayerId = targetId.substring(7);
+      const targetPlayer = state.players[targetPlayerId];
+      if (!targetPlayer) {
+        return { success: false, error: 'Player not found' };
+      }
+      if (targetPlayerId === attackerId) {
+        return { success: false, error: 'Cannot DDoS yourself' };
+      }
+      targetOwnerId = targetPlayerId;  // The player being DDoS'd
+      validHacks = ['ddos'];  // Only DDoS allowed for player targets
+    }
+    // Check for network node target (node:<id> format)
+    else if (targetId.startsWith('node:')) {
+      const nodeId = targetId.substring(5);
+      const node = this.networkNodes[nodeId];
+      if (!node) {
+        return { success: false, error: 'Network node not found' };
+      }
+      // For nodes, targetOwnerId is the attacker (they own the effect)
+      targetOwnerId = attackerId;
+      validHacks = this.getVulnerabilitiesForNode();
+    }
+    // Check for cable target (cable:<id> format)
+    else if (targetId.startsWith('cable:')) {
+      const cableId = targetId.substring(6);
+      const cable = this.networkConnections[cableId];
+      if (!cable) {
+        return { success: false, error: 'Cable not found' };
+      }
+      if (!cable.isIntercontinental) {
+        return { success: false, error: 'Only intercontinental cables can be cut' };
+      }
+      targetOwnerId = attackerId;
+      validHacks = this.getVulnerabilitiesForCable();
+    }
+    // Regular building target
+    else {
+      const target = state.buildings[targetId];
+      if (!target || target.destroyed) {
+        return { success: false, error: 'Target not found' };
+      }
+
+      // Check if target type is allowed at this DEFCON level
+      if (!config.allowedTargets.includes(target.type)) {
+        return { success: false, error: `Cannot hack ${target.type} at this DEFCON level` };
+      }
+
+      // Check if player is trying to hack own building
+      if (target.ownerId === attackerId) {
+        return { success: false, error: 'Cannot hack your own buildings' };
+      }
+
+      targetOwnerId = target.ownerId;
+      validHacks = this.getVulnerabilities(target, state.defconLevel);
+    }
+
+    // Check if hack type is valid for this target
+    if (!validHacks.includes(hackType)) {
+      return { success: false, error: `Invalid hack type for this target` };
     }
 
     // Validate proxy route (all buildings must belong to attacker)
@@ -229,7 +365,7 @@ export class HackingSystem {
       id: uuidv4(),
       attackerId,
       targetId,
-      targetOwnerId: target.ownerId,
+      targetOwnerId,
       hackType,
       progress: 0,
       traceProgress: 0,
@@ -240,8 +376,10 @@ export class HackingSystem {
 
     this.activeHacks.set(hack.id, hack);
 
-    // Create intrusion alert for target owner
-    this.createIntrusionAlert(hack);
+    // Create intrusion alert for target owner (not for infrastructure hacks)
+    if (!targetId.startsWith('node:') && !targetId.startsWith('cable:')) {
+      this.createIntrusionAlert(hack);
+    }
 
     return { success: true, hack };
   }
@@ -304,12 +442,14 @@ export class HackingSystem {
         continue;
       }
 
-      // Check if target building still exists
-      const target = state.buildings[hack.targetId];
-      if (!target || target.destroyed) {
-        hack.status = 'disconnected';
-        this.removeIntrusionAlert(hack.targetId, hack.targetOwnerId);
-        continue;
+      // Check if target still exists (skip for special targets like cables/nodes/players)
+      if (!hack.targetId.startsWith('cable:') && !hack.targetId.startsWith('node:') && !hack.targetId.startsWith('sat:') && !hack.targetId.startsWith('player:')) {
+        const target = state.buildings[hack.targetId];
+        if (!target || target.destroyed) {
+          hack.status = 'disconnected';
+          this.removeIntrusionAlert(hack.targetId, hack.targetOwnerId);
+          continue;
+        }
       }
 
       // Check if any proxy in route was destroyed
@@ -329,6 +469,11 @@ export class HackingSystem {
       const baseTime = HACK_COMPLETION_TIME[hack.hackType];
       const hackSpeedMultiplier = config.hackSpeed;
       const progressPerSecond = (100 / (baseTime / 1000)) * hackSpeedMultiplier;
+
+      // Debug: log every 20 ticks (~1 second)
+      if (Math.floor(hack.progress) % 10 === 0 && hack.progress < 100) {
+        console.log(`[HACK PROGRESS] ${hack.hackType}: ${hack.progress.toFixed(1)}%, delta=${deltaSeconds.toFixed(3)}s, rate=${progressPerSecond.toFixed(1)}%/s`);
+      }
 
       // Calculate trace increment
       const riskLevel = HACK_RISK_LEVELS[hack.hackType];
@@ -377,6 +522,9 @@ export class HackingSystem {
     // Clean up expired compromises
     this.cleanupExpiredCompromises();
 
+    // Clean up expired network warfare effects
+    this.cleanupExpiredNetworkEffects();
+
     return result;
   }
 
@@ -397,12 +545,99 @@ export class HackingSystem {
       expiresAt: duration > 0 ? now + duration : 0,
     };
 
+    // Apply special effects for network warfare hacks
+    this.applyNetworkWarfareEffect(hack, compromise);
+
     // Add to compromises map
     const existing = this.compromises.get(hack.targetId) || [];
     existing.push(compromise);
     this.compromises.set(hack.targetId, existing);
 
     return compromise;
+  }
+
+  /**
+   * Apply network warfare specific effects when a hack completes
+   */
+  private applyNetworkWarfareEffect(hack: ActiveHack, compromise: SystemCompromise): void {
+    const duration = HACK_DURATIONS[hack.hackType];
+    const expiresAt = duration > 0 ? Date.now() + duration : 0;
+
+    switch (hack.hackType) {
+      case 'tap_radar':
+        // Track tapped radar
+        this.tappedRadars.set(hack.targetId, {
+          attackerId: hack.attackerId,
+          expiresAt,
+        });
+        break;
+
+      case 'ddos':
+        // DDoS targets the enemy player's ability to hack
+        this.ddosTargets.set(hack.targetOwnerId, {
+          attackerId: hack.attackerId,
+          expiresAt,
+        });
+        break;
+
+      case 'compromise_node':
+        // Mark node as compromised (if targeting a node)
+        if (hack.targetId.startsWith('node:')) {
+          const nodeId = hack.targetId.substring(5);
+          const node = this.networkNodes[nodeId];
+          if (node) {
+            applyNodeCompromise(node, hack.attackerId, duration);
+          }
+        }
+        break;
+
+      case 'launch_warning':
+        // Monitor the silo for launch warnings
+        this.monitoredSilos.set(hack.targetId, {
+          attackerId: hack.attackerId,
+          expiresAt,
+        });
+        break;
+
+      case 'hijack_satellite':
+        // Hijack satellite vision (target is sat:<id>)
+        if (hack.targetId.startsWith('sat:')) {
+          const satId = hack.targetId.substring(4);
+          this.hijackedSatellites.set(satId, {
+            attackerId: hack.attackerId,
+            expiresAt,
+          });
+        }
+        break;
+
+      case 'cut_cable':
+        // Cut the cable (target is cable:<id>)
+        if (hack.targetId.startsWith('cable:')) {
+          const cableId = hack.targetId.substring(6);
+          const cable = this.networkConnections[cableId];
+          if (cable) {
+            cutCable(cable, hack.attackerId, duration);
+          }
+        }
+        break;
+
+      case 'false_flag':
+        // Apply false flag to a node (target is node:<id>)
+        if (hack.targetId.startsWith('node:')) {
+          const nodeId = hack.targetId.substring(5);
+          const node = this.networkNodes[nodeId];
+          if (node) {
+            // The impersonate ID should be passed through the hack somehow
+            // For now, use a placeholder - this needs to be passed via protocol
+            this.falseFlagNodes.set(nodeId, {
+              impersonatePlayerId: hack.targetOwnerId, // Will be overridden
+              ownerId: hack.attackerId,
+              expiresAt,
+            });
+          }
+        }
+        break;
+    }
   }
 
   /**
@@ -551,5 +786,201 @@ export class HackingSystem {
    */
   getDetectedBuildings(playerId: string): DetectedBuilding[] {
     return this.detectedBuildings.get(playerId) || [];
+  }
+
+  // ============ NETWORK WARFARE METHODS ============
+
+  /**
+   * Check if a player is under DDoS attack (can't initiate new hacks)
+   */
+  isPlayerUnderDdos(playerId: string): boolean {
+    const ddos = this.ddosTargets.get(playerId);
+    if (!ddos) return false;
+    if (Date.now() > ddos.expiresAt) {
+      this.ddosTargets.delete(playerId);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Check if a radar is being tapped by an attacker
+   */
+  isRadarTapped(radarId: string): { tapped: boolean; attackerId?: string } {
+    const tap = this.tappedRadars.get(radarId);
+    if (!tap) return { tapped: false };
+    if (Date.now() > tap.expiresAt) {
+      this.tappedRadars.delete(radarId);
+      return { tapped: false };
+    }
+    return { tapped: true, attackerId: tap.attackerId };
+  }
+
+  /**
+   * Get all radars tapped by a player (for fog-of-war integration)
+   */
+  getRadarsTappedByPlayer(playerId: string): string[] {
+    const now = Date.now();
+    const tappedRadarIds: string[] = [];
+
+    for (const [radarId, tap] of this.tappedRadars) {
+      if (tap.attackerId === playerId && now <= tap.expiresAt) {
+        tappedRadarIds.push(radarId);
+      }
+    }
+
+    return tappedRadarIds;
+  }
+
+  /**
+   * Check if a silo is being monitored for launch warnings
+   */
+  isSiloMonitored(siloId: string): { monitored: boolean; attackerId?: string } {
+    const monitor = this.monitoredSilos.get(siloId);
+    if (!monitor) return { monitored: false };
+    if (Date.now() > monitor.expiresAt) {
+      this.monitoredSilos.delete(siloId);
+      return { monitored: false };
+    }
+    return { monitored: true, attackerId: monitor.attackerId };
+  }
+
+  /**
+   * Get all silos being monitored (for launch warning integration)
+   */
+  getMonitoredSilos(): Map<string, { attackerId: string; expiresAt: number }> {
+    const now = Date.now();
+    // Clean up expired entries
+    for (const [siloId, monitor] of this.monitoredSilos) {
+      if (now > monitor.expiresAt) {
+        this.monitoredSilos.delete(siloId);
+      }
+    }
+    return this.monitoredSilos;
+  }
+
+  /**
+   * Check if a satellite is hijacked
+   */
+  isSatelliteHijacked(satelliteId: string): { hijacked: boolean; attackerId?: string } {
+    const hijack = this.hijackedSatellites.get(satelliteId);
+    if (!hijack) return { hijacked: false };
+    if (Date.now() > hijack.expiresAt) {
+      this.hijackedSatellites.delete(satelliteId);
+      return { hijacked: false };
+    }
+    return { hijacked: true, attackerId: hijack.attackerId };
+  }
+
+  /**
+   * Get all satellites hijacked by a player (for fog-of-war integration)
+   */
+  getSatellitesHijackedByPlayer(playerId: string): string[] {
+    const now = Date.now();
+    const hijackedSatIds: string[] = [];
+
+    for (const [satId, hijack] of this.hijackedSatellites) {
+      if (hijack.attackerId === playerId && now <= hijack.expiresAt) {
+        hijackedSatIds.push(satId);
+      }
+    }
+
+    return hijackedSatIds;
+  }
+
+  /**
+   * Get intercontinental cables that can be targeted
+   */
+  getTargetableCables(): HackingConnection[] {
+    return getIntercontinentalCables(this.networkConnections);
+  }
+
+  /**
+   * Get network state for client
+   */
+  getNetworkState(): { nodes: Record<string, HackingNode>; connections: Record<string, HackingConnection> } {
+    return {
+      nodes: this.networkNodes,
+      connections: this.networkConnections,
+    };
+  }
+
+  /**
+   * Check if trace should reveal a different attacker (false flag)
+   */
+  getFalseFlagAttacker(routeNodeIds: string[], realAttackerId: string): string | null {
+    const now = Date.now();
+
+    for (const nodeId of routeNodeIds) {
+      const falseFlag = this.falseFlagNodes.get(nodeId);
+      if (falseFlag && falseFlag.ownerId === realAttackerId && now <= falseFlag.expiresAt) {
+        return falseFlag.impersonatePlayerId;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Set false flag impersonation target for a node
+   */
+  setFalseFlagTarget(nodeId: string, impersonatePlayerId: string): boolean {
+    const falseFlag = this.falseFlagNodes.get(nodeId);
+    if (!falseFlag) return false;
+
+    falseFlag.impersonatePlayerId = impersonatePlayerId;
+    return true;
+  }
+
+  /**
+   * Clean up expired network warfare effects
+   */
+  cleanupExpiredNetworkEffects(): void {
+    const now = Date.now();
+
+    // Clean up tapped radars
+    for (const [radarId, tap] of this.tappedRadars) {
+      if (now > tap.expiresAt) {
+        this.tappedRadars.delete(radarId);
+      }
+    }
+
+    // Clean up DDoS targets
+    for (const [playerId, ddos] of this.ddosTargets) {
+      if (now > ddos.expiresAt) {
+        this.ddosTargets.delete(playerId);
+      }
+    }
+
+    // Clean up monitored silos
+    for (const [siloId, monitor] of this.monitoredSilos) {
+      if (now > monitor.expiresAt) {
+        this.monitoredSilos.delete(siloId);
+      }
+    }
+
+    // Clean up hijacked satellites
+    for (const [satId, hijack] of this.hijackedSatellites) {
+      if (now > hijack.expiresAt) {
+        this.hijackedSatellites.delete(satId);
+      }
+    }
+
+    // Clean up false flag nodes
+    for (const [nodeId, falseFlag] of this.falseFlagNodes) {
+      if (now > falseFlag.expiresAt) {
+        this.falseFlagNodes.delete(nodeId);
+      }
+    }
+
+    // Clean up network node/cable effects
+    cleanupExpiredEffects(this.networkNodes, this.networkConnections, now);
+  }
+
+  /**
+   * Get silo target position (for target_intel hack result)
+   */
+  getSiloTarget(silo: Silo): GeoPosition | undefined {
+    return silo.targetedPosition;
   }
 }

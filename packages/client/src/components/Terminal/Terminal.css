@@ -763,6 +763,7 @@
 /* ============ NETWORK TAB ============ */
 
 .network-tab {
+  position: relative;  /* Establish positioning context for selector overlay */
   padding: 12px;
   overflow-y: auto;
   flex: 1;
@@ -1002,6 +1003,145 @@
   font-size: 10px;
   padding-top: 8px;
   border-top: 1px dashed var(--terminal-secondary);
+}
+
+/* Network subtabs for targets vs infrastructure */
+.network-subtabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.network-subtabs .subtab {
+  background: transparent;
+  border: 1px solid var(--terminal-secondary);
+  color: var(--terminal-secondary);
+  padding: 4px 12px;
+  font-family: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.network-subtabs .subtab:hover {
+  border-color: var(--terminal-primary);
+  color: var(--terminal-primary);
+}
+
+.network-subtabs .subtab.active {
+  background: color-mix(in srgb, var(--terminal-primary) 15%, transparent);
+  border-color: var(--terminal-primary);
+  color: var(--terminal-primary);
+}
+
+/* Infrastructure topology layout */
+.network-topology.infrastructure {
+  flex-direction: column;
+  gap: 12px;
+}
+
+.network-topology.infrastructure .network-section {
+  flex: none;
+}
+
+/* Cable and player node styles */
+.cable-node {
+  color: #00aaff;
+}
+
+.enemy-player {
+  color: #ff6666;
+}
+
+.section-hint {
+  color: #666;
+  font-size: 9px;
+  font-style: italic;
+  margin-top: 4px;
+  padding-left: 8px;
+}
+
+.more-items {
+  color: #666;
+  font-size: 10px;
+  padding: 4px 8px;
+}
+
+.target-type {
+  color: var(--terminal-secondary);
+  font-size: 10px;
+}
+
+/* Clickable/Selected target states */
+.node-clickable {
+  cursor: pointer;
+}
+
+.node-clickable:hover {
+  color: #00ff88;
+}
+
+.node-selected {
+  color: #ffff00 !important;
+  background: rgba(255, 255, 0, 0.1);
+  border-color: #ffff00 !important;
+}
+
+/* Hack type selector - positioned as overlay at bottom */
+.hack-type-selector {
+  position: absolute;
+  bottom: 40px;         /* Above the help text */
+  left: 12px;
+  right: 12px;
+  z-index: 10;
+  border: 1px solid var(--terminal-primary);
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.95);  /* Solid background to cover content below */
+  box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.8);  /* Shadow for depth */
+}
+
+.selector-header {
+  color: var(--terminal-primary);
+  font-size: 11px;
+  margin-bottom: 12px;
+}
+
+.hack-options {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.hack-option {
+  background: transparent;
+  border: 1px solid var(--terminal-primary);
+  color: var(--terminal-primary);
+  cursor: pointer;
+  padding: 6px 12px;
+  font-family: inherit;
+  font-size: 11px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.hack-option:hover {
+  background: color-mix(in srgb, var(--terminal-primary) 20%, transparent);
+}
+
+.hack-desc {
+  font-size: 9px;
+  color: var(--terminal-secondary);
+  font-weight: normal;
+}
+
+.hack-option.cancel {
+  border-color: #ff6600;
+  color: #ff6600;
+}
+
+.hack-option.cancel:hover {
+  background: rgba(255, 102, 0, 0.2);
 }
 
 /* ============ HACKING OVERLAY ============ */

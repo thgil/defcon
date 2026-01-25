@@ -141,6 +141,21 @@ export class MissileSimulator {
   private handleImpact(missile: Missile, state: GameState): GameEvent[] {
     missile.detonated = true;
     const events: GameEvent[] = [];
+
+    // Decoy missiles create visual explosion but no damage
+    if (missile.isDecoy) {
+      events.push({
+        type: 'missile_impact',
+        tick: state.tick,
+        missileId: missile.id,
+        position: missile.targetPosition,
+        casualties: 0,
+        targetType: 'ground',
+      } as MissileImpactEvent);
+      console.log(`[DECOY IMPACT] Decoy missile ${missile.id} created visual explosion at target`);
+      return events;
+    }
+
     const impactRadius = 50;
     let totalCasualties = 0;
 

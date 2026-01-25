@@ -5,9 +5,12 @@ import {
   type HackingRoute,
   type NetworkHackTrace,
   type HackingNetworkState,
+  type GeoPosition,
+  type HackType,
   createDefaultHackingNetwork,
   findRoute,
   createConnectionId,
+  greatCircleDistance,
 } from '@defcon/shared';
 
 interface HackingStore extends HackingNetworkState {
@@ -18,8 +21,10 @@ interface HackingStore extends HackingNetworkState {
   setPlayerSource: (nodeId: string | null) => void;
 
   // Hack actions
-  startHack: (sourceId: string, targetId: string, color?: string) => string | null;
-  updateHackProgress: (hackId: string, progress: number) => void;
+  startHack: (sourceId: string, targetId: string, color?: string, hackType?: HackType) => string | null;
+  startHackFromGeo: (sourceGeo: GeoPosition, targetGeo: GeoPosition, hackId: string, color?: string, hackType?: HackType) => string | null;
+  addActiveHack: (trace: NetworkHackTrace) => void;
+  updateHackProgress: (hackId: string, progress: number, traceProgress?: number) => void;
   completeHack: (hackId: string) => void;
   failHack: (hackId: string) => void;
   startTrace: (hackId: string) => void;
@@ -27,6 +32,7 @@ interface HackingStore extends HackingNetworkState {
 
   // Demo/test actions
   startDemoHack: () => void;
+  startDemoDdosHack: () => void;
   clearAllHacks: () => void;
 
   // Computed
@@ -34,6 +40,7 @@ interface HackingStore extends HackingNetworkState {
   getConnectionsArray: () => HackingConnection[];
   getNetworkHackTracesArray: () => NetworkHackTrace[];
   getRouteForHack: (hackId: string) => HackingRoute | null;
+  findNearestNode: (geoPos: GeoPosition) => HackingNode | null;
 }
 
 // Hack trace colors for visual variety
@@ -81,7 +88,7 @@ export const useHackingStore = create<HackingStore>((set, get) => ({
   },
 
   // Start a new hack from source to target
-  startHack: (sourceId, targetId, color) => {
+  startHack: (sourceId, targetId, color, hackType) => {
     const { nodes, connections } = get();
 
     // Find route
@@ -93,6 +100,57 @@ export const useHackingStore = create<HackingStore>((set, get) => ({
 
     // Generate hack ID
     const hackId = `hack-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+    // Pick color (orange for DDoS)
+    const hackColor = color || (hackType === 'ddos' ? '#ff8800' : HACK_COLORS[hackColorIndex % HACK_COLORS.length]);
+    hackColorIndex++;
+
+    const hack: NetworkHackTrace = {
+      id: hackId,
+      routeId: route.id,
+      route,
+      startTime: Date.now(),
+      progress: 0,
+      color: hackColor,
+      status: 'routing',
+      hackType,
+    };
+
+    set((state) => ({
+      activeHacks: {
+        ...state.activeHacks,
+        [hackId]: hack,
+      },
+    }));
+
+    return hackId;
+  },
+
+  // Start a hack from geographic positions (finds nearest network nodes)
+  startHackFromGeo: (sourceGeo, targetGeo, hackId, color, hackType) => {
+    const { nodes, connections, findNearestNode } = get();
+
+    console.log('[HackingStore] startHackFromGeo called', { sourceGeo, targetGeo, hackId, hackType });
+    console.log('[HackingStore] Network has', Object.keys(nodes).length, 'nodes and', Object.keys(connections).length, 'connections');
+
+    const sourceNode = findNearestNode(sourceGeo);
+    const targetNode = findNearestNode(targetGeo);
+
+    console.log('[HackingStore] Found nodes:', sourceNode?.id, '->', targetNode?.id);
+
+    if (!sourceNode || !targetNode) {
+      console.warn('[HackingStore] Could not find network nodes near positions');
+      return null;
+    }
+
+    // Find route
+    const route = findRoute(nodes, connections, sourceNode.id, targetNode.id);
+    if (!route) {
+      console.warn(`[HackingStore] No route found from ${sourceNode.id} to ${targetNode.id}`);
+      return null;
+    }
+
+    console.log('[HackingStore] Route found with', route.nodeIds.length, 'nodes:', route.nodeIds);
 
     // Pick color
     const hackColor = color || HACK_COLORS[hackColorIndex % HACK_COLORS.length];
@@ -106,6 +164,7 @@ export const useHackingStore = create<HackingStore>((set, get) => ({
       progress: 0,
       color: hackColor,
       status: 'routing',
+      hackType,
     };
 
     set((state) => ({
@@ -118,7 +177,17 @@ export const useHackingStore = create<HackingStore>((set, get) => ({
     return hackId;
   },
 
-  updateHackProgress: (hackId, progress) => {
+  // Add an existing hack trace directly
+  addActiveHack: (trace) => {
+    set((state) => ({
+      activeHacks: {
+        ...state.activeHacks,
+        [trace.id]: trace,
+      },
+    }));
+  },
+
+  updateHackProgress: (hackId, progress, traceProgress?: number) => {
     set((state) => {
       const hack = state.activeHacks[hackId];
       if (!hack) return state;
@@ -129,7 +198,8 @@ export const useHackingStore = create<HackingStore>((set, get) => ({
           [hackId]: {
             ...hack,
             progress: Math.max(0, Math.min(1, progress)),
-            status: progress >= 1 ? 'complete' : 'active',
+            traceProgress: traceProgress !== undefined ? Math.max(0, Math.min(1, traceProgress)) : hack.traceProgress,
+            status: progress >= 1 ? 'complete' : (traceProgress !== undefined && traceProgress >= 1) ? 'traced' : 'active',
           },
         },
       };
@@ -220,6 +290,30 @@ export const useHackingStore = create<HackingStore>((set, get) => ({
     startHack(sourceId, targetId);
   },
 
+  // Demo DDoS hack - picks random source and target, uses DDoS type (orange color)
+  startDemoDdosHack: () => {
+    const { nodes, startHack } = get();
+    const nodeIds = Object.keys(nodes);
+
+    if (nodeIds.length < 2) {
+      console.warn('Not enough nodes for demo DDoS hack');
+      return;
+    }
+
+    // Pick random source and target (ensure they're different)
+    const sourceIndex = Math.floor(Math.random() * nodeIds.length);
+    let targetIndex = Math.floor(Math.random() * nodeIds.length);
+    while (targetIndex === sourceIndex) {
+      targetIndex = Math.floor(Math.random() * nodeIds.length);
+    }
+
+    const sourceId = nodeIds[sourceIndex];
+    const targetId = nodeIds[targetIndex];
+
+    console.log(`Starting demo DDoS hack from ${sourceId} to ${targetId}`);
+    startHack(sourceId, targetId, undefined, 'ddos');
+  },
+
   clearAllHacks: () => {
     set({ activeHacks: {} });
   },
@@ -234,5 +328,21 @@ export const useHackingStore = create<HackingStore>((set, get) => ({
   getRouteForHack: (hackId) => {
     const hack = get().activeHacks[hackId];
     return hack?.route || null;
+  },
+
+  // Find nearest network node to a geographic position
+  findNearestNode: (geoPos) => {
+    const nodes = get().nodes;
+    let nearest: HackingNode | null = null;
+    let minDistance = Infinity;
+
+    for (const node of Object.values(nodes)) {
+      const dist = greatCircleDistance(node.position, geoPos);
+      if (dist < minDistance) {
+        minDistance = dist;
+        nearest = node;
+      }
+    }
+    return nearest;
   },
 }));

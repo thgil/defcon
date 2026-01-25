@@ -1983,14 +1983,41 @@ export class GameRoom {
     if (!connection) return;
 
     if (result.success && result.hack) {
-      const targetBuilding = getBuildings(this.state).find(b => b.id === targetId);
+      // Resolve target name based on target type
+      let targetName = 'Unknown';
+      if (targetId.startsWith('cable:')) {
+        // Cable target - get cable name from network state
+        const networkState = this.hackingSystem.getNetworkState();
+        const cableId = targetId.substring(6);
+        const cable = networkState.connections[cableId];
+        if (cable) {
+          const fromNode = networkState.nodes[cable.fromNodeId];
+          const toNode = networkState.nodes[cable.toNodeId];
+          targetName = `${fromNode?.name || 'Unknown'} ↔ ${toNode?.name || 'Unknown'}`;
+        }
+      } else if (targetId.startsWith('node:')) {
+        // Node target - get node name
+        const networkState = this.hackingSystem.getNetworkState();
+        const nodeId = targetId.substring(5);
+        const node = networkState.nodes[nodeId];
+        targetName = node?.name || 'Network Node';
+      } else if (targetId.startsWith('sat:')) {
+        // Satellite target
+        const satId = targetId.substring(4);
+        const satellite = this.state.satellites[satId];
+        targetName = satellite ? `Satellite ${satId.substring(0, 8)}` : 'Unknown Satellite';
+      } else {
+        // Building target
+        const targetBuilding = getBuildings(this.state).find(b => b.id === targetId);
+        targetName = targetBuilding?.id || 'Unknown';
+      }
 
       // Send hack_started with full info so client can initialize activeHack
       this.connectionManager.send(connection, {
         type: 'hack_started',
         hackId: result.hack.id,
         targetId: targetId,
-        targetName: targetBuilding?.id || 'Unknown',
+        targetName: targetName,
         hackType: hackType,
       });
 
