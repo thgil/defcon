@@ -30,6 +30,47 @@
 }
 
 /* ============================================
+   Mute Button
+   ============================================ */
+
+.mute-button {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 150;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: rgba(0, 20, 15, 0.7);
+  border: 1px solid rgba(0, 170, 102, 0.3);
+  color: #00aa66;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+  backdrop-filter: blur(4px);
+}
+
+.mute-button:hover {
+  background: rgba(0, 40, 30, 0.8);
+  border-color: rgba(0, 170, 102, 0.6);
+  transform: scale(1.05);
+}
+
+.mute-button:active {
+  transform: scale(0.95);
+}
+
+.mute-button svg {
+  opacity: 0.8;
+}
+
+.mute-button:hover svg {
+  opacity: 1;
+}
+
+/* ============================================
    Hero Section
    ============================================ */
 
