@@ -9,8 +9,12 @@ interface AppState {
   setPlayerName: (name: string) => void;
 }
 
+// Check for ?play URL parameter to skip landing page
+const urlParams = new URLSearchParams(window.location.search);
+const skipLanding = urlParams.has('play');
+
 export const useAppStore = create<AppState>((set) => ({
-  screen: 'landing',
+  screen: skipLanding ? 'menu' : 'landing',
   playerName: '',
   setScreen: (screen) => set({ screen }),
   setPlayerName: (playerName) => set({ playerName }),
