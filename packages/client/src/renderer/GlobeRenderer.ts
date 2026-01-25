@@ -354,6 +354,13 @@ export class GlobeRenderer {
   private hoverGeoPosition: GeoPosition | null = null;
   private placementPreviewGroup: THREE.Group;
 
+  // Missile trajectory preview (when silo selected)
+  private missilePreviewGroup: THREE.Group;
+  private missilePreviewLine: THREE.Line | null = null;
+  private missilePreviewTarget: THREE.Mesh | null = null;
+  private snappedTargetGeo: GeoPosition | null = null;
+  private snappedTargetId: string | null = null; // ID of snapped building/city
+
   // Camera tracking - for following missiles or centering on objects
   private trackedMissileId: string | null = null;
   // Linked target ICBM (auto-selected when clicking an interceptor with a target)
@@ -517,6 +524,7 @@ export class GlobeRenderer {
     this.satCommGroup = new THREE.Group();
     this.aircraftGroup = new THREE.Group();
     this.icbmTrackingGroup = new THREE.Group();
+    this.missilePreviewGroup = new THREE.Group();
 
     this.scene.add(this.territoryGroup);
     this.scene.add(this.coastlineGroup);
@@ -536,6 +544,7 @@ export class GlobeRenderer {
     this.scene.add(this.aircraftGroup);
     this.scene.add(this.hackingNetworkGroup);
     this.scene.add(this.icbmTrackingGroup);
+    this.scene.add(this.missilePreviewGroup);
 
     // Create starfield background
     this.createStarfield();
@@ -636,6 +645,11 @@ export class GlobeRenderer {
     if (building) {
       this.selectedSatelliteId = null;
     }
+    // Clear missile preview if not selecting a silo in ICBM mode
+    const isSiloInICBMMode = building?.type === 'silo' && (building as any).mode === 'icbm';
+    if (!isSiloInICBMMode) {
+      this.clearMissilePreview();
+    }
     if (this.gameState) {
       this.hudRenderer.updateState(this.gameState, this.playerId, building, this.placementMode);
     }
@@ -651,6 +665,16 @@ export class GlobeRenderer {
 
   setOnBuildingClick(callback: (building: Building | null) => void): void {
     this.onBuildingClickCallback = callback;
+  }
+
+  // Get the current missile target position (snapped if near a target, otherwise hover position)
+  getMissileTargetPosition(): GeoPosition | null {
+    return this.snappedTargetGeo || this.hoverGeoPosition;
+  }
+
+  // Get the snapped target ID (building ID or city name)
+  getSnappedTargetId(): string | null {
+    return this.snappedTargetId;
   }
 
   setOnModeChange(callback: (siloId: string, mode: SiloMode) => void): void {
@@ -1349,6 +1373,154 @@ export class GlobeRenderer {
     }
   }
 
+  private clearMissilePreview(): void {
+    if (this.missilePreviewLine) {
+      this.missilePreviewGroup.remove(this.missilePreviewLine);
+      this.missilePreviewLine.geometry.dispose();
+      (this.missilePreviewLine.material as THREE.Material).dispose();
+      this.missilePreviewLine = null;
+    }
+    if (this.missilePreviewTarget) {
+      this.missilePreviewGroup.remove(this.missilePreviewTarget);
+      this.missilePreviewTarget.geometry.dispose();
+      (this.missilePreviewTarget.material as THREE.Material).dispose();
+      this.missilePreviewTarget = null;
+    }
+    this.snappedTargetGeo = null;
+    this.snappedTargetId = null;
+  }
+
+  private findNearbyTarget(hoverGeo: GeoPosition): { geo: GeoPosition; id: string | null } | null {
+    const SNAP_DISTANCE_DEG = 3; // Snap within ~3 degrees
+
+    // Helper to calculate distance between two geo positions
+    const geoDistance = (a: GeoPosition, b: GeoPosition): number => {
+      const dLat = a.lat - b.lat;
+      let dLng = a.lng - b.lng;
+      // Handle wrap-around
+      if (dLng > 180) dLng -= 360;
+      if (dLng < -180) dLng += 360;
+      return Math.sqrt(dLat * dLat + dLng * dLng);
+    };
+
+    let closest: { geo: GeoPosition; id: string | null; dist: number } | null = null;
+
+    // Check enemy buildings (silos, radars, airfields)
+    if (this.gameState) {
+      const buildings = getBuildings(this.gameState);
+      for (const building of buildings) {
+        // Only target enemy buildings
+        if (building.ownerId === this.playerId) continue;
+
+        const buildingGeo = building.geoPosition;
+        if (!buildingGeo) continue;
+
+        const dist = geoDistance(hoverGeo, buildingGeo);
+        if (dist < SNAP_DISTANCE_DEG && (!closest || dist < closest.dist)) {
+          closest = { geo: buildingGeo, id: building.id, dist };
+        }
+      }
+
+      // Check enemy cities
+      const players = Object.values(this.gameState.players);
+      for (const player of players) {
+        if (player.id === this.playerId) continue; // Skip own cities
+
+        const territoryId = player.territoryId;
+        if (!territoryId) continue;
+        const cities = CITY_GEO_DATA[territoryId];
+        if (!cities) continue;
+
+        for (const city of cities) {
+          const dist = geoDistance(hoverGeo, city.position);
+          if (dist < SNAP_DISTANCE_DEG && (!closest || dist < closest.dist)) {
+            closest = { geo: city.position, id: `city:${city.name}`, dist };
+          }
+        }
+      }
+    }
+
+    return closest ? { geo: closest.geo, id: closest.id } : null;
+  }
+
+  private updateMissilePreview(silo: Building, targetGeo: GeoPosition): void {
+    const siloGeo = silo.geoPosition;
+    if (!siloGeo) return;
+
+    // Check for snap target
+    const snapTarget = this.findNearbyTarget(targetGeo);
+    const finalTargetGeo = snapTarget ? snapTarget.geo : targetGeo;
+    this.snappedTargetGeo = snapTarget ? snapTarget.geo : null;
+    this.snappedTargetId = snapTarget ? snapTarget.id : null;
+
+    // Calculate trajectory points
+    const maxAltitude = calculateMissileAltitude(siloGeo, finalTargetGeo);
+    const points: THREE.Vector3[] = [];
+    const numPoints = 50;
+
+    for (let i = 0; i <= numPoints; i++) {
+      const progress = i / numPoints;
+      const pos3d = getMissilePosition3D(
+        siloGeo,
+        finalTargetGeo,
+        progress,
+        maxAltitude,
+        GLOBE_RADIUS
+      );
+      points.push(new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z));
+    }
+
+    // Update or create trajectory line
+    if (this.missilePreviewLine) {
+      this.missilePreviewLine.geometry.dispose();
+      this.missilePreviewLine.geometry = new THREE.BufferGeometry().setFromPoints(points);
+    } else {
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const material = new THREE.LineDashedMaterial({
+        color: snapTarget ? 0xff4444 : 0xffaa00, // Red if snapped to target, orange otherwise
+        transparent: true,
+        opacity: 0.7,
+        dashSize: 3,
+        gapSize: 2,
+      });
+      this.missilePreviewLine = new THREE.Line(geometry, material);
+      this.missilePreviewLine.computeLineDistances();
+      this.missilePreviewGroup.add(this.missilePreviewLine);
+    }
+
+    // Update line color based on snap state
+    const lineMat = this.missilePreviewLine.material as THREE.LineDashedMaterial;
+    lineMat.color.setHex(snapTarget ? 0xff4444 : 0xffaa00);
+    this.missilePreviewLine.computeLineDistances();
+
+    // Update or create target marker
+    const targetPos3d = geoToSphere(finalTargetGeo, GLOBE_RADIUS + 1);
+    const targetVec = new THREE.Vector3(targetPos3d.x, targetPos3d.y, targetPos3d.z);
+
+    if (this.missilePreviewTarget) {
+      this.missilePreviewTarget.position.copy(targetVec);
+      // Update color
+      const mat = this.missilePreviewTarget.material as THREE.MeshBasicMaterial;
+      mat.color.setHex(snapTarget ? 0xff4444 : 0xffaa00);
+    } else {
+      const markerGeom = new THREE.RingGeometry(2, 3, 16);
+      const markerMat = new THREE.MeshBasicMaterial({
+        color: snapTarget ? 0xff4444 : 0xffaa00,
+        transparent: true,
+        opacity: 0.8,
+        side: THREE.DoubleSide,
+      });
+      this.missilePreviewTarget = new THREE.Mesh(markerGeom, markerMat);
+      this.missilePreviewTarget.position.copy(targetVec);
+      // Orient to face outward from globe
+      this.missilePreviewTarget.lookAt(0, 0, 0);
+      this.missilePreviewGroup.add(this.missilePreviewTarget);
+    }
+
+    // Reorient target marker
+    this.missilePreviewTarget.lookAt(0, 0, 0);
+  }
+
   private updatePlacementPreview(): void {
     if (!this.placementMode || !this.hoverGeoPosition) {
       this.clearPlacementPreview();
@@ -1427,7 +1599,17 @@ export class GlobeRenderer {
   }
 
   private handleMouseMove = (event: MouseEvent): void => {
-    if (!this.placementMode) return;
+    // Check if we need to track mouse - either for placement mode or silo targeting
+    const isSiloInICBMMode = this.selectedBuilding?.type === 'silo' &&
+      (this.selectedBuilding as any).mode === 'icbm';
+
+    if (!this.placementMode && !isSiloInICBMMode) {
+      // Clear preview if we were showing one
+      if (this.missilePreviewLine) {
+        this.clearMissilePreview();
+      }
+      return;
+    }
 
     const rect = this.renderer.domElement.getBoundingClientRect();
     this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
@@ -1439,10 +1621,22 @@ export class GlobeRenderer {
     if (intersects.length > 0) {
       const point = intersects[0].point;
       this.hoverGeoPosition = this.spherePointToGeo(point);
-      this.updatePlacementPreview();
+
+      if (this.placementMode) {
+        this.updatePlacementPreview();
+      }
+
+      if (isSiloInICBMMode && this.selectedBuilding) {
+        this.updateMissilePreview(this.selectedBuilding, this.hoverGeoPosition);
+      }
     } else {
       this.hoverGeoPosition = null;
-      this.clearPlacementPreview();
+      if (this.placementMode) {
+        this.clearPlacementPreview();
+      }
+      if (isSiloInICBMMode) {
+        this.clearMissilePreview();
+      }
     }
   };
 
