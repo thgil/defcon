@@ -1183,11 +1183,12 @@ export class GlobeRenderer {
     hintCtx.font = '56px "Courier New", monospace';
     hintCtx.textAlign = 'center';
     hintCtx.textBaseline = 'middle';
-    hintCtx.fillStyle = '#00aa66';
-    hintCtx.fillText('▼', hintCanvas.width / 2, 60);
     hintCtx.font = '42px "Courier New", monospace';
     hintCtx.fillStyle = '#446655';
-    hintCtx.fillText('SCROLL TO INITIATE', hintCanvas.width / 2, 160);
+    hintCtx.fillText('SCROLL TO INITIATE', hintCanvas.width / 2, 90);
+    hintCtx.font = '56px "Courier New", monospace';
+    hintCtx.fillStyle = '#00aa66';
+    hintCtx.fillText('▼', hintCanvas.width / 2, 190);
 
     const hintTexture = new THREE.CanvasTexture(hintCanvas);
     const hintMaterial = new THREE.MeshBasicMaterial({
