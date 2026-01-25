@@ -44,6 +44,8 @@ export function DemoGlobeContainer({ scrollState }: DemoGlobeContainerProps) {
 
   // Demo hack progress animation
   const hackAnimationRef = useRef<number | null>(null);
+  // Track pending timeouts for cleanup
+  const pendingTimeoutsRef = useRef<ReturnType<typeof setTimeout>[]>([]);
   // Track if we've already started the one-time DDoS hack
   const ddosHackStartedRef = useRef(false);
 
@@ -271,15 +273,26 @@ export function DemoGlobeContainer({ scrollState }: DemoGlobeContainerProps) {
       // Also force network visible directly on renderer (store propagation may not work in demo mode)
       rendererRef.current?.forceNetworkVisible(true);
 
+      // Clear any pending timeouts from previous visits
+      pendingTimeoutsRef.current.forEach(clearTimeout);
+      pendingTimeoutsRef.current = [];
+
+      // Helper to track timeouts for cleanup
+      const scheduleTimeout = (fn: () => void, delay: number) => {
+        const id = setTimeout(fn, delay);
+        pendingTimeoutsRef.current.push(id);
+        return id;
+      };
+
       // Start 2-3 regular demo hacks
       startDemoHack();
-      setTimeout(() => startDemoHack(), 300);
-      setTimeout(() => startDemoHack(), 600);
+      scheduleTimeout(() => startDemoHack(), 300);
+      scheduleTimeout(() => startDemoHack(), 600);
 
       // Start exactly one DDoS hack (only once ever across all visits to this section)
       if (!ddosHackStartedRef.current) {
         ddosHackStartedRef.current = true;
-        setTimeout(() => startDemoDdosHack(), 150);
+        scheduleTimeout(() => startDemoDdosHack(), 150);
       }
 
       // Track if component is still mounted to prevent state updates after unmount
@@ -304,14 +317,14 @@ export function DemoGlobeContainer({ scrollState }: DemoGlobeContainerProps) {
             // Remove completed hack
             removeHack(hack.id);
             // Only restart regular hacks, never restart DDoS
-            if (hack.hackType !== 'ddos' && regularHacks.length <= 3) {
-              setTimeout(() => startDemoHack(), 500);
+            if (hack.hackType !== 'ddos' && regularHacks.length <= 3 && isMounted) {
+              scheduleTimeout(() => startDemoHack(), 500);
             }
           }
         }
 
         // Ensure we always have at least 2 regular hacks running (DDoS is separate)
-        if (regularHacks.length < 2) {
+        if (regularHacks.length < 2 && isMounted) {
           startDemoHack();
         }
 
@@ -321,9 +334,11 @@ export function DemoGlobeContainer({ scrollState }: DemoGlobeContainerProps) {
       // Start animation
       hackAnimationRef.current = requestAnimationFrame(animateHacks);
 
-      // Cleanup: mark unmounted before cancelling RAF
+      // Cleanup: clear timeouts and cancel RAF
       return () => {
         isMounted = false;
+        pendingTimeoutsRef.current.forEach(clearTimeout);
+        pendingTimeoutsRef.current = [];
         if (hackAnimationRef.current) {
           cancelAnimationFrame(hackAnimationRef.current);
           hackAnimationRef.current = null;
@@ -333,7 +348,9 @@ export function DemoGlobeContainer({ scrollState }: DemoGlobeContainerProps) {
       setNetworkVisible(false);
       rendererRef.current?.forceNetworkVisible(false);
 
-      // Stop hack animation
+      // Clear pending timeouts and stop hack animation
+      pendingTimeoutsRef.current.forEach(clearTimeout);
+      pendingTimeoutsRef.current = [];
       if (hackAnimationRef.current) {
         cancelAnimationFrame(hackAnimationRef.current);
         hackAnimationRef.current = null;

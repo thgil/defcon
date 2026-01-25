@@ -204,15 +204,15 @@ export class DemoSimulator {
     // AI attack logic (use game time for AI timing)
     this.updateAIAttacks(gameTime);
 
-    // AI defense logic
-    this.updateAIDefense(gameTime);
+    // AI defense logic (currently disabled - interceptors causing issues)
+    // this.updateAIDefense(gameTime);
   }
 
   /**
    * Update missile positions and check for impacts/interceptions
    */
   private updateMissiles(deltaMs: number, gameTime: number): void {
-    const missilesToRemove: string[] = [];
+    const missilesToRemove = new Set<string>();
 
     // First pass: update ICBM positions
     for (const missile of Object.values(this.gameState.missiles)) {
@@ -237,7 +237,7 @@ export class DemoSimulator {
       if (missile.progress >= 1 && !missile.intercepted && !missile.detonated) {
         missile.detonated = true;
         this.handleMissileImpact(missile);
-        missilesToRemove.push(missile.id);
+        missilesToRemove.add(missile.id);
       }
     }
 
@@ -251,9 +251,8 @@ export class DemoSimulator {
 
       // If target no longer exists or is already destroyed, remove this interceptor immediately
       if (!targetIcbm || targetIcbm.intercepted || targetIcbm.detonated) {
-        console.log(`[DEMO] Orphan cleanup: interceptor ${missile.id.split('-')[1]?.substring(0,8)} - target ${missile.targetId?.split('-')[1]?.substring(0,8) || 'none'} gone`);
         missile.detonated = true;
-        missilesToRemove.push(missile.id);
+        missilesToRemove.add(missile.id);
         continue;
       }
 
@@ -282,7 +281,8 @@ export class DemoSimulator {
         if (distToTarget < 2 && missile.progress > 0.2) {
           targetIcbm.intercepted = true;
           missile.detonated = true;
-          missilesToRemove.push(targetIcbm.id, missile.id);
+          missilesToRemove.add(targetIcbm.id);
+          missilesToRemove.add(missile.id);
         }
       }
 
@@ -291,7 +291,7 @@ export class DemoSimulator {
       const flightTime = gameTime - missile.launchTime;
       if (flightTime > missile.flightDuration * 1.5 && !missile.detonated) {
         missile.detonated = true;
-        missilesToRemove.push(missile.id);
+        missilesToRemove.add(missile.id);
       }
     }
 
@@ -467,8 +467,6 @@ export class DemoSimulator {
     this.gameState.missiles[missileId] = missile;
     this.missileSeeds.set(missileId, Math.random() * 10000);
 
-    console.log(`[DEMO] Launched ICBM ${missileId.split('-')[1]?.substring(0,8)}, dist=${angularDistance.toFixed(1)}°, flight=${(flightDuration/1000).toFixed(1)}s`);
-
     // Decrement silo ammo
     silo.missileCount--;
     silo.lastFireTime = this.gameTimeElapsed;
@@ -582,7 +580,6 @@ export class DemoSimulator {
     // Verify target still exists and is valid before launching
     const currentTarget = this.gameState.missiles[targetMissile.id];
     if (!currentTarget || currentTarget.intercepted || currentTarget.detonated) {
-      console.log(`[DEMO] Rejected launch - target ${targetMissile.id.split('-')[1]?.substring(0,8)} invalid: exists=${!!currentTarget}, intercepted=${currentTarget?.intercepted}, detonated=${currentTarget?.detonated}`);
       return; // Target no longer valid, don't launch
     }
 
@@ -622,8 +619,6 @@ export class DemoSimulator {
 
     this.gameState.missiles[interceptorId] = interceptor;
     this.missileSeeds.set(interceptorId, Math.random() * 10000);
-
-    console.log(`[DEMO] Launched interceptor at ICBM ${targetMissile.id.split('-')[1]?.substring(0,8)}, progress=${targetMissile.progress.toFixed(2)}, dist=${angularDistance.toFixed(1)}°, flight=${(flightDuration/1000).toFixed(1)}s`);
 
     // Decrement silo ammo
     silo.airDefenseAmmo--;
