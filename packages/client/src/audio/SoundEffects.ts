@@ -30,16 +30,17 @@ class SoundEffectsManager {
         this.audioContext = new AudioContext();
         this.preloadSounds();
       }
-      document.removeEventListener('click', initAudio);
-      document.removeEventListener('keydown', initAudio);
-      document.removeEventListener('wheel', initAudio);
-      document.removeEventListener('touchstart', initAudio);
+      document.removeEventListener('click', initAudio, { capture: true });
+      document.removeEventListener('keydown', initAudio, { capture: true });
+      document.removeEventListener('wheel', initAudio, { capture: true });
+      document.removeEventListener('touchstart', initAudio, { capture: true });
     };
 
-    document.addEventListener('click', initAudio);
-    document.addEventListener('keydown', initAudio);
-    document.addEventListener('wheel', initAudio, { passive: true });
-    document.addEventListener('touchstart', initAudio, { passive: true });
+    // Use capture phase to catch events before scroll container intercepts them
+    document.addEventListener('click', initAudio, { capture: true });
+    document.addEventListener('keydown', initAudio, { capture: true });
+    document.addEventListener('wheel', initAudio, { capture: true, passive: true });
+    document.addEventListener('touchstart', initAudio, { capture: true, passive: true });
   }
 
   private async preloadSounds() {
