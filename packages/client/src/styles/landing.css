@@ -590,7 +590,8 @@
     left: 1rem !important;
     right: 1rem !important;
     top: auto;
-    bottom: 10%;
+    /* Use fixed value instead of % to prevent jumping when mobile browser chrome shows/hides */
+    bottom: calc(80px + env(safe-area-inset-bottom, 0px));
     transform: none;
   }
 
@@ -630,7 +631,8 @@
   }
 
   .cta-section {
-    bottom: 5%;
+    /* Use fixed value instead of % to prevent jumping when mobile browser chrome shows/hides */
+    bottom: calc(40px + env(safe-area-inset-bottom, 0px));
     width: calc(100% - 2rem);
     padding: 0 1rem;
   }

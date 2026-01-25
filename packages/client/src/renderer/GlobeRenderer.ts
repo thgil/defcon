@@ -443,6 +443,9 @@ export class GlobeRenderer {
     currentLat: 25,
     currentLng: -90,
     currentDistance: 550,
+    lookAtX: 0,
+    lookAtY: 0,
+    lookAtZ: 0,
   };
   // Persistent missile tracking for demo mode (avoids switching missiles mid-flight)
   private demoTrackedMissileId: string | null = null;
@@ -7638,25 +7641,19 @@ export class GlobeRenderer {
             const newMissileId = this.getActiveMissileIdForDemo();
             if (newMissileId !== this.demoTrackedMissileId) {
               this.demoTrackedMissileId = newMissileId;
-              this.demoMissileSelectedTime = now; // Track when we selected this missile
+              this.demoMissileSelectedTime = now;
             }
             currentMissile = newMissileId ? missiles.find(m => m.id === newMissileId) : null;
           }
 
-          // Track the current missile's position
+          // Track the current missile's live position - lerp handles smoothing
           if (currentMissile && !currentMissile.detonated && !currentMissile.intercepted) {
             const missile3DPos = this.getMissile3DPositionForTracking(currentMissile);
             if (missile3DPos && missile3DPos.length() > GLOBE_RADIUS * 0.5) {
-              // Convert 3D position to lat/lng for spherical interpolation
               const missileGeo = sphereToGeo(missile3DPos, GLOBE_RADIUS);
               targetLat = missileGeo.lat;
               targetLng = missileGeo.lng;
-              // Delay lookAt for 500ms after selection to let camera position lerp first
-              // This prevents the camera from snapping its rotation before moving
-              const timeSinceSelection = now - this.demoMissileSelectedTime;
-              if (timeSinceSelection > 500) {
-                lookAtTarget = missile3DPos; // Look at the missile itself
-              }
+              lookAtTarget = missile3DPos;
             }
           }
         } else if (targets.trackType === 'satellite' && this.gameState) {
@@ -7725,17 +7722,28 @@ export class GlobeRenderer {
 
         this.camera.position.set(cameraX, cameraY, cameraZ);
 
-        // Determine what to look at
+        // Determine what to look at - lerp the lookAt target for smooth rotation
+        let targetLookAtX = 0;
+        let targetLookAtY = 0;
+        let targetLookAtZ = 0;
+
         if (lookAtTarget) {
           // Look at the tracked object (missile or satellite)
-          this.camera.lookAt(lookAtTarget);
+          targetLookAtX = lookAtTarget.x;
+          targetLookAtY = lookAtTarget.y;
+          targetLookAtZ = lookAtTarget.z;
         } else if (targets.verticalOffset > 1) {
           // Look above globe center for hero section (globe appears lower on screen)
-          this.camera.lookAt(0, targets.verticalOffset, 0);
-        } else {
-          // Look at globe center
-          this.camera.lookAt(0, 0, 0);
+          targetLookAtY = targets.verticalOffset;
         }
+        // else: look at globe center (0, 0, 0)
+
+        // Lerp lookAt position for smooth rotation transitions
+        state.lookAtX += (targetLookAtX - state.lookAtX) * lerp;
+        state.lookAtY += (targetLookAtY - state.lookAtY) * lerp;
+        state.lookAtZ += (targetLookAtZ - state.lookAtZ) * lerp;
+
+        this.camera.lookAt(state.lookAtX, state.lookAtY, state.lookAtZ);
 
         // Force radar visible if set
         if (this.forceRadarVisible) {
