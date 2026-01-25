@@ -1173,31 +1173,6 @@ export class GlobeRenderer {
     subtitleMesh.position.set(0, -55, 0);
     this.heroTextGroup.add(subtitleMesh);
 
-    // Create warning tagline - more ominous
-    const taglineCanvas = document.createElement('canvas');
-    const taglineCtx = taglineCanvas.getContext('2d')!;
-    taglineCanvas.width = 2048;
-    taglineCanvas.height = 128;
-
-    taglineCtx.clearRect(0, 0, taglineCanvas.width, taglineCanvas.height);
-    taglineCtx.font = '36px "Courier New", monospace';
-    taglineCtx.textAlign = 'center';
-    taglineCtx.textBaseline = 'middle';
-    taglineCtx.fillStyle = '#ff4444';
-    taglineCtx.fillText('« EVERYBODY DIES »', taglineCanvas.width / 2, taglineCanvas.height / 2);
-
-    const taglineTexture = new THREE.CanvasTexture(taglineCanvas);
-    const taglineMaterial = new THREE.MeshBasicMaterial({
-      map: taglineTexture,
-      transparent: true,
-      side: THREE.DoubleSide,
-      depthWrite: true,
-    });
-    const taglineGeometry = new THREE.PlaneGeometry(140, 10);
-    const taglineMesh = new THREE.Mesh(taglineGeometry, taglineMaterial);
-    taglineMesh.position.set(0, -78, 0);
-    this.heroTextGroup.add(taglineMesh);
-
     // Create scroll hint - subtle
     const hintCanvas = document.createElement('canvas');
     const hintCtx = hintCanvas.getContext('2d')!;
@@ -1223,7 +1198,7 @@ export class GlobeRenderer {
     });
     const hintGeometry = new THREE.PlaneGeometry(50, 12);
     const hintMesh = new THREE.Mesh(hintGeometry, hintMaterial);
-    hintMesh.position.set(0, -115, 0);
+    hintMesh.position.set(0, -78, 0);
     this.heroTextGroup.add(hintMesh);
 
     // Position the text above and in front of globe (2.5 radii up)
