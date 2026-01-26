@@ -145,12 +145,10 @@ export function useScrollController({
 
   // Animation state for scroll hijacking
   const [isAnimating, setIsAnimating] = useState(false);
-  const isAnimatingRef = useRef(false); // Ref version to avoid stale closures
   const animationRef = useRef<number | null>(null);
   const touchStartY = useRef<number>(0);
   const currentSectionIndexRef = useRef(0); // Track current section for handlers
-  const isLockedRef = useRef(false); // Lock during animation + cooldown
-  const cooldownTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastNavigationTime = useRef(0); // Timestamp debounce — simple and reliable
 
   const lastSectionRef = useRef<string | null>(null);
   const rafIdRef = useRef<number | null>(null);
@@ -261,13 +259,7 @@ export function useScrollController({
     if (!container) return;
 
     setIsAnimating(true);
-    isAnimatingRef.current = true;
-    isLockedRef.current = true; // Lock to prevent further changes
-
-    // Clear any existing cooldown
-    if (cooldownTimeoutRef.current) {
-      clearTimeout(cooldownTimeoutRef.current);
-    }
+    lastNavigationTime.current = performance.now();
 
     const startScrollTop = container.scrollTop;
     const distance = targetScrollTop - startScrollTop;
@@ -284,13 +276,7 @@ export function useScrollController({
         animationRef.current = requestAnimationFrame(animate);
       } else {
         setIsAnimating(false);
-        isAnimatingRef.current = false;
         animationRef.current = null;
-
-        // Keep locked for additional cooldown to absorb momentum events
-        cooldownTimeoutRef.current = setTimeout(() => {
-          isLockedRef.current = false;
-        }, 500); // Extra 500ms after animation
       }
     };
 
@@ -324,50 +310,25 @@ export function useScrollController({
     }
   }, [animateToSection]);
 
-  // Accumulated wheel delta for threshold-based navigation
-  const wheelDeltaAccumRef = useRef(0);
-  const wheelResetTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
   // Wheel handler - navigates between sections
-  // Uses delta accumulation to filter out trackpad momentum
+  // Simple debounce: ignore wheel events for 800ms after a navigation
   const handleWheel = useCallback((e: WheelEvent) => {
     e.preventDefault();
 
-    // If we're animating or in cooldown, ignore all wheel events
-    if (isAnimatingRef.current) return;
-    if (isLockedRef.current) return;
+    const now = performance.now();
+    if (now - lastNavigationTime.current < 800) return;
 
-    // Accumulate wheel delta
-    wheelDeltaAccumRef.current += e.deltaY;
+    // Require a minimum delta to filter out tiny trackpad ticks
+    if (Math.abs(e.deltaY) < 15) return;
 
-    // Reset accumulator after a pause in scrolling
-    if (wheelResetTimeoutRef.current) {
-      clearTimeout(wheelResetTimeoutRef.current);
-    }
-    wheelResetTimeoutRef.current = setTimeout(() => {
-      wheelDeltaAccumRef.current = 0;
-    }, 150);
-
-    // Require significant accumulated delta before triggering navigation
-    // This filters out small momentum events
-    const threshold = 50;
-    if (Math.abs(wheelDeltaAccumRef.current) < threshold) {
-      return;
-    }
-
-    const direction = wheelDeltaAccumRef.current > 0 ? 1 : -1;
+    const direction = e.deltaY > 0 ? 1 : -1;
     const currentSectionIdx = currentSectionIndexRef.current;
 
-    // Reset accumulator after triggering
-    wheelDeltaAccumRef.current = 0;
-
     if (direction > 0) {
-      // Scrolling DOWN - go to next section
       if (currentSectionIdx < LANDING_SECTIONS.length - 1) {
         animateToSection(currentSectionIdx + 1);
       }
     } else {
-      // Scrolling UP - go to previous section
       if (currentSectionIdx > 0) {
         animateToSection(currentSectionIdx - 1);
       }
@@ -380,8 +341,8 @@ export function useScrollController({
   }, []);
 
   const handleTouchEnd = useCallback((e: TouchEvent) => {
-    if (isAnimatingRef.current) return;
-    if (isLockedRef.current) return;
+    const now = performance.now();
+    if (now - lastNavigationTime.current < 800) return;
 
     const deltaY = touchStartY.current - e.changedTouches[0].clientY;
     const threshold = 50; // minimum swipe distance in pixels
@@ -401,6 +362,26 @@ export function useScrollController({
           animateToSection(currentSectionIdx - 1);
         }
       }
+    }
+  }, [animateToSection]);
+
+  // Keyboard handler — Space/ArrowDown = next, Shift+Space/ArrowUp = prev
+  const handleKeyDown = useCallback((e: KeyboardEvent) => {
+    const now = performance.now();
+    if (now - lastNavigationTime.current < 800) return;
+
+    if (e.key === ' ' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      const idx = currentSectionIndexRef.current;
+      if (e.shiftKey && e.key === ' ') {
+        if (idx > 0) animateToSection(idx - 1);
+      } else {
+        if (idx < LANDING_SECTIONS.length - 1) animateToSection(idx + 1);
+      }
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      const idx = currentSectionIndexRef.current;
+      if (idx > 0) animateToSection(idx - 1);
     }
   }, [animateToSection]);
 
@@ -424,6 +405,9 @@ export function useScrollController({
     // (container is transparent and might not receive events directly)
     window.addEventListener('wheel', handleWheel, { passive: false });
 
+    // Keyboard navigation
+    window.addEventListener('keydown', handleKeyDown);
+
     // Touch handlers on window for mobile
     window.addEventListener('touchstart', handleTouchStart, { passive: true });
     window.addEventListener('touchend', handleTouchEnd, { passive: true });
@@ -443,6 +427,7 @@ export function useScrollController({
 
     return () => {
       window.removeEventListener('wheel', handleWheel);
+      window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('touchstart', handleTouchStart);
       window.removeEventListener('touchend', handleTouchEnd);
       container.removeEventListener('scroll', handleScroll);
@@ -456,14 +441,8 @@ export function useScrollController({
       if (animationRef.current !== null) {
         cancelAnimationFrame(animationRef.current);
       }
-      if (cooldownTimeoutRef.current !== null) {
-        clearTimeout(cooldownTimeoutRef.current);
-      }
-      if (wheelResetTimeoutRef.current !== null) {
-        clearTimeout(wheelResetTimeoutRef.current);
-      }
     };
-  }, [containerRef, calculateScrollState, handleWheel, handleTouchStart, handleTouchEnd]);
+  }, [containerRef, calculateScrollState, handleWheel, handleKeyDown, handleTouchStart, handleTouchEnd]);
 
   return {
     scrollState,

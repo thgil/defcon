@@ -177,7 +177,8 @@ export class DemoSimulator {
     if (!this.running) return;
 
     const now = performance.now();
-    const realDeltaMs = now - this.lastTime;
+    // Cap delta to 100ms to prevent time-bomb when returning from a background tab
+    const realDeltaMs = Math.min(now - this.lastTime, 100);
     this.lastTime = now;
 
     // Update game speed based on elapsed real time

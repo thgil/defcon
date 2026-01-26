@@ -460,6 +460,11 @@ export class GlobeRenderer {
     lastGlitchTime: number;
     isGlitching: boolean;
     glitchEndTime: number;
+    // Title (DEFCON) glitch — runs constantly
+    titleCanvas: HTMLCanvasElement | null;
+    titleCtx: CanvasRenderingContext2D | null;
+    titleTexture: THREE.CanvasTexture | null;
+    lastTitleGlitchFrame: number;
   } = {
     subtitleCanvas: null,
     subtitleCtx: null,
@@ -468,6 +473,10 @@ export class GlobeRenderer {
     lastGlitchTime: 0,
     isGlitching: false,
     glitchEndTime: 0,
+    titleCanvas: null,
+    titleCtx: null,
+    titleTexture: null,
+    lastTitleGlitchFrame: 0,
   };
 
   // Demo camera mode (for landing page smooth scroll-driven camera)
@@ -1186,26 +1195,14 @@ export class GlobeRenderer {
     titleCanvas.width = 2048;
     titleCanvas.height = 512;
 
-    titleCtx.clearRect(0, 0, titleCanvas.width, titleCanvas.height);
+    // Store for glitch updates
+    this.heroGlitchState.titleCanvas = titleCanvas;
+    this.heroGlitchState.titleCtx = titleCtx;
 
-    // Clean, stark typography - like the original DEFCON game
-    titleCtx.font = '900 280px "Helvetica Neue", "Arial", sans-serif';
-    titleCtx.textAlign = 'center';
-    titleCtx.textBaseline = 'middle';
-
-    // Subtle outer glow - understated
-    titleCtx.shadowColor = 'rgba(255, 255, 255, 0.15)';
-    titleCtx.shadowBlur = 60;
-    titleCtx.fillStyle = '#ffffff';
-    titleCtx.fillText('DEFCON', titleCanvas.width / 2, titleCanvas.height / 2);
-
-    // Main text - clean white with slight transparency
-    titleCtx.shadowColor = 'rgba(255, 255, 255, 0.3)';
-    titleCtx.shadowBlur = 8;
-    titleCtx.fillStyle = 'rgba(255, 255, 255, 0.95)';
-    titleCtx.fillText('DEFCON', titleCanvas.width / 2, titleCanvas.height / 2);
+    this.drawTitleText(titleCtx, titleCanvas, 'DEFCON');
 
     const titleTexture = new THREE.CanvasTexture(titleCanvas);
+    this.heroGlitchState.titleTexture = titleTexture;
     titleTexture.needsUpdate = true;
     const titleMaterial = new THREE.MeshBasicMaterial({
       map: titleTexture,
@@ -1280,6 +1277,42 @@ export class GlobeRenderer {
   }
 
   /**
+   * Draw title text "DEFCON" (used for normal and glitched states)
+   */
+  private drawTitleText(ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement, text: string, glitchOffset: number = 0): void {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    ctx.font = '900 280px "Helvetica Neue", "Arial", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    const cx = canvas.width / 2;
+    const cy = canvas.height / 2;
+
+    // Chromatic aberration during glitch
+    if (glitchOffset > 0) {
+      ctx.shadowColor = 'transparent';
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = 'rgba(255, 0, 0, 0.6)';
+      ctx.fillText(text, cx - glitchOffset, cy);
+      ctx.fillStyle = 'rgba(0, 255, 255, 0.6)';
+      ctx.fillText(text, cx + glitchOffset, cy);
+    }
+
+    // Subtle outer glow
+    ctx.shadowColor = 'rgba(255, 255, 255, 0.15)';
+    ctx.shadowBlur = 60;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(text, cx, cy);
+
+    // Main text
+    ctx.shadowColor = 'rgba(255, 255, 255, 0.3)';
+    ctx.shadowBlur = 8;
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+    ctx.fillText(text, cx, cy);
+  }
+
+  /**
    * Draw subtitle text (used for normal and glitched states)
    */
   private drawSubtitleText(ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement, text: string, glitchOffset: number = 0): void {
@@ -1321,10 +1354,40 @@ export class GlobeRenderer {
    * Update hero text glitch effect - call from render loop
    */
   updateHeroGlitch(): void {
-    if (!this.heroGlitchState.subtitleCtx || !this.heroGlitchState.subtitleCanvas || !this.heroGlitchState.subtitleTexture) return;
-
     const now = performance.now();
     const glitchChars = '!@#$%^&*()_+-=[]{}|;:,.<>?/\\~`░▒▓█▀▄■□●○◆◇';
+
+    // --- Constant DEFCON title glitch (runs every ~80ms) ---
+    if (this.heroGlitchState.titleCtx && this.heroGlitchState.titleCanvas && this.heroGlitchState.titleTexture) {
+      if (now - this.heroGlitchState.lastTitleGlitchFrame > 80) {
+        this.heroGlitchState.lastTitleGlitchFrame = now;
+
+        const original = 'DEFCON';
+        let glitched = '';
+        // Low intensity: scramble 1-2 chars most of the time
+        const intensity = 0.12 + Math.random() * 0.1;
+        for (let i = 0; i < original.length; i++) {
+          if (Math.random() < intensity) {
+            glitched += glitchChars[Math.floor(Math.random() * glitchChars.length)];
+          } else {
+            glitched += original[i];
+          }
+        }
+
+        // Subtle constant chromatic aberration
+        const chromaOffset = 1 + Math.random() * 3;
+        this.drawTitleText(
+          this.heroGlitchState.titleCtx,
+          this.heroGlitchState.titleCanvas,
+          glitched,
+          chromaOffset,
+        );
+        this.heroGlitchState.titleTexture.needsUpdate = true;
+      }
+    }
+
+    // --- Subtitle glitch (intermittent) ---
+    if (!this.heroGlitchState.subtitleCtx || !this.heroGlitchState.subtitleCanvas || !this.heroGlitchState.subtitleTexture) return;
 
     // Check if we should start a new glitch - more frequent for visibility
     if (!this.heroGlitchState.isGlitching && now - this.heroGlitchState.lastGlitchTime > 1500 + Math.random() * 2000) {
