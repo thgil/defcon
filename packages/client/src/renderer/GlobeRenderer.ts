@@ -18,6 +18,8 @@ import {
   type Satellite,
   type SatelliteLaunchFacility,
   type Airfield,
+  type FalloutCloud,
+  type GameSpeed,
   type HackingNode,
   type HackingConnection,
   type HackingRoute,
@@ -35,6 +37,7 @@ import {
   getMissiles,
   getSatellites,
   getAircraft,
+  getFalloutClouds,
   getSatellitePosition3D,
   getSatelliteGroundPosition,
   SatelliteOrbitalParams,
@@ -47,6 +50,8 @@ import {
   getRouteSegmentProgress,
   getIcbmAltitude,
   calculateBearing,
+  getWindAtPosition,
+  GLOBE_RADIUS,
 } from '@defcon/shared';
 import { HUDRenderer } from './HUDRenderer';
 
@@ -89,7 +94,6 @@ const PLAYER_COLOR_MAP: Record<string, number> = {
   magenta: 0xff44ff,
 };
 
-const GLOBE_RADIUS = 100;
 const MISSILE_MIN_ALTITUDE = 8;  // Minimum altitude for very short flights
 const MISSILE_MAX_ALTITUDE = 50; // Maximum altitude for intercontinental flights (higher for more dramatic arcs)
 
@@ -110,6 +114,13 @@ const DDOS_MAX_PARTICLES = 1024;        // Maximum particles (branches: 1->2->4-
 const DDOS_TRACE_SIZE = 0.75;           // Size of trace dots
 const DDOS_TRACE_SPEED = 25;            // Constant speed in globe units per second
 const DDOS_COLOR = 0xffaa00;            // Bright orange for attack visualization
+
+// Wind vector field configuration
+const WIND_VECTOR_COLOR = 0x88ccff;     // Pale blue/cyan
+const WIND_VECTOR_ALTITUDE = 1.5;       // Height above globe surface
+const WIND_VECTOR_OPACITY = 0.7;        // Base opacity for vectors
+const WIND_VECTOR_BASE_LENGTH = 2.5;    // Minimum line length in degrees
+const WIND_VECTOR_LENGTH_SCALE = 0.5;   // Additional length per wind speed unit
 
 // Calculate appropriate max altitude based on great-circle distance
 function calculateMissileAltitude(startGeo: GeoPosition, endGeo: GeoPosition): number {
@@ -174,6 +185,10 @@ export class GlobeRenderer {
   private borderGroup: THREE.Group;
   private airspaceGroup: THREE.Group;
   private hackingNetworkGroup: THREE.Group;
+  private windVectorGroup: THREE.Group;
+
+  // Wind vector field visualization
+  private windVectorLines: THREE.LineSegments | null = null;
 
   // View toggles state
   private viewToggles = {
@@ -185,6 +200,8 @@ export class GlobeRenderer {
     borders: true,
     airspaces: false,
     network: false,
+    fallout: true,
+    wind: false,
   };
 
   // Object maps for efficient updates
@@ -254,6 +271,24 @@ export class GlobeRenderer {
   private radarSweepLines = new Map<string, { line: THREE.Line; center: THREE.Vector3; outward: THREE.Vector3 }>();
   private fogOfWarMesh: THREE.Mesh | null = null;
   private fogOfWarMaterial: THREE.ShaderMaterial | null = null;
+
+  // Particle-based fallout system
+  private falloutParticles: Map<string, Array<{
+    position: GeoPosition;
+    age: number;          // seconds since spawn
+    intensity: number;    // 0-1, fades with age
+    size: number;         // visual size multiplier
+    velocityLat: number;  // degrees per second
+    velocityLng: number;  // degrees per second
+  }>> = new Map();
+  private falloutParticleMesh: THREE.InstancedMesh | null = null;
+  private falloutParticleMaterial: THREE.MeshBasicMaterial | null = null;
+  private falloutLastSpawnTime: Map<string, number> = new Map();
+  private readonly FALLOUT_MAX_PARTICLES = 2000;
+  private readonly FALLOUT_PARTICLE_LIFETIME = 180; // seconds (3 min at 1x speed)
+  private readonly FALLOUT_SPAWN_RATE = 5; // particles per second per cloud
+  private readonly FALLOUT_PARTICLE_SIZE = 2.8; // base size in globe units
+
   private selectedCityInfo: { name: string; population: number; territoryId: string } | null = null;
 
   // Client-side interpolation for smooth missile movement
@@ -518,6 +553,9 @@ export class GlobeRenderer {
     this.hackingNetworkGroup = new THREE.Group();
     this.hackingNetworkGroup.visible = this.viewToggles.network;
 
+    this.windVectorGroup = new THREE.Group();
+    this.windVectorGroup.visible = this.viewToggles.wind;
+
     this.placementPreviewGroup = new THREE.Group();
     this.commChainGroup = new THREE.Group();
     this.interceptPredictionGroup = new THREE.Group();
@@ -543,6 +581,7 @@ export class GlobeRenderer {
     this.scene.add(this.satCommGroup);
     this.scene.add(this.aircraftGroup);
     this.scene.add(this.hackingNetworkGroup);
+    this.scene.add(this.windVectorGroup);
     this.scene.add(this.icbmTrackingGroup);
     this.scene.add(this.missilePreviewGroup);
 
@@ -564,6 +603,10 @@ export class GlobeRenderer {
 
     // Create fog of war overlay
     this.createFogOfWar();
+
+    // Create fallout visualization overlay
+    this.createFallout();
+    this.createWindVectorField();
 
     // Create HUD renderer (canvas-based UI)
     this.hudRenderer = new HUDRenderer(container);
@@ -751,7 +794,7 @@ export class GlobeRenderer {
     onDebugCommand: (command: string, value?: number, targetRegion?: string) => void,
     onEnableAI: (region: string) => void,
     onDisableAI: () => void,
-    onSetGameSpeed?: (speed: 1 | 2 | 5) => void
+    onSetGameSpeed?: (speed: GameSpeed) => void
   ): void {
     this.hudRenderer.setDebugCallbacks(
       onDebugCommand,
@@ -1795,6 +1838,305 @@ export class GlobeRenderer {
     this.scene.add(this.fogOfWarMesh);
   }
 
+  private createFallout(): void {
+    // Particle-based fallout system using instanced meshes
+    // Each particle is a soft glowing sphere that drifts with wind
+
+    // Create a simple sphere geometry for particles
+    const particleGeometry = new THREE.SphereGeometry(1, 8, 6);
+
+    // Create material with warm fallout color
+    this.falloutParticleMaterial = new THREE.MeshBasicMaterial({
+      color: 0xffaa44,  // Orange-yellow
+      transparent: true,
+      opacity: 0.3,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+
+    // Create instanced mesh for all particles
+    this.falloutParticleMesh = new THREE.InstancedMesh(
+      particleGeometry,
+      this.falloutParticleMaterial,
+      this.FALLOUT_MAX_PARTICLES
+    );
+    this.falloutParticleMesh.frustumCulled = false;
+
+    // Initialize all instances as invisible (scale 0)
+    const matrix = new THREE.Matrix4();
+    matrix.makeScale(0, 0, 0);
+    for (let i = 0; i < this.FALLOUT_MAX_PARTICLES; i++) {
+      this.falloutParticleMesh.setMatrixAt(i, matrix);
+    }
+    this.falloutParticleMesh.instanceMatrix.needsUpdate = true;
+
+    this.scene.add(this.falloutParticleMesh);
+  }
+
+  private updateFallout(): void {
+    if (!this.falloutParticleMesh || !this.gameState) return;
+
+    const falloutClouds = getFalloutClouds(this.gameState);
+    const now = performance.now() / 1000;
+    const baseDeltatime = this.deltaTime || (1 / 60);
+    // Scale particle simulation by game speed
+    const gameSpeed = this.gameState.gameSpeed || 1;
+    const deltaTime = baseDeltatime * gameSpeed;
+
+    // Get set of active cloud IDs
+    const activeCloudIds = new Set(falloutClouds.map(c => c.id));
+
+    // Remove particles for clouds that no longer exist
+    for (const cloudId of this.falloutParticles.keys()) {
+      if (!activeCloudIds.has(cloudId)) {
+        this.falloutParticles.delete(cloudId);
+        this.falloutLastSpawnTime.delete(cloudId);
+      }
+    }
+
+    // Update existing particles and spawn new ones
+    for (const cloud of falloutClouds) {
+      // Initialize particle array for new clouds
+      if (!this.falloutParticles.has(cloud.id)) {
+        this.falloutParticles.set(cloud.id, []);
+        this.falloutLastSpawnTime.set(cloud.id, now);
+      }
+
+      const particles = this.falloutParticles.get(cloud.id)!;
+      const lastSpawn = this.falloutLastSpawnTime.get(cloud.id)!;
+
+      // Spawn new particles at ORIGIN (impact point), not current position
+      const spawnInterval = 1 / this.FALLOUT_SPAWN_RATE;
+      if (now - lastSpawn >= spawnInterval && this.getTotalParticleCount() < this.FALLOUT_MAX_PARTICLES) {
+        // Spawn at origin with small random offset
+        const spawnSpread = cloud.radius * 0.15; // Small initial spread at impact
+        const spawnAngle = Math.random() * Math.PI * 2;
+        const spawnDist = Math.random() * spawnSpread;
+        const cosLat = Math.max(0.3, Math.cos(cloud.originPosition.lat * Math.PI / 180));
+
+        // Each particle gets its own velocity: wind direction + random spread
+        // Pass time for shifting wind patterns
+        const wind = getWindAtPosition(cloud.originPosition, now);
+        const windRadians = (wind.direction * Math.PI) / 180;
+
+        // Spread particles in a wide arc centered on wind direction
+        // Most go downwind, some spread sideways, few go upwind
+        const spreadAngle = (Math.random() - 0.5) * Math.PI * 1.6; // +/- 144 degrees from wind
+        const finalAngle = windRadians + spreadAngle;
+
+        // Speed varies: faster for particles going with wind, slower against
+        const windAlignment = Math.cos(spreadAngle); // 1 = with wind, -1 = against
+        const baseSpeed = 0.025 + Math.random() * 0.02; // degrees per second (much faster)
+        const speedMultiplier = 0.4 + windAlignment * 0.6; // 0.4-1.0 based on alignment
+
+        const particleSpeed = baseSpeed * speedMultiplier;
+        const newParticle = {
+          position: {
+            lat: cloud.originPosition.lat + Math.cos(spawnAngle) * spawnDist,
+            lng: cloud.originPosition.lng + Math.sin(spawnAngle) * spawnDist / cosLat,
+          },
+          age: 0,
+          intensity: cloud.intensity * (0.7 + Math.random() * 0.3),
+          size: 0.8 + Math.random() * 0.4,
+          // Store velocity for this particle
+          velocityLat: Math.cos(finalAngle) * particleSpeed,
+          velocityLng: Math.sin(finalAngle) * particleSpeed,
+        };
+        particles.push(newParticle);
+        this.falloutLastSpawnTime.set(cloud.id, now);
+      }
+
+      // Update each particle: age, drift, fade
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const particle = particles[i];
+        particle.age += deltaTime;
+
+        // Remove old particles
+        if (particle.age > this.FALLOUT_PARTICLE_LIFETIME) {
+          particles.splice(i, 1);
+          continue;
+        }
+
+        // Move particle using its stored velocity (slows down over time)
+        const ageSlowdown = 1 - (particle.age / this.FALLOUT_PARTICLE_LIFETIME) * 0.5;
+        const cosLat = Math.max(0.3, Math.cos(particle.position.lat * Math.PI / 180));
+
+        particle.position.lat += particle.velocityLat * deltaTime * ageSlowdown;
+        particle.position.lng += particle.velocityLng * deltaTime / cosLat * ageSlowdown;
+
+        // Normalize longitude
+        if (particle.position.lng > 180) particle.position.lng -= 360;
+        if (particle.position.lng < -180) particle.position.lng += 360;
+
+        // Fade intensity over time
+        const ageRatio = particle.age / this.FALLOUT_PARTICLE_LIFETIME;
+        particle.intensity = cloud.intensity * (1 - ageRatio) * (0.7 + Math.random() * 0.05);
+      }
+    }
+
+    // Update instanced mesh with all particles
+    this.updateFalloutInstancedMesh();
+
+    // Update visibility based on toggle
+    this.falloutParticleMesh.visible = this.viewToggles.fallout;
+  }
+
+  private getTotalParticleCount(): number {
+    let count = 0;
+    for (const particles of this.falloutParticles.values()) {
+      count += particles.length;
+    }
+    return count;
+  }
+
+  private updateFalloutInstancedMesh(): void {
+    if (!this.falloutParticleMesh) return;
+
+    const matrix = new THREE.Matrix4();
+    const position = new THREE.Vector3();
+    const quaternion = new THREE.Quaternion();
+    const scale = new THREE.Vector3();
+    const color = new THREE.Color();
+
+    let instanceIndex = 0;
+
+    // Collect all particles from all clouds
+    for (const particles of this.falloutParticles.values()) {
+      for (const particle of particles) {
+        if (instanceIndex >= this.FALLOUT_MAX_PARTICLES) break;
+
+        // Convert geo position to 3D
+        const altitude = GLOBE_RADIUS + 0.8 + particle.age * 0.005; // Very slow rise
+        const pos3D = geoToSphere(particle.position, altitude);
+        position.set(pos3D.x, pos3D.y, pos3D.z);
+
+        // Scale based on age: stay big for most of life, shrink at the end
+        const ageRatio = particle.age / this.FALLOUT_PARTICLE_LIFETIME;
+        // Late decay curve: particles stay big until ~70% through life, then shrink
+        const decayFactor = 1 - Math.pow(ageRatio, 2.5);
+        const sizeMultiplier = particle.size * Math.max(0.15, decayFactor);
+        const baseSize = this.FALLOUT_PARTICLE_SIZE * sizeMultiplier * Math.max(0.2, particle.intensity);
+        scale.set(baseSize, baseSize, baseSize);
+
+        // No rotation needed for spheres
+        quaternion.identity();
+
+        matrix.compose(position, quaternion, scale);
+        this.falloutParticleMesh.setMatrixAt(instanceIndex, matrix);
+
+        // Color gradient: bright orange-yellow when young, fade to dim brown at end
+        const fadeMultiplier = 1 - Math.pow(ageRatio, 2); // Gradual color fade
+        const r = (1.0 - ageRatio * 0.15) * fadeMultiplier;
+        const g = (0.65 - ageRatio * 0.2) * fadeMultiplier;
+        const b = (0.25 - ageRatio * 0.1) * fadeMultiplier;
+        color.setRGB(r, g, b);
+        this.falloutParticleMesh.setColorAt(instanceIndex, color);
+
+        instanceIndex++;
+      }
+    }
+
+    // Hide remaining instances
+    const zeroMatrix = new THREE.Matrix4().makeScale(0, 0, 0);
+    for (let i = instanceIndex; i < this.FALLOUT_MAX_PARTICLES; i++) {
+      this.falloutParticleMesh.setMatrixAt(i, zeroMatrix);
+    }
+
+    this.falloutParticleMesh.instanceMatrix.needsUpdate = true;
+    if (this.falloutParticleMesh.instanceColor) {
+      this.falloutParticleMesh.instanceColor.needsUpdate = true;
+    }
+  }
+
+  /**
+   * Toggle fallout layer visibility
+   */
+  toggleFallout(): void {
+    this.viewToggles.fallout = !this.viewToggles.fallout;
+    if (this.falloutParticleMesh) {
+      this.falloutParticleMesh.visible = this.viewToggles.fallout;
+    }
+  }
+
+  /**
+   * Create wind vector field - static grid of line segments showing wind direction
+   */
+  private createWindVectorField(): void {
+    const positions: number[] = [];
+    const colors: number[] = [];
+
+    // Grid of points across the globe
+    // ~12 latitude bands × ~18 longitude divisions
+    const latStep = 15;  // degrees between latitude bands
+    const lngStep = 20;  // degrees between longitude points
+
+    const color = new THREE.Color(WIND_VECTOR_COLOR);
+
+    for (let lat = -75; lat <= 75; lat += latStep) {
+      // Adjust longitude density based on latitude (fewer points near poles)
+      const latRadians = Math.abs(lat) * (Math.PI / 180);
+      const lngAdjustedStep = lngStep / Math.max(0.4, Math.cos(latRadians));
+
+      for (let lng = -180; lng < 180; lng += lngAdjustedStep) {
+        const position: GeoPosition = { lat, lng };
+
+        // Get wind at this position
+        const wind = getWindAtPosition(position);
+        const windRadians = (wind.direction * Math.PI) / 180;
+
+        // Calculate line length: base length + speed-based bonus
+        const lineLength = WIND_VECTOR_BASE_LENGTH + wind.speed * WIND_VECTOR_LENGTH_SCALE;
+
+        // Tail point (back from center, against wind direction)
+        const tailLat = lat - Math.cos(windRadians) * lineLength * 0.3;
+        const tailLng = lng - (Math.sin(windRadians) * lineLength * 0.3) / Math.max(0.4, Math.cos(latRadians));
+
+        // Head point (forward in wind direction)
+        const headLat = lat + Math.cos(windRadians) * lineLength * 0.7;
+        const headLng = lng + (Math.sin(windRadians) * lineLength * 0.7) / Math.max(0.4, Math.cos(latRadians));
+
+        // Convert to 3D positions
+        const tailPos = geoToSphere({ lat: tailLat, lng: tailLng }, GLOBE_RADIUS + WIND_VECTOR_ALTITUDE);
+        const headPos = geoToSphere({ lat: headLat, lng: headLng }, GLOBE_RADIUS + WIND_VECTOR_ALTITUDE);
+
+        // Add line segment vertices (tail first, then head)
+        positions.push(tailPos.x, tailPos.y, tailPos.z);
+        positions.push(headPos.x, headPos.y, headPos.z);
+
+        // Directional color gradient: faint at tail, bright at head
+        // Tail color: very dim (20% brightness)
+        colors.push(color.r * 0.2, color.g * 0.2, color.b * 0.2);
+        // Head color: full brightness
+        colors.push(color.r, color.g, color.b);
+      }
+    }
+
+    // Create geometry with positions and colors
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+    // Create material with vertex colors
+    const material = new THREE.LineBasicMaterial({
+      vertexColors: true,
+      transparent: true,
+      opacity: WIND_VECTOR_OPACITY,
+      depthWrite: false,
+    });
+
+    // Create line segments and add to group
+    this.windVectorLines = new THREE.LineSegments(geometry, material);
+    this.windVectorGroup.add(this.windVectorLines);
+  }
+
+  /**
+   * Toggle wind vector visualization
+   */
+  toggleWind(): void {
+    this.viewToggles.wind = !this.viewToggles.wind;
+    this.windVectorGroup.visible = this.viewToggles.wind;
+  }
+
   private updateFogOfWar(): void {
     if (!this.fogOfWarMaterial || !this.gameState) return;
 
@@ -2282,6 +2624,7 @@ export class GlobeRenderer {
     this.updateTerritories();
     this.updateRadarCoverage();
     this.updateFogOfWar();
+    this.updateFallout();
     this.updateCities();
     this.updateBuildings();
     this.updateMissiles();
@@ -3457,7 +3800,7 @@ export class GlobeRenderer {
         // Cap at 1.0 for normal missiles, but allow up to 1.5 for missed interceptors
         // Allow extended progress for missed interceptors
         const isMissed = isGuidedInterceptor(missile)
-          ? (missile as GuidedInterceptor).status === 'missed' || (missile as GuidedInterceptor).status === 'crashed'
+          ? (missile as GuidedInterceptor).status === 'missed' || (missile as GuidedInterceptor).status === 'expired'
           : (missile as any).missedTarget;
         const maxProgress = (isInterceptor && isMissed) ? 1.5 : 1.0;
         interpolatedProgress = Math.min(interpolatedProgress, maxProgress);
@@ -3476,9 +3819,8 @@ export class GlobeRenderer {
         if (!isInterceptor && 'apexHeight' in missile && typeof missile.apexHeight === 'number') {
           maxAltitude = Math.min(missile.apexHeight, 60);
         } else if (isInterceptor) {
-          // Interceptors: 40% of calculated altitude
-          const baseAltitude = calculateMissileAltitude(startGeo, targetGeo);
-          maxAltitude = baseAltitude * 0.4;
+          // Interceptors: fixed altitude high enough to reach ICBMs
+          maxAltitude = 40;
         } else {
           // Fallback for legacy missiles without apexHeight
           maxAltitude = calculateMissileAltitude(startGeo, targetGeo);
@@ -3539,27 +3881,22 @@ export class GlobeRenderer {
       }
 
       // Get 3D position
-      // Physics missiles (new interceptors) use position from server directly
-      // Legacy missiles use curve-based calculation
       let pos3d: { x: number; y: number; z: number };
 
       // Calculate flameout progress for legacy interceptors (when fuel runs out)
-      // Guided interceptors handle fuel differently
       const flameoutProgress = isInterceptor && !isGuidedInterceptor(missile)
         ? this.calculateFlameoutProgress(missile as Missile)
         : 1.0;
 
       if (isGuidedInterceptor(missile)) {
-        // Guided interceptor: use position from server (continuously updated)
-        const guidedMissile = missile as GuidedInterceptor;
-        const altitude = guidedMissile.altitude || guidedMissile.currentAltitude || 0;
-        const geoPos = guidedMissile.geoPosition || guidedMissile.geoCurrentPosition;
-        if (geoPos) {
-          const groundPos = geoToSphere(geoPos, GLOBE_RADIUS + altitude);
-          pos3d = { x: groundPos.x, y: groundPos.y, z: groundPos.z };
+        // Guided interceptor: use server-provided 3D position
+        const gm = missile as GuidedInterceptor;
+        if (gm.pos3d) {
+          pos3d = gm.pos3d;
         } else {
-          // Fallback to launch position
-          pos3d = geoToSphere(startGeo, GLOBE_RADIUS);
+          // Fallback: use geoCurrentPosition at surface level
+          const fallbackGeo = gm.geoCurrentPosition || startGeo;
+          pos3d = geoToSphere(fallbackGeo, GLOBE_RADIUS);
         }
       } else if (isInterceptor && (missile as any).targetId) {
         // Legacy interceptor: use trajectory calculation
@@ -3583,7 +3920,7 @@ export class GlobeRenderer {
       // Check for ground impact on missed interceptors
       const isMissedInterceptor = isInterceptor && (
         isGuidedInterceptor(missile)
-          ? (missile as GuidedInterceptor).status === 'missed' || (missile as GuidedInterceptor).status === 'crashed'
+          ? (missile as GuidedInterceptor).status === 'missed' || (missile as GuidedInterceptor).status === 'expired'
           : (missile as any).missedTarget
       );
       if (isMissedInterceptor && missileProgress > 1) {
@@ -3638,37 +3975,19 @@ export class GlobeRenderer {
       let lookTarget: THREE.Vector3 | null = null;
 
       if (isGuidedInterceptor(missile)) {
-        // Guided interceptor: orient along heading and climb angle
-        const guidedMissile = missile as GuidedInterceptor;
-        const headingRad = guidedMissile.heading * (Math.PI / 180);
-        const climbRad = guidedMissile.climbAngle * (Math.PI / 180);
-
-        // Calculate forward direction based on heading and climb
-        const cosClimb = Math.cos(climbRad);
-        const sinClimb = Math.sin(climbRad);
-        const cosHead = Math.cos(headingRad);
-        const sinHead = Math.sin(headingRad);
-
-        // Get up vector at current position (radially outward)
-        const up = new THREE.Vector3(pos3d.x, pos3d.y, pos3d.z).normalize();
-
-        // North direction (tangent pointing toward north pole)
-        const north = new THREE.Vector3(0, 1, 0);
-        const east = new THREE.Vector3().crossVectors(north, up).normalize();
-        const northTangent = new THREE.Vector3().crossVectors(up, east).normalize();
-
-        // Forward direction based on heading
-        const forward = new THREE.Vector3()
-          .addScaledVector(northTangent, cosHead * cosClimb)
-          .addScaledVector(east, sinHead * cosClimb)
-          .addScaledVector(up, sinClimb)
-          .normalize();
-
-        lookTarget = new THREE.Vector3(
-          pos3d.x + forward.x * 10,
-          pos3d.y + forward.y * 10,
-          pos3d.z + forward.z * 10
-        );
+        // Guided interceptor: use server-provided velocity for orientation
+        const gm = missile as GuidedInterceptor;
+        if (gm.velocity3d && gm.pos3d) {
+          lookTarget = new THREE.Vector3(
+            gm.pos3d.x + gm.velocity3d.x * 5,
+            gm.pos3d.y + gm.velocity3d.y * 5,
+            gm.pos3d.z + gm.velocity3d.z * 5
+          );
+        } else {
+          // Fallback: point toward target
+          const fallbackTarget = geoToSphere(targetGeo, GLOBE_RADIUS);
+          lookTarget = new THREE.Vector3(fallbackTarget.x, fallbackTarget.y, fallbackTarget.z);
+        }
       } else if (isInterceptor && (missile as any).targetId && this.gameState) {
         // Legacy interceptor: calculate orientation from trajectory
         const legacyMissile = missile as Missile;
@@ -4290,10 +4609,10 @@ export class GlobeRenderer {
 
     if (!exhaust || !exhaustGlow) return;
 
-    // Guided interceptors: exhaust visible while has fuel and active
+    // Guided interceptors: exhaust visible while active
     if (missile && isGuidedInterceptor(missile)) {
       const guidedMissile = missile as GuidedInterceptor;
-      const engineOn = guidedMissile.fuel > 0 && guidedMissile.status === 'active';
+      const engineOn = guidedMissile.status === 'active';
       exhaust.visible = engineOn;
       exhaustGlow.visible = engineOn;
       return;
@@ -4682,15 +5001,18 @@ export class GlobeRenderer {
     // Get interceptor 3D position (at its current flight altitude)
     let interceptorVec: THREE.Vector3;
     if (isGuidedInterceptor(trackedMissile)) {
-      // Guided interceptor: use position from server
+      // Guided interceptor: use server-provided 3D position
       const guidedMissile = trackedMissile as GuidedInterceptor;
-      const altitude = guidedMissile.altitude || guidedMissile.currentAltitude || 0;
-      const geoPos = guidedMissile.geoPosition || guidedMissile.geoCurrentPosition;
-      if (geoPos) {
-        const groundPos = geoToSphere(geoPos, GLOBE_RADIUS + altitude);
-        interceptorVec = new THREE.Vector3(groundPos.x, groundPos.y, groundPos.z);
+      if (guidedMissile.pos3d) {
+        interceptorVec = new THREE.Vector3(guidedMissile.pos3d.x, guidedMissile.pos3d.y, guidedMissile.pos3d.z);
       } else {
-        interceptorVec = new THREE.Vector3(0, 0, 0);
+        const fallbackGeo = guidedMissile.geoCurrentPosition || guidedMissile.geoLaunchPosition;
+        if (fallbackGeo) {
+          const pos = geoToSphere(fallbackGeo, GLOBE_RADIUS);
+          interceptorVec = new THREE.Vector3(pos.x, pos.y, pos.z);
+        } else {
+          interceptorVec = new THREE.Vector3(0, 0, 0);
+        }
       }
     } else {
       // Legacy missile: calculate position from trajectory
@@ -5006,13 +5328,16 @@ export class GlobeRenderer {
       let pos3D: THREE.Vector3;
       if (isGuidedInterceptor(missile)) {
         const guidedMissile = missile as GuidedInterceptor;
-        const altitude = guidedMissile.altitude || guidedMissile.currentAltitude || 0;
-        const geoPos = guidedMissile.geoPosition || guidedMissile.geoCurrentPosition;
-        if (geoPos) {
-          const groundPos = geoToSphere(geoPos, GLOBE_RADIUS + altitude);
-          pos3D = new THREE.Vector3(groundPos.x, groundPos.y, groundPos.z);
+        if (guidedMissile.pos3d) {
+          pos3D = new THREE.Vector3(guidedMissile.pos3d.x, guidedMissile.pos3d.y, guidedMissile.pos3d.z);
         } else {
-          continue;
+          const fallbackGeo = guidedMissile.geoCurrentPosition || guidedMissile.geoLaunchPosition;
+          if (fallbackGeo) {
+            const pos = geoToSphere(fallbackGeo, GLOBE_RADIUS);
+            pos3D = new THREE.Vector3(pos.x, pos.y, pos.z);
+          } else {
+            continue;
+          }
         }
       } else {
         // Legacy interceptor - use geo position with estimated altitude
@@ -5261,56 +5586,40 @@ export class GlobeRenderer {
     const targetIcbm = targetId ? this.gameState.missiles[targetId] : null;
     if (!targetIcbm || targetIcbm.detonated || targetIcbm.intercepted) return;
 
-    // Guided interceptors: show predicted intercept point along ICBM's path
+    // Guided interceptors: show intercept point marker at estimated target position
     if (isGuidedInterceptor(interceptor)) {
       const guidedMissile = interceptor as GuidedInterceptor;
       const icbm = targetIcbm as Missile;
 
-      if (icbm.geoLaunchPosition && icbm.geoTargetPosition && icbm.geoCurrentPosition && icbm.flightDuration) {
+      // Use estimatedTargetPos3d for the marker (where interceptor thinks ICBM is)
+      if (guidedMissile.estimatedTargetPos3d) {
+        const markerPosition = new THREE.Vector3(
+          guidedMissile.estimatedTargetPos3d.x,
+          guidedMissile.estimatedTargetPos3d.y,
+          guidedMissile.estimatedTargetPos3d.z
+        );
+        this.createInterceptMarker(markerPosition, 0.70);
+
+        // Draw dashed line from interceptor pos3d to estimatedTargetPos3d
+        if (guidedMissile.pos3d) {
+          const interceptorPosition = new THREE.Vector3(
+            guidedMissile.pos3d.x, guidedMissile.pos3d.y, guidedMissile.pos3d.z
+          );
+          this.createInterceptorProjectedPath(interceptorPosition, markerPosition);
+        }
+      } else if (guidedMissile.geoTargetPosition && icbm.geoLaunchPosition && icbm.geoTargetPosition) {
+        // Fallback: use geo-based marker position
         const icbmApex = icbm.apexHeight || 30;
-        // Read tracking error from the ICBM itself (shared across all interceptors targeting it)
-        const errorMagnitude = icbm.radarTrackingError ?? 0.1;
+        const icbmProgress = icbm.progress || 0;
+        const interceptMarkerAltitude = getIcbmAltitude(icbmProgress, icbmApex, 0.6);
+        const markerPos = geoToSphere(guidedMissile.geoTargetPosition, GLOBE_RADIUS + interceptMarkerAltitude);
+        const markerPosition = new THREE.Vector3(markerPos.x, markerPos.y, markerPos.z);
+        this.createInterceptMarker(markerPosition, 0.70);
+      }
 
-        // Use server-provided aim point if available (this is the actual aim point with errors)
-        if (guidedMissile.predictedInterceptGeo && guidedMissile.predictedInterceptAltitude !== undefined) {
-          // Create marker for where interceptor is ACTUALLY aiming (from server)
-          const aimMarkerPos = geoToSphere(guidedMissile.predictedInterceptGeo, GLOBE_RADIUS + guidedMissile.predictedInterceptAltitude);
-          const aimMarkerPosition = new THREE.Vector3(aimMarkerPos.x, aimMarkerPos.y, aimMarkerPos.z);
-          this.createPerceivedInterceptMarker(aimMarkerPosition, errorMagnitude);
-
-          // Get interceptor's current 3D position and create projected path to aim point
-          if (guidedMissile.geoPosition) {
-            const altitude = guidedMissile.altitude || 0;
-            const interceptorPos3D = geoToSphere(guidedMissile.geoPosition, GLOBE_RADIUS + altitude);
-            const interceptorPosition = new THREE.Vector3(interceptorPos3D.x, interceptorPos3D.y, interceptorPos3D.z);
-            this.createInterceptorProjectedPath(interceptorPosition, aimMarkerPosition);
-          }
-        }
-
-        // Calculate where ICBM will actually be at the same time (for comparison)
-        // Use the interceptor's estimated time to reach its aim point
-        if (guidedMissile.geoPosition && guidedMissile.predictedInterceptGeo) {
-          const interceptorSpeed = guidedMissile.speed || 0.8;
-          const distToAim = greatCircleDistance(guidedMissile.geoPosition, guidedMissile.predictedInterceptGeo);
-          const distDegrees = distToAim * (180 / Math.PI);
-          const timeToIntercept = distDegrees / interceptorSpeed;
-
-          // Where will ICBM actually be at that time?
-          const actualProgressDelta = (timeToIntercept * 1000) / icbm.flightDuration;
-          const actualInterceptProgress = Math.min(0.95, icbm.progress + actualProgressDelta);
-          const actualInterceptGeo = geoInterpolate(icbm.geoLaunchPosition, icbm.geoTargetPosition, actualInterceptProgress);
-          const actualAltitude = getIcbmAltitude(actualInterceptProgress, icbmApex, 0.6);
-
-          const actualMarkerPos = geoToSphere(actualInterceptGeo, GLOBE_RADIUS + actualAltitude);
-          const actualMarkerPosition = new THREE.Vector3(actualMarkerPos.x, actualMarkerPos.y, actualMarkerPos.z);
-          const chance = guidedMissile.hasGuidance ? 0.75 : 0.15;
-          this.createInterceptMarker(actualMarkerPosition, chance);
-        }
-
-        // Render target ICBM's projected path if this interceptor is selected
-        if (this.linkedTargetId === icbm.id) {
-          this.createTargetIcbmProjectedPath(icbm);
-        }
+      // Render target ICBM's projected path if this interceptor is selected
+      if (this.linkedTargetId === icbm.id) {
+        this.createTargetIcbmProjectedPath(icbm);
       }
       return;
     }
@@ -7237,13 +7546,16 @@ export class GlobeRenderer {
    * Works with guided interceptors, legacy interceptors, and ICBMs.
    */
   private getMissile3DPositionForTracking(missile: Missile | GuidedInterceptor): THREE.Vector3 | null {
-    // Guided interceptors use server-provided position
+    // Guided interceptors: use server-provided 3D position
     if (isGuidedInterceptor(missile)) {
       const guidedMissile = missile as GuidedInterceptor;
-      const geoPos = guidedMissile.geoPosition || guidedMissile.geoCurrentPosition;
-      if (geoPos) {
-        const altitude = guidedMissile.altitude || guidedMissile.currentAltitude || 0;
-        const pos = geoToSphere(geoPos, GLOBE_RADIUS + altitude);
+      if (guidedMissile.pos3d) {
+        return new THREE.Vector3(guidedMissile.pos3d.x, guidedMissile.pos3d.y, guidedMissile.pos3d.z);
+      }
+      // Fallback to geo position
+      const fallbackGeo = guidedMissile.geoCurrentPosition || guidedMissile.geoLaunchPosition;
+      if (fallbackGeo) {
+        const pos = geoToSphere(fallbackGeo, GLOBE_RADIUS);
         return new THREE.Vector3(pos.x, pos.y, pos.z);
       }
       return null;
@@ -8122,7 +8434,7 @@ export class GlobeRenderer {
     if (!ring) return;
 
     // Pulse scale between 0.95 and 1.05 (time is in ms, so divide by 1000)
-    const pulseSpeed = 2; // Pulses per second
+    const pulseSpeed = 0.8; // Pulses per second (slower, more subtle)
     const timeInSeconds = time / 1000;
     const scale = 1 + 0.05 * Math.sin(timeInSeconds * pulseSpeed * Math.PI * 2);
     ring.scale.setScalar(scale);
@@ -8211,14 +8523,17 @@ export class GlobeRenderer {
 
     // Apply hacking network visibility
     this.hackingNetworkGroup.visible = this.viewToggles.network;
+
+    // Apply wind vector visibility
+    this.windVectorGroup.visible = this.viewToggles.wind;
   }
 
   // Public setter for view toggles
-  setViewToggle(toggle: 'radar' | 'grid' | 'labels' | 'trails' | 'network', value: boolean): void {
+  setViewToggle(toggle: 'radar' | 'grid' | 'labels' | 'trails' | 'network' | 'fallout' | 'wind', value: boolean): void {
     this.viewToggles[toggle] = value;
   }
 
-  getViewToggles(): { radar: boolean; grid: boolean; labels: boolean; trails: boolean; network: boolean } {
+  getViewToggles(): { radar: boolean; grid: boolean; labels: boolean; trails: boolean; network: boolean; fallout: boolean; wind: boolean } {
     return { ...this.viewToggles };
   }
 

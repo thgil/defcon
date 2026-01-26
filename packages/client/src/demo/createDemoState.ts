@@ -320,6 +320,7 @@ export function createDemoState(): GameState {
     missiles: {},
     satellites,
     aircraft: {},
+    falloutClouds: {},
   };
 
   return gameState;

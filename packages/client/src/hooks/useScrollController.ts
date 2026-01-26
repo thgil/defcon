@@ -20,7 +20,7 @@ export interface ScrollSection {
 }
 
 // Define sections with scroll multipliers
-// Flow: hero → radar → missiles → satellites → network → strategy → cta
+// Flow: hero → radar → missiles → satellites → radiation → network → strategy → cta
 export const LANDING_SECTIONS: ScrollSection[] = [
   {
     id: 'hero',
@@ -58,21 +58,27 @@ export const LANDING_SECTIONS: ScrollSection[] = [
     scrollMultiplier: 1.0,
   },
   {
+    id: 'radiation',
+    name: 'Radiation',
+    index: 4,
+    scrollMultiplier: 1.5,
+  },
+  {
     id: 'network',
     name: 'Network',
-    index: 4,
+    index: 5,
     scrollMultiplier: 1.5,
   },
   {
     id: 'strategy',
     name: 'Strategy',
-    index: 5,
+    index: 6,
     scrollMultiplier: 1.5,
   },
   {
     id: 'cta',
     name: 'CTA',
-    index: 6,
+    index: 7,
     scrollMultiplier: 1.0,
   },
 ];
@@ -481,12 +487,13 @@ interface CameraParams {
 }
 
 // Section camera params - positions should flow smoothly between sections
-// Flow: hero → radar → missiles → satellites → network → strategy → cta
+// Flow: hero → radar → missiles → satellites → radiation → network → strategy → cta
 const SECTION_CAMERA_PARAMS: Record<string, CameraParams> = {
   hero: { distance: 380, verticalOffset: 180 }, // Will be overridden by heroZoom
   radar: { distance: 300, targetLat: 45, targetLng: -100, trackType: 'radar' }, // North America
   missiles: { distance: 250, targetLat: 50, targetLng: -50, trackType: 'missile' }, // Mid-Atlantic
   satellites: { distance: 400, targetLat: 51, targetLng: 10, trackType: 'satellite' }, // Germany
+  radiation: { distance: 180, targetLat: 55.76, targetLng: 37.62 }, // Moscow - close zoom for fallout
   network: { distance: 300, targetLat: 51, targetLng: 10 }, // Germany (matches satellites end)
   strategy: { distance: 320, targetLat: 55, targetLng: 30 }, // Eastern Europe (closer to network)
   cta: { distance: 350, verticalOffset: 0, targetLat: 51, targetLng: 10 }, // Stay on Germany view

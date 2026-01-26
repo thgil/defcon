@@ -167,6 +167,18 @@ export interface SatelliteLaunchFacility extends BuildingBase {
 
 export type Building = Silo | Radar | Airfield | SatelliteLaunchFacility;
 
+// Fallout cloud from nuclear detonation
+export interface FalloutCloud {
+  id: string;
+  position: GeoPosition;      // Current center (drifts with wind)
+  originPosition: GeoPosition; // Original impact point
+  createdAt: number;          // Timestamp for decay calculation
+  intensity: number;          // 0-1, decays over time
+  radius: number;             // Current spread radius in degrees
+  windDirection: number;      // Degrees (0 = north, 90 = east)
+  windSpeed: number;          // Degrees per second drift
+}
+
 // Satellite entity (orbits the globe)
 export interface Satellite {
   id: string;
@@ -223,79 +235,53 @@ export interface Missile {
   isSpoofed?: boolean;               // True if this missile only exists for the victim
   victimPlayerId?: string;           // Player who sees this spoofed missile
 
-  // Radar tracking state (shared across all interceptors targeting this ICBM)
-  radarTrackingError?: number;       // Current error magnitude (0.02-0.15)
-  radarLastUpdateTime?: number;      // Last radar update timestamp
-  radarTrackingRadarIds?: string[];  // Which radars are currently tracking
-
-  // Error biases (generated on first radar detection, shared by all interceptors)
-  radarProgressErrorBias?: number;   // Direction of progress error
-  radarAltitudeErrorBias?: number;   // Direction of altitude error
-  radarSpeedErrorBias?: number;      // Direction of speed error
 }
 
 
 // ICBM flight phase for hit probability calculation
 export type IcbmPhase = 'boost' | 'midcourse' | 'reentry';
 
-// Guided interceptor (proportional navigation system)
-// Continuously adjusts course toward predicted intercept point
+// Guided interceptor (progress-based flight, same model as ICBMs)
+// Flies an arc from silo to predicted intercept point, checks proximity to target ICBM
 export interface GuidedInterceptor {
   id: string;
   type: 'guided_interceptor';
   ownerId: string;
   sourceId: string;  // Launching silo
+  targetId: string;  // ICBM being intercepted
 
-  // Position state (updated each tick)
+  // Flight path (same model as ICBMs: progress 0→1 along great circle arc)
   geoPosition: GeoPosition;
-  altitude: number;  // Globe units above surface
-
-  // Movement state
-  heading: number;      // Degrees, 0 = north, 90 = east
-  climbAngle: number;   // Degrees, positive = ascending, negative = descending
-  speed: number;        // Degrees per second (angular velocity on globe surface)
-
-  // Target information
-  targetId: string;            // ICBM being intercepted
-  hasGuidance: boolean;        // False = ballistic (lost radar lock)
-  trackingRadarIds: string[];  // Radars currently providing guidance
-
-  // Current aim point (where interceptor thinks ICBM will be - updated each tick)
-  predictedInterceptGeo?: GeoPosition;
-  predictedInterceptAltitude?: number;
-
-  // Fuel/timing
+  geoLaunchPosition: GeoPosition;
+  geoTargetPosition: GeoPosition;   // Predicted intercept point
+  geoCurrentPosition?: GeoPosition;
+  progress: number;       // 0-1 along flight path
+  flightDuration: number; // ms
   launchTime: number;
-  fuel: number;           // Remaining fuel in seconds
-  maxFuel: number;        // Max fuel capacity (seconds)
-  maxFlightTime: number;  // Maximum flight duration before expiration (seconds)
+  apexHeight: number;     // Arc height in globe units
 
   // Status
-  status: 'active' | 'hit' | 'missed' | 'expired' | 'crashed';
+  status: 'active' | 'hit' | 'missed' | 'expired';
+  intercepted: boolean;
+  detonated: boolean;
 
-  // Compatibility flags for rendering
-  intercepted: boolean;   // Always false for interceptors
-  detonated: boolean;     // True when status is terminal
+  // 3D position-based flight (server-authoritative)
+  pos3d?: { x: number; y: number; z: number };        // Current 3D Cartesian position
+  velocity3d?: { x: number; y: number; z: number };    // Current velocity direction (unit vector)
+  estimatedTargetPos3d?: { x: number; y: number; z: number }; // Radar-estimated ICBM position
+  trackingAccuracy?: number;  // 0→1, how refined the radar estimate is
+  speed3d?: number;           // Globe units per second
 
-  // Cached 3D position (for rendering)
-  geoCurrentPosition?: GeoPosition;
-  currentAltitude?: number;
-
-  // Legacy compatibility fields
+  // Legacy compatibility fields (for pixel-based rendering)
   launchPosition?: Vector2;
   targetPosition?: Vector2;
   currentPosition?: Vector2;
-  geoLaunchPosition?: GeoPosition;
-  geoTargetPosition?: GeoPosition;
-  flightDuration?: number;
-  apexHeight?: number;
-  progress?: number;  // Estimated progress for UI (0-1)
 }
 
 // Type guard for guided interceptors
 export function isGuidedInterceptor(m: Missile | GuidedInterceptor | null | undefined): m is GuidedInterceptor {
   if (!m) return false;
-  return m.type === 'guided_interceptor' && 'heading' in m && 'climbAngle' in m;
+  return m.type === 'guided_interceptor';
 }
 
 
@@ -310,7 +296,7 @@ export function isInterceptor(m: Missile | GuidedInterceptor | null | undefined)
 export type AnyMissile = Missile | GuidedInterceptor;
 
 // Game speed multiplier type
-export type GameSpeed = 1 | 2 | 5;
+export type GameSpeed = 1 | 2 | 5 | 10;
 
 // Full game state
 export interface GameState {
@@ -329,6 +315,7 @@ export interface GameState {
   missiles: Record<string, Missile | GuidedInterceptor>;
   satellites: Record<string, Satellite>;
   aircraft: Record<string, Aircraft>;
+  falloutClouds: Record<string, FalloutCloud>;
 }
 
 // Lobby info (for lobby browser)
@@ -458,6 +445,7 @@ export type GameStateRecords = {
   buildings: Building;
   missiles: Missile | GuidedInterceptor;
   satellites: Satellite;
+  falloutClouds: FalloutCloud;
 };
 
 // Helper functions to get typed arrays from game state records
@@ -487,6 +475,10 @@ export function getSatellites(state: GameState): Satellite[] {
 
 export function getAircraft(state: GameState): Aircraft[] {
   return state.aircraft ? Object.values(state.aircraft) : [];
+}
+
+export function getFalloutClouds(state: GameState): FalloutCloud[] {
+  return state.falloutClouds ? Object.values(state.falloutClouds) : [];
 }
 
 // Global missile speed multiplier - affects all missiles (ICBMs and interceptors)

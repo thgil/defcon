@@ -13,6 +13,7 @@ import type {
   AnyMissile,
   Aircraft,
   AircraftType,
+  FalloutCloud,
   GeoPosition,
   HackType,
   ActiveHack,
@@ -297,6 +298,7 @@ export interface GameDeltaMessage {
   removedSatelliteIds: string[];
   aircraftUpdates?: Aircraft[];
   removedAircraftIds?: string[];
+  falloutUpdates?: FalloutCloud[];
 }
 
 export interface PlayerJoinedMessage {

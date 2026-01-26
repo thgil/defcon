@@ -11,6 +11,7 @@ import {
   type AnyMissile,
   type Satellite,
   type Aircraft,
+  type FalloutCloud,
   type GameEvent,
   type DefconLevel,
   type Vector2,
@@ -81,7 +82,8 @@ interface GameStore {
     satelliteUpdates?: Satellite[],
     removedSatelliteIds?: string[],
     aircraftUpdates?: Aircraft[],
-    removedAircraftIds?: string[]
+    removedAircraftIds?: string[],
+    falloutUpdates?: FalloutCloud[]
   ) => void;
   selectBuilding: (building: Building | null) => void;
   setPlacementMode: (type: BuildingType | null) => void;
@@ -159,7 +161,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
     set({ gameState: state });
   },
 
-  applyDelta: (tick, timestamp, events, buildingUpdates, missileUpdates, removedMissileIds, satelliteUpdates, removedSatelliteIds, aircraftUpdates, removedAircraftIds) => {
+  applyDelta: (tick, timestamp, events, buildingUpdates, missileUpdates, removedMissileIds, satelliteUpdates, removedSatelliteIds, aircraftUpdates, removedAircraftIds, falloutUpdates) => {
     const { gameState, selectedBuilding, playerId } = get();
     if (!gameState) return;
 
@@ -177,6 +179,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
     const safeRemovedSatelliteIds = removedSatelliteIds || [];
     const safeAircraftUpdates = aircraftUpdates || [];
     const safeRemovedAircraftIds = removedAircraftIds || [];
+    const safeFalloutUpdates = falloutUpdates || [];
 
     // Apply building updates
     for (const building of safeBuildingUpdates) {
@@ -243,6 +246,15 @@ export const useGameStore = create<GameStore>((set, get) => ({
         const { [id]: removed, ...rest } = newState.aircraft;
         newState.aircraft = rest;
       }
+    }
+
+    // Apply fallout updates (replace entire fallout state - server is authoritative)
+    if (safeFalloutUpdates.length > 0) {
+      const newFalloutClouds: Record<string, FalloutCloud> = {};
+      for (const cloud of safeFalloutUpdates) {
+        newFalloutClouds[cloud.id] = cloud;
+      }
+      newState.falloutClouds = newFalloutClouds;
     }
 
     // Process events

@@ -52,6 +52,8 @@ export function DemoGlobeContainer({ scrollState }: DemoGlobeContainerProps) {
   const pendingTimeoutsRef = useRef<ReturnType<typeof setTimeout>[]>([]);
   // Track if we've already started the one-time DDoS hack
   const ddosHackStartedRef = useRef(false);
+  // Track if radiation demo has been triggered for current visit to the section
+  const radiationTriggeredRef = useRef(false);
 
   // Handle state updates from simulator
   const handleStateUpdate = useCallback((state: GameState) => {
@@ -198,7 +200,8 @@ export function DemoGlobeContainer({ scrollState }: DemoGlobeContainerProps) {
           lerpFactor: 0.04,
         });
       } else {
-        renderer.setDemoAutoRotate(true, 0.01);
+        const isRadiation = scrollState.activeSection?.id === 'radiation';
+        renderer.setDemoAutoRotate(!isRadiation, isRadiation ? 0 : 0.01);
         renderer.setDemoCameraTarget({
           distance: cameraParams.distance,
           verticalOffset: cameraParams.currentVerticalOffset,
@@ -362,7 +365,7 @@ export function DemoGlobeContainer({ scrollState }: DemoGlobeContainerProps) {
     }
   }, [scrollState.activeSection?.id, isInitialized, setNetworkVisible, startDemoHack, startDemoDdosHack, updateHackProgress, removeHack]);
 
-  // Handle section transitions (trigger missile salvo when entering missiles section)
+  // Handle section transitions (trigger missile salvo when entering missiles section, radiation demo, etc.)
   useEffect(() => {
     if (!isInitialized) return;
 
@@ -376,6 +379,17 @@ export function DemoGlobeContainer({ scrollState }: DemoGlobeContainerProps) {
       // Trigger missile salvo when entering missiles section
       if (currentSectionId === 'missiles') {
         simulatorRef.current?.triggerMissileSalvo();
+      }
+
+      // Trigger radiation demo when entering radiation section
+      if (currentSectionId === 'radiation') {
+        if (!radiationTriggeredRef.current) {
+          radiationTriggeredRef.current = true;
+          simulatorRef.current?.triggerRadiationDemo();
+        }
+      } else {
+        // Reset so re-entering radiation section triggers again
+        radiationTriggeredRef.current = false;
       }
     }
   }, [scrollState.activeSection?.id, isInitialized]);

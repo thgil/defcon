@@ -96,6 +96,19 @@ export const FEATURES = [
     position: 'right' as const,
   },
   {
+    id: 'feature-radiation',
+    sectionId: 'radiation',
+    title: 'NUCLEAR FALLOUT',
+    description: 'Detonations leave radioactive fallout that drifts with global wind patterns.',
+    details: [
+      'Radiation clouds expand and drift with atmospheric winds',
+      'Fallout intensity decays over time following nuclear half-life',
+      'Contamination zones deny territory to all sides',
+      'Wind patterns push fallout across borders unpredictably',
+    ],
+    position: 'right' as const,
+  },
+  {
     id: 'feature-network',
     sectionId: 'network',
     title: 'CYBER WARFARE',

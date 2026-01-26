@@ -137,6 +137,12 @@ export function getUpVector(pos: Vector3): Vector3 {
 }
 
 // ============================================================================
+// Globe Constants
+// ============================================================================
+
+export const GLOBE_RADIUS = 100;
+
+// ============================================================================
 // Geographic Utilities
 // ============================================================================
 
@@ -757,6 +763,190 @@ export function getInterceptorDirection3D(
  * The algorithm counts how many times a horizontal ray from the point
  * crosses polygon edges. An odd count means the point is inside.
  */
+// ============================================================================
+// Wind System
+// ============================================================================
+
+export interface WindVector {
+  direction: number; // degrees (0 = north, 90 = east)
+  speed: number;     // normalized speed (0-1)
+}
+
+/**
+ * Wind vector grid for interpolation.
+ * Each node defines wind at a specific lat/lng.
+ * Direction: 0=north, 90=east, 180=south, 270=west
+ */
+const WIND_GRID_STEP = 20; // degrees between grid points
+
+// Generate wind grid based on global patterns with longitude variation
+function generateWindGrid(): Map<string, { direction: number; speed: number }> {
+  const grid = new Map<string, { direction: number; speed: number }>();
+
+  for (let lat = -80; lat <= 80; lat += WIND_GRID_STEP) {
+    for (let lng = -180; lng < 180; lng += WIND_GRID_STEP) {
+      const absLat = Math.abs(lat);
+      let baseDir: number;
+      let baseSpeed: number;
+
+      // Base direction from latitude bands
+      if (absLat < 25) {
+        // Trade winds - westward
+        baseDir = 270;
+        baseSpeed = 0.75;
+      } else if (absLat < 35) {
+        // Horse latitudes transition
+        const t = (absLat - 25) / 10;
+        baseDir = 270 - t * 180; // 270 -> 90
+        baseSpeed = 0.4 + t * 0.3;
+      } else if (absLat < 55) {
+        // Westerlies - eastward
+        baseDir = 90;
+        baseSpeed = 0.7;
+      } else if (absLat < 65) {
+        // Transition to polar
+        const t = (absLat - 55) / 10;
+        baseDir = 90 + t * 180;
+        baseSpeed = 0.6 - t * 0.2;
+      } else {
+        // Polar easterlies
+        baseDir = 270;
+        baseSpeed = 0.45;
+      }
+
+      // Add longitude-based variation for more natural patterns
+      // Creates swirls and local variations
+      const lngVariation = Math.sin(lng * Math.PI / 60) * 25; // ±25° variation
+      const latVariation = Math.cos(lat * Math.PI / 45) * 15; // ±15° variation
+
+      // Ocean vs land influence (rough approximation)
+      // Atlantic/Pacific tend to have stronger, more consistent winds
+      const isOcean = (lng > -80 && lng < -10) || // Atlantic
+                      (lng > 100 || lng < -100);   // Pacific
+      const oceanBoost = isOcean ? 0.15 : 0;
+
+      // Hemisphere Coriolis deflection
+      const coriolis = lat >= 0 ? 12 : -12;
+
+      let direction = baseDir + lngVariation + latVariation + coriolis;
+      direction = ((direction % 360) + 360) % 360;
+
+      const speed = Math.min(1, Math.max(0.3, baseSpeed + oceanBoost + Math.random() * 0.1 - 0.05));
+
+      grid.set(`${lat},${lng}`, { direction, speed });
+    }
+  }
+
+  return grid;
+}
+
+const WIND_GRID = generateWindGrid();
+
+/**
+ * Get wind vector at a geographic position using bilinear interpolation
+ * between grid nodes for smooth, natural wind patterns.
+ *
+ * @param position Geographic position
+ * @param time Optional time in seconds for temporal variation (creates shifting patterns)
+ * @returns Wind direction (degrees, 0=north, 90=east) and normalized speed (0-1)
+ */
+export function getWindAtPosition(position: GeoCoordinate, time?: number): WindVector {
+  // Find the 4 surrounding grid points
+  const latLo = Math.floor(position.lat / WIND_GRID_STEP) * WIND_GRID_STEP;
+  const latHi = latLo + WIND_GRID_STEP;
+  const lngLo = Math.floor(position.lng / WIND_GRID_STEP) * WIND_GRID_STEP;
+  const lngHi = lngLo + WIND_GRID_STEP;
+
+  // Clamp latitude to grid bounds
+  const clampedLatLo = Math.max(-80, Math.min(80, latLo));
+  const clampedLatHi = Math.max(-80, Math.min(80, latHi));
+
+  // Wrap longitude
+  const wrapLng = (lng: number) => {
+    while (lng >= 180) lng -= 360;
+    while (lng < -180) lng += 360;
+    return lng;
+  };
+  const wrappedLngLo = wrapLng(lngLo);
+  const wrappedLngHi = wrapLng(lngHi);
+
+  // Get the 4 corner wind values
+  const getWind = (lat: number, lng: number) => {
+    const key = `${lat},${lng}`;
+    return WIND_GRID.get(key) || { direction: 90, speed: 0.5 };
+  };
+
+  const w00 = getWind(clampedLatLo, wrappedLngLo); // bottom-left
+  const w10 = getWind(clampedLatLo, wrappedLngHi); // bottom-right
+  const w01 = getWind(clampedLatHi, wrappedLngLo); // top-left
+  const w11 = getWind(clampedLatHi, wrappedLngHi); // top-right
+
+  // Calculate interpolation factors (0-1)
+  const tLat = clampedLatHi !== clampedLatLo
+    ? (position.lat - clampedLatLo) / (clampedLatHi - clampedLatLo)
+    : 0;
+  const tLng = (position.lng - lngLo) / WIND_GRID_STEP;
+
+  // Bilinear interpolation for speed (simple)
+  const speed =
+    w00.speed * (1 - tLng) * (1 - tLat) +
+    w10.speed * tLng * (1 - tLat) +
+    w01.speed * (1 - tLng) * tLat +
+    w11.speed * tLng * tLat;
+
+  // For direction, convert to vectors, interpolate, then back to angle
+  // This handles wraparound (e.g., 350° and 10° should average to 0°)
+  const toVec = (dir: number) => ({
+    x: Math.cos(dir * Math.PI / 180),
+    y: Math.sin(dir * Math.PI / 180)
+  });
+
+  const v00 = toVec(w00.direction);
+  const v10 = toVec(w10.direction);
+  const v01 = toVec(w01.direction);
+  const v11 = toVec(w11.direction);
+
+  const vx =
+    v00.x * (1 - tLng) * (1 - tLat) +
+    v10.x * tLng * (1 - tLat) +
+    v01.x * (1 - tLng) * tLat +
+    v11.x * tLng * tLat;
+
+  const vy =
+    v00.y * (1 - tLng) * (1 - tLat) +
+    v10.y * tLng * (1 - tLat) +
+    v01.y * (1 - tLng) * tLat +
+    v11.y * tLng * tLat;
+
+  let direction = Math.atan2(vy, vx) * 180 / Math.PI;
+  direction = ((direction % 360) + 360) % 360;
+
+  // Add time-based variation if time is provided
+  // Creates slowly shifting wind patterns
+  if (time !== undefined) {
+    // Slow oscillation based on position and time
+    const timeScale = 0.02; // Very slow change
+    const spatialFreq = 0.05;
+
+    // Direction wobble: ±15° over time
+    const dirWobble = Math.sin(time * timeScale + position.lat * spatialFreq) *
+                      Math.cos(time * timeScale * 0.7 + position.lng * spatialFreq) * 15;
+    direction = ((direction + dirWobble) % 360 + 360) % 360;
+
+    // Speed variation: ±20% over time
+    const speedWobble = Math.sin(time * timeScale * 0.5 + position.lng * spatialFreq) * 0.15;
+    const finalSpeed = Math.max(0.2, Math.min(1, speed + speedWobble));
+
+    return { direction, speed: finalSpeed };
+  }
+
+  return { direction, speed };
+}
+
+// ============================================================================
+// Polygon Utilities
+// ============================================================================
+
 export function pointInPolygon(point: GeoCoordinate, polygon: GeoCoordinate[]): boolean {
   if (polygon.length < 3) return false;
 

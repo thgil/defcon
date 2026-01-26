@@ -16,6 +16,7 @@ import {
   GuidedInterceptor,
   Aircraft,
   AircraftType,
+  FalloutCloud,
   DefconLevel,
   BuildingType,
   SiloMode,
@@ -29,6 +30,7 @@ import {
   getMissiles,
   getSatellites,
   getAircraft,
+  getFalloutClouds,
   TERRITORY_GEO_DATA,
   CITY_GEO_DATA,
   geoToPixel,
@@ -38,6 +40,7 @@ import {
   pointInPolygon,
   isGuidedInterceptor,
   isInterceptor,
+  getWindAtPosition,
 } from '@defcon/shared';
 import { Lobby, LobbyPlayer } from '../lobby/Lobby';
 import { ConnectionManager, Connection } from '../ConnectionManager';
@@ -246,6 +249,7 @@ export class GameRoom {
       missiles: {},
       satellites: {},
       aircraft: {},
+      falloutClouds: {},
     };
   }
 
@@ -288,11 +292,19 @@ export class GameRoom {
     this.updateDefconTimer(scaledTickInterval);
 
     // Update ICBMs (legacy missiles)
-    const missileEvents = this.missileSimulator.update(
+    const missileResult = this.missileSimulator.update(
       this.state,
       deltaSeconds
     );
-    this.pendingEvents.push(...missileEvents);
+    this.pendingEvents.push(...missileResult.events);
+
+    // Add new fallout clouds to state
+    for (const fallout of missileResult.falloutClouds) {
+      this.state.falloutClouds[fallout.id] = fallout;
+    }
+
+    // Update existing fallout clouds
+    this.updateFalloutClouds(deltaSeconds);
 
     // Update guided interceptors (proportional navigation with radar-improved prediction)
     const guidedInterceptorEvents = this.guidedInterceptorSimulator.update(
@@ -383,6 +395,78 @@ export class GameRoom {
     }
   }
 
+  /**
+   * Update fallout clouds - drift with wind, expand radius, decay intensity
+   * Wind direction adapts based on current latitude using global wind model
+   */
+  private updateFalloutClouds(deltaSeconds: number): void {
+    const FALLOUT_HALF_LIFE = 60; // seconds
+    const EXPAND_RATE = 0.08; // degrees per second (much slower expansion)
+    const MAX_RADIUS = 8; // Cap at ~8 degrees max
+    const WIND_ADAPTATION_RATE = 0.1; // How quickly wind direction adapts (0-1 per second)
+    const now = Date.now();
+
+    const cloudsToRemove: string[] = [];
+
+    for (const cloud of getFalloutClouds(this.state)) {
+      // Calculate age in seconds
+      const ageSeconds = (now - cloud.createdAt) / 1000;
+
+      // Decay intensity using half-life formula
+      cloud.intensity = Math.pow(0.5, ageSeconds / FALLOUT_HALF_LIFE);
+
+      // Remove clouds that have faded too much
+      if (cloud.intensity < 0.05) {
+        cloudsToRemove.push(cloud.id);
+        continue;
+      }
+
+      // Expand radius over time (capped at MAX_RADIUS)
+      if (cloud.radius < MAX_RADIUS) {
+        cloud.radius = Math.min(MAX_RADIUS, cloud.radius + EXPAND_RATE * deltaSeconds);
+      }
+
+      // Adapt wind direction based on current position using global wind model
+      const localWind = getWindAtPosition(cloud.position);
+
+      // Gradually adapt wind direction toward local conditions
+      // This creates realistic behavior where clouds change direction as they cross latitude zones
+      const adaptFactor = Math.min(1, WIND_ADAPTATION_RATE * deltaSeconds);
+
+      // Calculate angular difference for smooth interpolation
+      let directionDiff = localWind.direction - cloud.windDirection;
+      // Normalize to -180 to 180
+      while (directionDiff > 180) directionDiff -= 360;
+      while (directionDiff < -180) directionDiff += 360;
+
+      cloud.windDirection = (cloud.windDirection + directionDiff * adaptFactor + 360) % 360;
+
+      // Also adapt wind speed slightly
+      cloud.windSpeed = cloud.windSpeed * (1 - adaptFactor * 0.5) + (0.5 + localWind.speed * 0.5) * (adaptFactor * 0.5);
+
+      // Drift position with wind
+      // windDirection is degrees (0 = north, 90 = east)
+      const windRadians = (cloud.windDirection * Math.PI) / 180;
+      const driftLat = Math.cos(windRadians) * cloud.windSpeed * deltaSeconds;
+      const driftLng = Math.sin(windRadians) * cloud.windSpeed * deltaSeconds;
+
+      cloud.position.lat += driftLat;
+      cloud.position.lng += driftLng;
+
+      // Clamp latitude to valid range
+      cloud.position.lat = Math.max(-90, Math.min(90, cloud.position.lat));
+
+      // Wrap longitude
+      if (cloud.position.lng > 180) cloud.position.lng -= 360;
+      if (cloud.position.lng < -180) cloud.position.lng += 360;
+    }
+
+    // Remove faded clouds
+    for (const id of cloudsToRemove) {
+      delete this.state.falloutClouds[id];
+    }
+  }
+
   private checkInterceptions(): GameEvent[] {
     const events: GameEvent[] = [];
 
@@ -418,17 +502,15 @@ export class GameRoom {
       if (icbmMissile.progress > 0.75) continue;
 
       // Collect all valid silos that can engage this missile, with their scores
-      const candidateSilos: Array<{ silo: Silo; score: number; radarIds: string[] }> = [];
+      const candidateSilos: Array<{ silo: Silo; score: number }> = [];
 
       for (const silo of airDefenseSilos) {
         // Only intercept missiles heading toward this player's territory
         const targetTerritory = this.getTerritoryAt(icbmMissile.targetPosition);
         if (!targetTerritory || targetTerritory.ownerId !== silo.ownerId) continue;
 
-        // RADAR REQUIREMENT: Find all radars that can see the missile
-        const trackingRadarIds = this.findAllTrackingRadars(icbmMissile, silo.ownerId);
-        if (trackingRadarIds.length === 0) continue;
-
+        // Radar check: at least one friendly radar must see the incoming ICBM
+        if (!this.findDetectingRadar(icbmMissile, silo.ownerId)) continue;
 
         // Check cooldown (scaled by game speed)
         const effectiveCooldown = silo.fireCooldown / (this.state.gameSpeed || 1);
@@ -436,7 +518,7 @@ export class GameRoom {
 
         // Score this silo based on geometry
         const score = this.scoreSiloForIntercept(silo, icbmMissile);
-        candidateSilos.push({ silo, score, radarIds: trackingRadarIds });
+        candidateSilos.push({ silo, score });
       }
 
       // No valid silos for this missile
@@ -452,7 +534,7 @@ export class GameRoom {
         silo,
         icbmMissile,
         silo.ownerId,
-        best.radarIds
+        []
       );
 
       if (!interceptor) {
@@ -599,46 +681,6 @@ export class GameRoom {
   }
 
   /**
-   * Find all radars that can track the given missile.
-   * Used for multi-radar bonus calculation in interceptors.
-   * Returns array of radar IDs that can see the missile.
-   *
-   * IMPORTANT: Requires actual radar contact with the missile's CURRENT position
-   * before allowing interceptor launch. This ensures realistic gameplay where
-   * missiles must be detected before they can be engaged.
-   */
-  private findAllTrackingRadars(missile: Missile, ownerId: string): string[] {
-    const radars = getBuildings(this.state).filter(
-      (b): b is Radar =>
-        b.type === 'radar' &&
-        !b.destroyed &&
-        b.active &&
-        b.ownerId === ownerId
-    );
-
-    if (radars.length === 0) return [];
-
-    // Use the missile's CURRENT position - must have actual radar contact
-    const currentGeo = missile.geoCurrentPosition || pixelToGeoLocal(missile.currentPosition);
-
-    const trackingRadarIds: string[] = [];
-
-    for (const radar of radars) {
-      const radarGeo = radar.geoPosition || pixelToGeoLocal(radar.position);
-
-      const angularDistanceRadians = greatCircleDistance(radarGeo, currentGeo);
-      const angularDistanceDegrees = angularDistanceRadians * (180 / Math.PI);
-      const radarRangeDegrees = (radar.range / 100) * 9;
-
-      if (angularDistanceDegrees <= radarRangeDegrees) {
-        trackingRadarIds.push(radar.id);
-      }
-    }
-
-    return trackingRadarIds;
-  }
-
-  /**
    * Check if any enemy satellites can see a launch at the given position.
    * Returns LaunchDetectedEvent for each player who detects the launch.
    */
@@ -752,8 +794,9 @@ export class GameRoom {
     const hasMissiles = Object.keys(this.state.missiles).length > 0;
     const hasSatellites = Object.keys(this.state.satellites).length > 0;
     const hasAircraft = Object.keys(this.state.aircraft).length > 0;
+    const hasFallout = Object.keys(this.state.falloutClouds).length > 0;
 
-    if (this.pendingEvents.length === 0 && !hasMissiles && !hasSatellites && !hasAircraft) {
+    if (this.pendingEvents.length === 0 && !hasMissiles && !hasSatellites && !hasAircraft && !hasFallout) {
       return;
     }
 
@@ -846,6 +889,9 @@ export class GameRoom {
       }
     }
 
+    // Collect fallout updates
+    const falloutUpdates = Object.values(this.state.falloutClouds);
+
     const delta = {
       type: 'game_delta' as const,
       tick: this.state.tick,
@@ -858,6 +904,7 @@ export class GameRoom {
       removedSatelliteIds,
       aircraftUpdates,
       removedAircraftIds,
+      falloutUpdates,
     };
 
     if (this.pendingEvents.some(e => e.type === 'mode_change')) {
@@ -1228,8 +1275,8 @@ export class GameRoom {
     console.log(`[AIRCRAFT] ${playerId} launched ${aircraftType} from ${airfieldId}`);
   }
 
-  handleSetGameSpeed(speed: 1 | 2 | 5): void {
-    if (speed === 1 || speed === 2 || speed === 5) {
+  handleSetGameSpeed(speed: 1 | 2 | 5 | 10): void {
+    if (speed === 1 || speed === 2 || speed === 5 || speed === 10) {
       this.state.gameSpeed = speed;
       console.log(`[GAME] Speed set to ${speed}x`);
       this.sendFullSync();
@@ -1651,12 +1698,11 @@ export class GameRoom {
       const effectiveCooldown = silo.fireCooldown / (this.state.gameSpeed || 1);
       if (now - silo.lastFireTime < effectiveCooldown) continue;
 
-      // Find all radars that can see the missile
-      const trackingRadarIds = this.findAllTrackingRadars(missile, playerId);
-      if (trackingRadarIds.length === 0) continue;
+      // Radar check: at least one friendly radar must see the ICBM
+      if (!this.findDetectingRadar(missile, playerId)) continue;
 
       // Calculate hit probability using the guided interceptor simulator
-      const hitProbability = this.guidedInterceptorSimulator.estimateHitProbability(silo, missile, trackingRadarIds.length);
+      const hitProbability = this.guidedInterceptorSimulator.estimateHitProbability(silo, missile, 0);
 
       // Estimate where the intercept would occur
       const interceptProgress = this.estimateInterceptProgress(silo, missile);
@@ -1731,16 +1777,15 @@ export class GameRoom {
       const effectiveCooldown = silo.fireCooldown / (this.state.gameSpeed || 1);
       if (now - silo.lastFireTime < effectiveCooldown) continue;
 
-      // Find all radars that can see the missile
-      const trackingRadarIds = this.findAllTrackingRadars(missile, playerId);
-      if (trackingRadarIds.length === 0) continue;
+      // Radar check: at least one friendly radar must see the ICBM
+      if (!this.findDetectingRadar(missile, playerId)) continue;
 
       // Launch guided interceptor
       const interceptor = this.guidedInterceptorSimulator.launchInterceptor(
         silo,
         missile,
         playerId,
-        trackingRadarIds
+        []
       );
 
       if (!interceptor) {

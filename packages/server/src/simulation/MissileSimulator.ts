@@ -8,10 +8,13 @@ import {
   MissileImpactEvent,
   CityHitEvent,
   BuildingDestroyedEvent,
+  FalloutCloud,
+  GeoPosition,
   pixelToGeo,
   geoInterpolate,
   greatCircleDistance,
   isGuidedInterceptor,
+  getWindAtPosition,
 } from '@defcon/shared';
 
 // Map dimensions for converting pixel to geo coordinates
@@ -70,8 +73,9 @@ export class MissileSimulator {
     };
   }
 
-  update(state: GameState, deltaSeconds: number): GameEvent[] {
+  update(state: GameState, deltaSeconds: number): { events: GameEvent[]; falloutClouds: FalloutCloud[] } {
     const events: GameEvent[] = [];
+    const falloutClouds: FalloutCloud[] = [];
 
     // Guided interceptors are updated by GuidedInterceptorSimulator
     // This method only handles ICBMs
@@ -113,12 +117,15 @@ export class MissileSimulator {
       const icbm = missile as Missile;
       if (icbm.progress >= 1) {
         // ICBM impact
-        const impactEvents = this.handleImpact(icbm, state);
-        events.push(...impactEvents);
+        const impactResult = this.handleImpact(icbm, state);
+        events.push(...impactResult.events);
+        if (impactResult.fallout) {
+          falloutClouds.push(impactResult.fallout);
+        }
       }
     }
 
-    return events;
+    return { events, falloutClouds };
   }
 
   private calculateArcPosition(missile: Missile): Vector2 {
@@ -138,11 +145,11 @@ export class MissileSimulator {
     };
   }
 
-  private handleImpact(missile: Missile, state: GameState): GameEvent[] {
+  private handleImpact(missile: Missile, state: GameState): { events: GameEvent[]; fallout: FalloutCloud | null } {
     missile.detonated = true;
     const events: GameEvent[] = [];
 
-    // Decoy missiles create visual explosion but no damage
+    // Decoy missiles create visual explosion but no damage or fallout
     if (missile.isDecoy) {
       events.push({
         type: 'missile_impact',
@@ -153,11 +160,12 @@ export class MissileSimulator {
         targetType: 'ground',
       } as MissileImpactEvent);
       console.log(`[DECOY IMPACT] Decoy missile ${missile.id} created visual explosion at target`);
-      return events;
+      return { events, fallout: null };
     }
 
     const impactRadius = 50;
     let totalCasualties = 0;
+    let hitCity = false;
 
     // Find attacker for scoring
     const attacker = state.players[missile.ownerId];
@@ -169,6 +177,7 @@ export class MissileSimulator {
       const distance = this.distance(city.position, missile.targetPosition);
 
       if (distance < impactRadius) {
+        hitCity = true;
         const damage = this.calculateDamage(distance, impactRadius, city.population);
         city.population = Math.max(0, city.population - damage);
         totalCasualties += damage;
@@ -237,7 +246,40 @@ export class MissileSimulator {
       targetId: missile.targetId,
     } as MissileImpactEvent);
 
-    return events;
+    // Create fallout cloud at impact position
+    const impactGeo = missile.geoTargetPosition || pixelToGeo(missile.targetPosition, MAP_WIDTH, MAP_HEIGHT);
+    const fallout = this.createFalloutCloud(impactGeo, hitCity);
+
+    return { events, fallout };
+  }
+
+  /**
+   * Create a fallout cloud at the given position.
+   * Wind direction is determined by the global wind system based on latitude.
+   */
+  private createFalloutCloud(position: GeoPosition, hitCity: boolean): FalloutCloud {
+    // Get wind at impact position using global wind model
+    const wind = getWindAtPosition(position);
+
+    // Add some random variation to wind direction (+/- 30 degrees)
+    const windDirection = (wind.direction + (Math.random() - 0.5) * 60 + 360) % 360;
+
+    // Wind speed based on global model with some variation (0.5-1.0 degrees per second base)
+    const windSpeed = 0.5 + wind.speed * 0.5 + Math.random() * 0.2;
+
+    // Higher initial intensity if hit a city (more material to disperse)
+    const initialIntensity = hitCity ? 1.0 : 0.7;
+
+    return {
+      id: `fallout-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      position: { ...position },
+      originPosition: { ...position },
+      createdAt: Date.now(),
+      intensity: initialIntensity,
+      radius: 0.8, // Smaller initial radius in degrees
+      windDirection,
+      windSpeed,
+    };
   }
 
   private calculateDamage(distance: number, radius: number, population: number): number {

@@ -7,9 +7,12 @@ import {
   Building,
   GeoPosition,
   Vector2,
+  FalloutCloud,
   geoToPixel,
   greatCircleDistance,
   geoInterpolate,
+  getWindAtPosition,
+  getFalloutClouds,
   GLOBAL_MISSILE_SPEED_MULTIPLIER,
 } from '@defcon/shared';
 import { createDemoState, getDemoPlayerIds } from './createDemoState';
@@ -42,6 +45,12 @@ const DEMO_AI_CONFIG = {
   INTERCEPT_DELAY: 500,        // Delay before intercepting (ms)
   MISSILE_SPEED: 2 * GLOBAL_MISSILE_SPEED_MULTIPLIER, // Base missile speed
 };
+
+// Fallout simulation constants (matching server GameRoom.ts)
+const FALLOUT_HALF_LIFE = 60;         // seconds for intensity to halve
+const FALLOUT_EXPAND_RATE = 0.08;     // degrees per second
+const FALLOUT_MAX_RADIUS = 8;         // cap at ~8 degrees max
+const FALLOUT_WIND_ADAPT_RATE = 0.1;  // how quickly wind adapts (0-1 per second)
 
 export type DemoEventCallback = (state: GameState) => void;
 
@@ -207,6 +216,9 @@ export class DemoSimulator {
 
     // AI defense logic (currently disabled - interceptors causing issues)
     // this.updateAIDefense(gameTime);
+
+    // Update fallout clouds (decay, expand, drift)
+    this.updateFalloutClouds(deltaMs);
   }
 
   /**
@@ -312,17 +324,19 @@ export class DemoSimulator {
   }
 
   /**
-   * Handle missile impact - damage nearby cities
+   * Handle missile impact - damage nearby cities and create fallout
    */
   private handleMissileImpact(missile: Missile): void {
     if (!missile.geoTargetPosition) return;
 
+    let hitCity = false;
     const impactRadius = 1.5; // degrees (~167km, more reasonable for nuclear blast)
     for (const city of Object.values(this.gameState.cities)) {
       if (city.destroyed || !city.geoPosition) continue;
 
       const dist = greatCircleDistance(missile.geoTargetPosition, city.geoPosition);
       if (dist < impactRadius) {
+        hitCity = true;
         // Damage proportional to distance
         const damageFactor = 1 - (dist / impactRadius);
         const casualties = Math.floor(city.population * damageFactor * 0.5);
@@ -352,6 +366,97 @@ export class DemoSimulator {
           }
         }
       }
+    }
+
+    // Create fallout cloud at impact point
+    const fallout = this.createFalloutCloud(missile.geoTargetPosition, hitCity);
+    this.gameState.falloutClouds[fallout.id] = fallout;
+  }
+
+  /**
+   * Create a fallout cloud at a detonation position
+   * Replicates MissileSimulator.ts logic for client-side demo
+   */
+  private createFalloutCloud(position: GeoPosition, hitCity: boolean): FalloutCloud {
+    const wind = getWindAtPosition(position);
+
+    // Add random variation to wind direction (+/- 30 degrees)
+    const windDirection = (wind.direction + (Math.random() - 0.5) * 60 + 360) % 360;
+
+    // Wind speed based on global model with some variation
+    const windSpeed = 0.5 + wind.speed * 0.5 + Math.random() * 0.2;
+
+    // Higher initial intensity if hit a city (more material to disperse)
+    const initialIntensity = hitCity ? 1.0 : 0.7;
+
+    return {
+      id: `fallout-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      position: { ...position },
+      originPosition: { ...position },
+      createdAt: Date.now(),
+      intensity: initialIntensity,
+      radius: 0.8,
+      windDirection,
+      windSpeed,
+    };
+  }
+
+  /**
+   * Update fallout clouds - decay, expand, and drift with wind
+   * Replicates GameRoom.ts logic for client-side demo
+   */
+  private updateFalloutClouds(deltaMs: number): void {
+    const deltaSeconds = deltaMs / 1000;
+    const now = Date.now();
+    const cloudsToRemove: string[] = [];
+
+    for (const cloud of getFalloutClouds(this.gameState)) {
+      // 1. Decay intensity using half-life formula
+      const ageSeconds = (now - cloud.createdAt) / 1000;
+      cloud.intensity = Math.pow(0.5, ageSeconds / FALLOUT_HALF_LIFE);
+
+      // Remove if too faded
+      if (cloud.intensity < 0.05) {
+        cloudsToRemove.push(cloud.id);
+        continue;
+      }
+
+      // 2. Expand radius over time (capped)
+      if (cloud.radius < FALLOUT_MAX_RADIUS) {
+        cloud.radius = Math.min(FALLOUT_MAX_RADIUS, cloud.radius + FALLOUT_EXPAND_RATE * deltaSeconds);
+      }
+
+      // 3. Adapt wind direction to local conditions as cloud drifts
+      const localWind = getWindAtPosition(cloud.position);
+      const adaptFactor = Math.min(1, FALLOUT_WIND_ADAPT_RATE * deltaSeconds);
+
+      // Smooth direction interpolation
+      let directionDiff = localWind.direction - cloud.windDirection;
+      while (directionDiff > 180) directionDiff -= 360;
+      while (directionDiff < -180) directionDiff += 360;
+      cloud.windDirection = (cloud.windDirection + directionDiff * adaptFactor + 360) % 360;
+
+      // Also adapt wind speed
+      cloud.windSpeed = cloud.windSpeed * (1 - adaptFactor * 0.5)
+                      + (0.5 + localWind.speed * 0.5) * (adaptFactor * 0.5);
+
+      // 4. Drift position with wind
+      const windRadians = (cloud.windDirection * Math.PI) / 180;
+      const driftLat = Math.cos(windRadians) * cloud.windSpeed * deltaSeconds;
+      const driftLng = Math.sin(windRadians) * cloud.windSpeed * deltaSeconds;
+
+      cloud.position.lat += driftLat;
+      cloud.position.lng += driftLng;
+
+      // Clamp latitude and wrap longitude
+      cloud.position.lat = Math.max(-90, Math.min(90, cloud.position.lat));
+      if (cloud.position.lng > 180) cloud.position.lng -= 360;
+      if (cloud.position.lng < -180) cloud.position.lng += 360;
+    }
+
+    // Remove faded clouds
+    for (const id of cloudsToRemove) {
+      delete this.gameState.falloutClouds[id];
     }
   }
 
@@ -671,6 +776,62 @@ export class DemoSimulator {
     playerIds.forEach((playerId: string) => {
       this.launchAttack(playerId);
     });
+  }
+
+  /**
+   * Trigger the radiation demo - launch a pre-advanced ICBM at Moscow from USA
+   * The missile starts at ~80% progress so it arrives in ~3 seconds
+   */
+  triggerRadiationDemo(): void {
+    const moscowGeo: GeoPosition = { lat: 55.7558, lng: 37.6173 };
+
+    // Find a USA silo with ammo
+    const usaSilo = Object.values(this.gameState.buildings).find(
+      (b): b is Silo =>
+        b.type === 'silo' &&
+        b.ownerId === 'demo-player-1' &&
+        !b.destroyed &&
+        b.missileCount > 0 &&
+        !!b.geoPosition
+    );
+
+    if (!usaSilo || !usaSilo.geoPosition) return;
+
+    const missileId = `missile-radiation-${uuidv4()}`;
+
+    // Calculate flight duration based on distance
+    const angularDistance = greatCircleDistance(usaSilo.geoPosition, moscowGeo);
+    const distance = angularDistance * 100;
+    const flightDuration = Math.max(8000, (distance / DEMO_AI_CONFIG.MISSILE_SPEED) * 1000);
+
+    // Set launchTime in the past so progress starts at ~80%
+    const launchTime = this.gameTimeElapsed - (flightDuration * 0.80);
+
+    const missile: Missile = {
+      id: missileId,
+      type: 'icbm',
+      ownerId: 'demo-player-1',
+      sourceId: usaSilo.id,
+      launchPosition: usaSilo.position,
+      targetPosition: geoToPixel(moscowGeo, MAP_WIDTH, MAP_HEIGHT),
+      currentPosition: usaSilo.position,
+      launchTime,
+      flightDuration,
+      progress: 0.80,
+      apexHeight: Math.min(distance * 0.2, 60),
+      intercepted: false,
+      detonated: false,
+      geoLaunchPosition: usaSilo.geoPosition,
+      geoTargetPosition: moscowGeo,
+      geoCurrentPosition: geoInterpolate(usaSilo.geoPosition, moscowGeo, 0.80),
+    };
+
+    this.gameState.missiles[missileId] = missile;
+    this.missileSeeds.set(missileId, Math.random() * 10000);
+
+    // Decrement silo ammo
+    usaSilo.missileCount--;
+    usaSilo.lastFireTime = this.gameTimeElapsed;
   }
 
   /**

@@ -337,7 +337,8 @@ function handleMessage(message: ServerMessage) {
         message.satelliteUpdates,
         message.removedSatelliteIds,
         message.aircraftUpdates,
-        message.removedAircraftIds
+        message.removedAircraftIds,
+        message.falloutUpdates
       );
       break;
 

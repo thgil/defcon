@@ -55,7 +55,7 @@ export class HUDRenderer {
   // Callbacks
   private onModeChange: ((siloId: string, mode: 'air_defense' | 'icbm') => void) | null = null;
   private onPlacementMode: ((type: string | null) => void) | null = null;
-  private onViewToggle: ((toggle: 'radar' | 'grid' | 'labels' | 'trails' | 'network', value: boolean) => void) | null = null;
+  private onViewToggle: ((toggle: 'radar' | 'grid' | 'labels' | 'trails' | 'network' | 'fallout' | 'wind', value: boolean) => void) | null = null;
   private onLaunchSatellite: ((facilityId: string, inclination: number) => void) | null = null;
   private onDebugCommand: ((command: string, value?: number, targetRegion?: string) => void) | null = null;
   private onEnableAI: ((region: string) => void) | null = null;
@@ -78,6 +78,8 @@ export class HUDRenderer {
     labels: true,
     trails: true,
     network: false,
+    fallout: true,
+    wind: false,
   };
 
   // Debug panel state
@@ -147,7 +149,7 @@ export class HUDRenderer {
   setCallbacks(
     onModeChange: (siloId: string, mode: 'air_defense' | 'icbm') => void,
     onPlacementMode: (type: string | null) => void,
-    onViewToggle?: (toggle: 'radar' | 'grid' | 'labels' | 'trails' | 'network', value: boolean) => void,
+    onViewToggle?: (toggle: 'radar' | 'grid' | 'labels' | 'trails' | 'network' | 'fallout' | 'wind', value: boolean) => void,
     onLaunchSatellite?: (facilityId: string, inclination: number) => void
   ): void {
     this.onModeChange = onModeChange;
@@ -156,7 +158,7 @@ export class HUDRenderer {
     this.onLaunchSatellite = onLaunchSatellite || null;
   }
 
-  setViewToggles(toggles: { radar: boolean; grid: boolean; labels: boolean; trails: boolean; network: boolean }): void {
+  setViewToggles(toggles: { radar: boolean; grid: boolean; labels: boolean; trails: boolean; network: boolean; fallout: boolean; wind: boolean }): void {
     this.viewToggles = { ...toggles };
   }
 
@@ -523,10 +525,10 @@ export class HUDRenderer {
 
     // Background - wider to accommodate speed buttons
     this.ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
-    this.ctx.fillRect(centerX - 140, 8, 280, 50);
+    this.ctx.fillRect(centerX - 140, 8, 330, 50);
     this.ctx.strokeStyle = color;
     this.ctx.lineWidth = 1;
-    this.ctx.strokeRect(centerX - 140, 8, 280, 50);
+    this.ctx.strokeRect(centerX - 140, 8, 330, 50);
 
     // DEFCON text
     this.ctx.fillStyle = color;
@@ -546,7 +548,7 @@ export class HUDRenderer {
     this.ctx.fillText(`${minutes}:${seconds.toString().padStart(2, '0')}`, centerX - 40, 52);
 
     // Speed buttons
-    const speeds: GameSpeed[] = [1, 2, 5];
+    const speeds: GameSpeed[] = [1, 2, 5, 10];
     const buttonWidth = 28;
     const buttonHeight = 20;
     const buttonSpacing = 4;
@@ -1263,12 +1265,14 @@ export class HUDRenderer {
     const toggleSpacing = 4;
     const panelPadding = 8;
 
-    const toggles: Array<{ key: 'radar' | 'grid' | 'labels' | 'trails' | 'network'; label: string }> = [
+    const toggles: Array<{ key: 'radar' | 'grid' | 'labels' | 'trails' | 'network' | 'fallout' | 'wind'; label: string }> = [
       { key: 'radar', label: 'RADAR' },
       { key: 'grid', label: 'GRID' },
       { key: 'labels', label: 'LABELS' },
       { key: 'trails', label: 'TRAILS' },
       { key: 'network', label: 'NETWORK' },
+      { key: 'fallout', label: 'FALLOUT' },
+      { key: 'wind', label: 'WIND' },
     ];
 
     const panelWidth = toggles.length * (toggleWidth + toggleSpacing) - toggleSpacing + panelPadding * 2;
@@ -1401,7 +1405,7 @@ export class HUDRenderer {
 
     // Top center DEFCON (wider to include speed buttons)
     const centerX = width / 2;
-    if (x >= centerX - 140 && x <= centerX + 140 && y >= 8 && y <= 58) return true;
+    if (x >= centerX - 140 && x <= centerX + 190 && y >= 8 && y <= 58) return true;
 
     // Top right scoreboard
     const players = this.gameState ? Object.values(this.gameState.players) : [];
