@@ -56,7 +56,7 @@ export function LandingPage() {
   });
 
   // Discord invite link
-  const DISCORD_INVITE_URL = 'https://discord.gg/YK8bezkADc';
+  const DISCORD_INVITE_URL = 'https://discord.gg/xTqhVDS5Xn';
 
   // Check if CTA should be visible - show when in CTA section
   const showCTA = scrollState.activeSection?.id === 'cta';
