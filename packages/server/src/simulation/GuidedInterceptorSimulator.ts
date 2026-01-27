@@ -229,10 +229,36 @@ export class GuidedInterceptorSimulator {
         );
       }
 
-      // Move interceptor toward estimated target
+      // Move interceptor toward lead-predicted target position
       if (interceptor.estimatedTargetPos3d && interceptor.pos3d) {
-        const toTarget = vec3Sub(interceptor.estimatedTargetPos3d, interceptor.pos3d);
-        const direction = vec3Normalize(toTarget);
+        // Lead pursuit: predict where the ICBM will be when the interceptor arrives
+        let aimPoint = interceptor.estimatedTargetPos3d;
+
+        if (target.geoLaunchPosition && target.geoTargetPosition) {
+          const toTarget = vec3Sub(interceptor.estimatedTargetPos3d, interceptor.pos3d);
+          const distToTarget = vec3Length(toTarget);
+          const timeToIntercept = distToTarget / interceptor.speed3d;
+
+          // Predict ICBM future progress along its trajectory
+          const icbmProgress = target.progress || 0;
+          const icbmFlightDurationSec = target.flightDuration / 1000;
+          const progressPerSec = 1.0 / icbmFlightDurationSec;
+          // Lead aggressively (1.3x) — interceptor is slower so it must cut the corner
+          const leadProgress = Math.min(1, icbmProgress + progressPerSec * timeToIntercept * 1.3);
+
+          const leadPos = getMissilePosition3D(
+            target.geoLaunchPosition,
+            target.geoTargetPosition,
+            leadProgress,
+            target.apexHeight || 30,
+            GLOBE_RADIUS,
+          );
+
+          // Blend: high tracking accuracy → trust the lead calculation more
+          aimPoint = vec3Lerp(interceptor.estimatedTargetPos3d, leadPos, interceptor.trackingAccuracy || 0.3);
+        }
+
+        const direction = vec3Normalize(vec3Sub(aimPoint, interceptor.pos3d));
 
         const moveDistance = interceptor.speed3d * deltaSeconds;
         interceptor.pos3d = vec3Add(interceptor.pos3d, vec3Scale(direction, moveDistance));
@@ -251,11 +277,9 @@ export class GuidedInterceptorSimulator {
         interceptor.geoCurrentPosition = { lat: geo.lat, lng: geo.lng };
         interceptor.geoPosition = { ...interceptor.geoCurrentPosition };
 
-        // Also update geoTargetPosition for client prediction line
-        if (interceptor.estimatedTargetPos3d) {
-          const targetGeo = sphereToGeo(interceptor.estimatedTargetPos3d, GLOBE_RADIUS);
-          interceptor.geoTargetPosition = { lat: targetGeo.lat, lng: targetGeo.lng };
-        }
+        // Update geoTargetPosition for client prediction line (aim point, not raw estimate)
+        const aimGeo = sphereToGeo(aimPoint, GLOBE_RADIUS);
+        interceptor.geoTargetPosition = { lat: aimGeo.lat, lng: aimGeo.lng };
       }
 
       // 3D proximity check (use TRUE position, not estimate)
